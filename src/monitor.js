@@ -1,11 +1,15 @@
 import { config } from './config.js';
 import { getOrderbook, getMarketById } from './predict.js';
 import { sendMessage, htmlEscape } from './telegram.js';
-import { listAllSubscriptions, removeSubscription, saveState } from './state.js';
+import {
+  listAllSubscriptions, removeSubscription, saveState,
+  ALL_LEVELS, LEVEL_LABEL, subKey,
+} from './state.js';
 
-// In-memory: marketId -> last orderbook snapshot (top-3 each side).
-// Per (chatId,marketId): lastNotifyMs to enforce cooldown.
-const lastBook = new Map();
+// Per-sub last-notified snapshot (so each sub diffs against the book
+// at the moment it last got an alert, not against an unrelated sub's
+// state). Per-sub last notify time enforces NOTIFY_COOLDOWN_SEC.
+const lastBookPerSub = new Map();
 const lastNotify = new Map();
 
 function fmtSide(side) {
@@ -13,6 +17,13 @@ function fmtSide(side) {
   const price = side.price.toFixed(4);
   const size = side.size.toLocaleString('en-US', { maximumFractionDigits: 0 });
   return `${price} × ${size}`;
+}
+
+function getLevel(snap, key) {
+  if (!snap) return null;
+  const idx = Number(key.slice(3)) - 1;
+  const side = key.startsWith('bid') ? snap.bids : snap.asks;
+  return side?.[idx] ?? null;
 }
 
 function levelDiff(prev, cur) {
@@ -26,58 +37,60 @@ function levelDiff(prev, cur) {
   return false;
 }
 
-function bookChanged(prev, cur) {
+function bookChanged(prev, cur, levels) {
   if (!prev) return true;
-  if (levelDiff(prev.bestBid, cur.bestBid)) return true;
-  if (levelDiff(prev.bestAsk, cur.bestAsk)) return true;
-  // Check level-2 / level-3 in case top is the same but depth shifted noticeably.
-  for (let i = 1; i < 3; i++) {
-    if (levelDiff(prev.bids?.[i], cur.bids?.[i])) return true;
-    if (levelDiff(prev.asks?.[i], cur.asks?.[i])) return true;
+  for (const k of levels) {
+    if (levelDiff(getLevel(prev, k), getLevel(cur, k))) return true;
   }
   return false;
 }
 
-function fmtBook(snap) {
+function fmtChange(prev, cur, levels) {
+  if (!prev) return '初次抓取';
+  const out = [];
+  for (const k of levels) {
+    const p = getLevel(prev, k);
+    const c = getLevel(cur, k);
+    if (!levelDiff(p, c)) continue;
+    const label = LEVEL_LABEL[k] ?? k;
+    if (!p && c) {
+      out.push(`${label} 新增 ${c.price.toFixed(4)}×${c.size.toFixed(0)}`);
+    } else if (p && !c) {
+      out.push(`${label} 撤销`);
+    } else {
+      const dp = c.price - p.price;
+      const ds = c.size - p.size;
+      const parts = [];
+      if (Math.abs(dp) >= 1e-9) parts.push(`价 ${dp >= 0 ? '+' : ''}${dp.toFixed(4)}`);
+      if (ds !== 0) parts.push(`量 ${ds > 0 ? '+' : ''}${ds.toFixed(0)}`);
+      out.push(`${label} ${parts.join(' / ')}`);
+    }
+  }
+  return out.join('；') || '深度变动';
+}
+
+function fmtBook(snap, levels) {
+  const set = new Set(levels);
   const lines = [];
   lines.push('<b>买单（Bids）</b>');
   for (let i = 0; i < 3; i++) {
-    const r = snap.bids?.[i];
-    lines.push(`  L${i + 1}: ${fmtSide(r)}`);
+    const k = `bid${i + 1}`;
+    const mark = set.has(k) ? '👁' : ' ';
+    lines.push(`  ${mark} L${i + 1}: ${fmtSide(snap.bids?.[i])}`);
   }
   lines.push('<b>卖单（Asks）</b>');
   for (let i = 0; i < 3; i++) {
-    const r = snap.asks?.[i];
-    lines.push(`  L${i + 1}: ${fmtSide(r)}`);
+    const k = `ask${i + 1}`;
+    const mark = set.has(k) ? '👁' : ' ';
+    lines.push(`  ${mark} L${i + 1}: ${fmtSide(snap.asks?.[i])}`);
   }
   return lines.join('\n');
-}
-
-function fmtChange(prev, cur) {
-  if (!prev) return '初次抓取';
-  const out = [];
-  const arrow = (a, b) => {
-    if (a == null && b == null) return '';
-    if (a == null) return '↑ 新增';
-    if (b == null) return '↓ 撤销';
-    if (a.price === b.price && a.size === b.size) return '';
-    const dp = (b.price - a.price).toFixed(4);
-    const ds = b.size - a.size;
-    const dpStr = (b.price === a.price) ? '' : `价 ${dp >= 0 ? '+' : ''}${dp}`;
-    const dsStr = (ds === 0) ? '' : `量 ${ds > 0 ? '+' : ''}${ds.toFixed(0)}`;
-    return [dpStr, dsStr].filter(Boolean).join(' / ');
-  };
-  const bid = arrow(prev.bestBid, cur.bestBid);
-  if (bid) out.push(`最佳买 ${bid}`);
-  const ask = arrow(prev.bestAsk, cur.bestAsk);
-  if (ask) out.push(`最佳卖 ${ask}`);
-  return out.join('；') || '深度变动';
 }
 
 async function pollOnce() {
   const subs = listAllSubscriptions();
   if (!subs.length) return;
-  const byMarket = new Map(); // marketId -> { sub-list, lookup }
+  const byMarket = new Map();
   for (const s of subs) {
     if (!byMarket.has(s.marketId)) byMarket.set(s.marketId, []);
     byMarket.get(s.marketId).push(s);
@@ -87,7 +100,6 @@ async function pollOnce() {
     try {
       let market = await getMarketById(marketId);
       if (!market) {
-        // Reconstruct minimal market from sub data (conditionId is enough).
         const s0 = group[0];
         if (!s0.conditionId) {
           console.warn('[monitor] no market record for', marketId);
@@ -100,32 +112,39 @@ async function pollOnce() {
       console.warn(new Date().toISOString(), `[monitor] ${marketId} fetch failed:`, err.message);
       continue;
     }
-    const prev = lastBook.get(marketId);
-    const changed = bookChanged(prev, snap);
-    lastBook.set(marketId, snap);
-    if (!changed) continue;
-    const summary = fmtChange(prev, snap);
-    const body = fmtBook(snap);
     const now = Date.now();
     for (const s of group) {
-      const cooldownKey = `${s.chatId}:${s.marketId}`;
-      const last = lastNotify.get(cooldownKey) ?? 0;
-      if (prev && now - last < config.notifyCooldownMs) continue;
+      const levels = s.levels?.length ? s.levels : ALL_LEVELS;
+      const k = subKey(s.chatId, s.marketId);
+      const prev = lastBookPerSub.get(k);
+      // Empty levels = monitoring nothing (user toggled all off). Snapshot
+      // the book so re-enabling levels later doesn't dump a stale diff.
+      if (!s.levels?.length) {
+        lastBookPerSub.set(k, snap);
+        continue;
+      }
+      if (!bookChanged(prev, snap, levels)) continue;
+      const lastSentAt = lastNotify.get(k) ?? 0;
+      if (prev && now - lastSentAt < config.notifyCooldownMs) continue;
+      const summary = fmtChange(prev, snap, levels);
+      const body = fmtBook(snap, levels);
       const titleLine = htmlEscape(s.title || `Market ${s.marketId}`);
+      const watching = levels.map((l) => LEVEL_LABEL[l]).join('/');
       const text = [
         `<b>📊 ${titleLine}</b>`,
+        `<i>监控档位：${watching}</i>`,
         `<i>${htmlEscape(summary)}</i>`,
         '',
         body,
         '',
-        `<code>id=${s.marketId}</code> · /stop_${s.marketId} 停止`,
+        `<code>id=${s.marketId}</code> · /levels_${s.marketId} 改档位 · /stop_${s.marketId} 停止`,
       ].join('\n');
       try {
         await sendMessage(s.chatId, text);
-        lastNotify.set(cooldownKey, now);
+        lastNotify.set(k, now);
+        lastBookPerSub.set(k, snap);
       } catch (err) {
         console.warn('[monitor] send failed', s.chatId, err.message);
-        // 403 = user blocked the bot / kicked from group → drop the sub.
         if (err.message?.includes('403')) {
           removeSubscription(s.chatId, s.marketId);
           await saveState();

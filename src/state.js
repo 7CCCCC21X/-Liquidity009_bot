@@ -3,10 +3,25 @@ import { config } from './config.js';
 
 // Shape:
 // {
-//   subs: { "<chatId>:<marketId>": { chatId, marketId, conditionId, title, slug, addedAt } },
+//   subs: { "<chatId>:<marketId>": { chatId, marketId, conditionId, title, slug, levels, addedAt } },
 //   pendingChoices: { "<chatId>:<token>": { matches: [...], expiresAt } },
 //   telegramOffset: number
 // }
+// levels: array picked from ALL_LEVELS — empty array means "watch nothing"
+// (sub still tracked for snapshot/list but never alerts).
+
+export const ALL_LEVELS = ['bid1', 'bid2', 'bid3', 'ask1', 'ask2', 'ask3'];
+
+export const LEVEL_LABEL = {
+  bid1: '买1', bid2: '买2', bid3: '买3',
+  ask1: '卖1', ask2: '卖2', ask3: '卖3',
+};
+
+export function normalizeLevels(levels) {
+  if (!Array.isArray(levels)) return [...ALL_LEVELS];
+  const set = new Set(levels.filter((l) => ALL_LEVELS.includes(l)));
+  return ALL_LEVELS.filter((l) => set.has(l));
+}
 
 function emptyState() {
   return { subs: {}, pendingChoices: {}, telegramOffset: 0 };
@@ -52,8 +67,28 @@ export function subKey(chatId, marketId) {
 
 export function addSubscription(sub) {
   const k = subKey(sub.chatId, sub.marketId);
-  _state.subs[k] = { ...sub, addedAt: Date.now() };
+  const existing = _state.subs[k];
+  _state.subs[k] = {
+    ...sub,
+    levels: normalizeLevels(sub.levels ?? existing?.levels),
+    addedAt: existing?.addedAt ?? Date.now(),
+  };
   return k;
+}
+
+export function getSubscription(chatId, marketId) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  // Backfill default levels for subs created before /levels existed.
+  s.levels = normalizeLevels(s.levels);
+  return s;
+}
+
+export function updateSubscriptionLevels(chatId, marketId, levels) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  s.levels = normalizeLevels(levels);
+  return s;
 }
 
 export function removeSubscription(chatId, marketId) {
@@ -68,7 +103,10 @@ export function listSubscriptionsForChat(chatId) {
 }
 
 export function listAllSubscriptions() {
-  return Object.values(_state.subs);
+  return Object.values(_state.subs).map((s) => {
+    s.levels = normalizeLevels(s.levels);
+    return s;
+  });
 }
 
 // Pending market-choice batches. Stored keyed by a short token so callback
