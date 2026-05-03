@@ -130,15 +130,17 @@ async function pollOnce() {
       const body = fmtBook(snap, levels);
       const titleLine = htmlEscape(s.title || `Market ${s.marketId}`);
       const watching = levels.map((l) => LEVEL_LABEL[l]).join('/');
-      const text = [
-        `<b>📊 ${titleLine}</b>`,
+      const lines = [`<b>📊 ${titleLine}</b>`];
+      if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
+      lines.push(
         `<i>监控档位：${watching}</i>`,
         `<i>${htmlEscape(summary)}</i>`,
         '',
         body,
         '',
-        `<code>id=${s.marketId}</code> · /levels_${s.marketId} 改档位 · /stop_${s.marketId} 停止`,
-      ].join('\n');
+        `<code>id=${s.marketId}</code> · /levels_${s.marketId} · /note_${s.marketId} · /stop_${s.marketId}`,
+      );
+      const text = lines.join('\n');
       try {
         await sendMessage(s.chatId, text);
         lastNotify.set(k, now);

@@ -17,6 +17,16 @@ export function slugify(s) {
     .replace(/^-+|-+$/g, '');
 }
 
+// Detects an input that's just a numeric market id (e.g. "257916").
+// Returns the trimmed id string, or null. Bot uses this to short-circuit
+// the slug-resolution path when the user already knows the id.
+export function extractMarketId(input) {
+  if (input == null) return null;
+  const s = String(input).trim();
+  if (/^\d{1,20}$/.test(s)) return s;
+  return null;
+}
+
 // Extract a slug from a Predict.fun URL or accept a bare slug.
 // Supports:
 //   https://predict.fun/event/<slug>

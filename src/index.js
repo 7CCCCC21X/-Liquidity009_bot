@@ -3,11 +3,12 @@ import { getUpdates, sendMessage, editMessageText, answerCallbackQuery, setMyCom
 import {
   loadState, saveState, getState,
   addSubscription, removeSubscription, listSubscriptionsForChat,
-  getSubscription, updateSubscriptionLevels,
+  getSubscription, updateSubscriptionLevels, updateSubscriptionNote,
   putPendingChoice, takePendingChoice, gcPendingChoices,
+  putPendingNote, takePendingNote, gcPendingNotes,
   ALL_LEVELS, LEVEL_LABEL,
 } from './state.js';
-import { extractSlugFromUrl, resolveSlugToMarkets, getMarketById } from './predict.js';
+import { extractSlugFromUrl, extractMarketId, resolveSlugToMarkets, getMarketById } from './predict.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -15,18 +16,20 @@ requireConfig();
 const HELP = [
   '👋 <b>Predict.fun 订单簿监控机器人</b>',
   '',
-  '直接发送一个 Predict.fun 网址（事件页或单个市场页都行），我会识别页面里的所有市场卡片，让你选择要监控哪一个。被选中的市场只要你关注的档位（买1/2/3、卖1/2/3）发生变化就会推送给你。',
+  '三种方式订阅：',
+  '① 直接发 Predict.fun <b>网址</b>（事件页/市场页都行）',
+  '② 直接发 <b>marketId</b>（纯数字，如 <code>257916</code>）',
+  '③ 直接发 <b>slug</b>（如 <code>btc-eom-2026</code>）',
+  '',
+  '订阅后只要你关注的档位（买1/2/3、卖1/2/3）发生变化就会推送给你。还可以给每张订阅加备注，列表和通知里都会显示。',
   '',
   '<b>命令</b>',
   '/start, /help — 显示此帮助',
   '/list — 当前订阅的市场',
-  '/levels &lt;marketId&gt; — 自定义监控档位（买1/2/3、卖1/2/3）',
+  '/levels &lt;marketId&gt; — 自定义监控档位',
+  '/note &lt;marketId&gt; [备注] — 设置备注（不带文字 = 清除）',
   '/stop &lt;marketId&gt; — 取消订阅',
   '/stopall — 取消全部订阅',
-  '',
-  '<b>用法示例</b>',
-  '<code>https://predict.fun/event/xxxx</code>',
-  '<code>https://predict.fun/zh-cn/market/yyyy</code>',
 ].join('\n');
 
 function buildLevelsKeyboard(marketId, levels) {
@@ -68,20 +71,42 @@ function shortToken() {
   return Math.random().toString(36).slice(2, 8);
 }
 
-async function sendSubscribed(chatId, m) {
-  const text = [
+async function sendSubscribed(chatId, m, { existingNote } = {}) {
+  const lines = [
     `✅ 已订阅 <b>${htmlEscape(m.title || m.question || m.id)}</b>`,
     `<code>id=${m.id}</code>`,
-    '默认监控买1/2/3 + 卖1/2/3 全部 6 档。',
-    '点下方按钮自定义要看哪几档；订单簿一旦变动立刻推送。',
-  ].join('\n');
+  ];
+  if (existingNote) lines.push(`📝 备注：${htmlEscape(existingNote)}`);
+  lines.push('默认监控买1/2/3 + 卖1/2/3 全部 6 档。');
+  lines.push('点下方按钮自定义要看哪几档 / 加备注；订单簿一旦变动立刻推送。');
   const replyMarkup = {
     inline_keyboard: [
-      [{ text: '📐 配置档位', callback_data: `lvl:${m.id}:open` }],
+      [
+        { text: '📐 配置档位', callback_data: `lvl:${m.id}:open` },
+        { text: '📝 设置备注', callback_data: `note:${m.id}` },
+      ],
       [{ text: '🛑 取消订阅', callback_data: `unsub:${m.id}` }],
     ],
   };
-  await sendMessage(chatId, text, { replyMarkup });
+  await sendMessage(chatId, lines.join('\n'), { replyMarkup });
+}
+
+// Send a ForceReply prompt asking the user to type a note. Records the
+// prompt's message_id in pendingNotes so the eventual reply can be
+// matched back to the right market.
+async function promptForNote(chatId, marketId) {
+  const sub = getSubscription(chatId, marketId);
+  const cur = sub?.note ? `\n当前备注：<i>${htmlEscape(sub.note)}</i>` : '';
+  const text = [
+    `📝 请<b>回复此条消息</b>输入备注（直接发送文字）。`,
+    `市场：${htmlEscape(sub?.title || `Market ${marketId}`)}  <code>id=${marketId}</code>${cur}`,
+    `<i>发送 “-” 清除备注；30 分钟内有效。</i>`,
+  ].join('\n');
+  const sent = await sendMessage(chatId, text, {
+    replyMarkup: { force_reply: true, selective: true, input_field_placeholder: '输入备注…' },
+  });
+  putPendingNote(chatId, sent.message_id, marketId);
+  await saveState();
 }
 
 function buildChoiceKeyboard(token, matches) {
@@ -117,6 +142,7 @@ async function handleUrl(chatId, text) {
   }
   if (matches.length === 1) {
     const m = matches[0];
+    const existing = getSubscription(chatId, m.id);
     addSubscription({
       chatId,
       marketId: m.id,
@@ -125,7 +151,7 @@ async function handleUrl(chatId, text) {
       slug: m.slug,
     });
     await saveState();
-    await sendSubscribed(chatId, m);
+    await sendSubscribed(chatId, m, { existingNote: existing?.note });
     return;
   }
   const token = shortToken();
@@ -147,16 +173,41 @@ async function handleCommand(chatId, text) {
   if (c === '/list') {
     const subs = listSubscriptionsForChat(chatId);
     if (!subs.length) {
-      await sendMessage(chatId, '当前没有订阅。直接发个 Predict.fun 网址就能开始监控。');
+      await sendMessage(chatId, '当前没有订阅。直接发个 Predict.fun 网址或 marketId 就能开始监控。');
       return true;
     }
     const lines = ['<b>当前订阅</b>'];
     for (const s of subs) {
       const levels = s.levels?.length ? s.levels.map((l) => LEVEL_LABEL[l]).join('/') : '（无）';
-      lines.push(`• <code>${s.marketId}</code> — ${htmlEscape(s.title || '')}\n   档位：${levels}  /levels_${s.marketId}`);
+      const noteLine = s.note ? `\n   📝 ${htmlEscape(s.note)}` : '';
+      lines.push(`• <code>${s.marketId}</code> — ${htmlEscape(s.title || '')}${noteLine}\n   档位：${levels}  /levels_${s.marketId}  /note_${s.marketId}`);
     }
-    lines.push('', '改档位：/levels &lt;marketId&gt;\n取消单个：/stop &lt;marketId&gt;\n取消全部：/stopall');
+    lines.push('', '改档位：/levels &lt;id&gt;\n改备注：/note &lt;id&gt; &lt;文字&gt;（不带文字 = 清除）\n取消单个：/stop &lt;id&gt;\n取消全部：/stopall');
     await sendMessage(chatId, lines.join('\n'));
+    return true;
+  }
+  if (c === '/note' || /^\/note_\d+$/.test(c)) {
+    let id = args[0];
+    let noteArgs = args.slice(1);
+    if (/^\/note_\d+$/.test(c)) {
+      id = c.slice('/note_'.length);
+      noteArgs = args;
+    }
+    if (!id) {
+      await sendMessage(chatId, '用法：/note &lt;marketId&gt; &lt;备注文字&gt;\n（不带文字 → 弹输入框；发 “-” 清除）');
+      return true;
+    }
+    const sub = getSubscription(chatId, id);
+    if (!sub) {
+      await sendMessage(chatId, `❌ 没有订阅 <code>${htmlEscape(id)}</code>`);
+      return true;
+    }
+    if (noteArgs.length === 0) {
+      // Inline keyboard mode — pop a ForceReply prompt.
+      await promptForNote(chatId, id);
+      return true;
+    }
+    await applyNoteInput(chatId, id, noteArgs.join(' '));
     return true;
   }
   if (c === '/levels' || /^\/levels_\d+$/.test(c)) {
@@ -202,13 +253,88 @@ async function handleMessage(msg) {
   const chatId = msg.chat?.id;
   const text = (msg.text ?? '').trim();
   if (!chatId || !text) return;
+
+  // Reply-to-prompt path: if the user is replying to one of our note
+  // prompts, treat the entire body as the note text.
+  const replyTo = msg.reply_to_message?.message_id;
+  if (replyTo) {
+    const marketId = takePendingNote(chatId, replyTo);
+    if (marketId) {
+      await applyNoteInput(chatId, marketId, text);
+      return;
+    }
+  }
+
   if (text.startsWith('/')) {
     const handled = await handleCommand(chatId, text);
     if (!handled) await sendMessage(chatId, '未识别的命令。/help 查看可用命令。');
     return;
   }
-  // Treat any non-command message as a URL/slug attempt.
+
+  // Pure numeric → marketId direct subscribe
+  const id = extractMarketId(text);
+  if (id) {
+    await handleMarketIdInput(chatId, id);
+    return;
+  }
+  // Otherwise treat as URL or slug.
   await handleUrl(chatId, text);
+}
+
+async function handleMarketIdInput(chatId, marketId) {
+  let market;
+  try {
+    market = await getMarketById(marketId);
+  } catch (err) {
+    await sendMessage(chatId, `❌ 抓取市场失败：${htmlEscape(err.message)}`);
+    return;
+  }
+  if (!market) {
+    await sendMessage(chatId, [
+      `❌ 找不到 marketId <code>${htmlEscape(marketId)}</code>。`,
+      '可能 id 不对，或该市场已 resolve。试试发完整 URL。',
+    ].join('\n'));
+    return;
+  }
+  const m = {
+    id: String(market.id),
+    conditionId: market.conditionId ?? null,
+    title: market.title ?? market.question ?? null,
+    question: market.question ?? null,
+    slug: market.categorySlug ?? market.slug ?? market.marketSlug ?? null,
+  };
+  const existing = getSubscription(chatId, m.id);
+  addSubscription({
+    chatId,
+    marketId: m.id,
+    conditionId: m.conditionId,
+    title: m.title || m.question || `Market ${m.id}`,
+    slug: m.slug,
+  });
+  await saveState();
+  await sendSubscribed(chatId, m, { existingNote: existing?.note });
+}
+
+async function applyNoteInput(chatId, marketId, raw) {
+  const sub = getSubscription(chatId, marketId);
+  if (!sub) {
+    await sendMessage(chatId, `❌ 订阅 <code>${htmlEscape(marketId)}</code> 已不存在。`);
+    return;
+  }
+  const text = raw.trim();
+  // Single dash = clear.
+  const noteText = (text === '-' || text === '——') ? '' : text;
+  updateSubscriptionNote(chatId, marketId, noteText);
+  await saveState();
+  if (noteText) {
+    await sendMessage(chatId, [
+      `✅ 已设置备注`,
+      `<code>id=${marketId}</code> ${htmlEscape(sub.title || '')}`,
+      `📝 ${htmlEscape(noteText)}`,
+    ].join('\n'));
+  } else {
+    await sendMessage(chatId, `✅ 已清除备注  <code>id=${marketId}</code>`);
+  }
 }
 
 async function handleCallback(cb) {
@@ -306,6 +432,7 @@ async function handleCallback(cb) {
       await answerCallbackQuery(cb.id, { text: '无效选项', showAlert: true });
       return;
     }
+    const existing = getSubscription(chatId, pick.id);
     addSubscription({
       chatId,
       marketId: pick.id,
@@ -315,7 +442,20 @@ async function handleCallback(cb) {
     });
     await saveState();
     await answerCallbackQuery(cb.id, { text: '✅ 已订阅' });
-    await sendSubscribed(chatId, pick);
+    await sendSubscribed(chatId, pick, { existingNote: existing?.note });
+    return;
+  }
+
+  const noteMatch = data.match(/^note:(\d+)$/);
+  if (noteMatch) {
+    const id = noteMatch[1];
+    const sub = getSubscription(chatId, id);
+    if (!sub) {
+      await answerCallbackQuery(cb.id, { text: '订阅不存在', showAlert: true });
+      return;
+    }
+    await answerCallbackQuery(cb.id, { text: '请回复弹出的消息输入备注' });
+    await promptForNote(chatId, id);
     return;
   }
 
@@ -350,6 +490,7 @@ async function pollUpdates(signal) {
       await saveState();
     }
     gcPendingChoices();
+    gcPendingNotes();
   }
 }
 
@@ -362,6 +503,7 @@ async function main() {
     { command: 'help', description: '帮助' },
     { command: 'list', description: '当前订阅' },
     { command: 'levels', description: '自定义监控档位（买1/2/3、卖1/2/3）' },
+    { command: 'note', description: '设置/清除订阅备注' },
     { command: 'stop', description: '取消单个订阅' },
     { command: 'stopall', description: '取消全部订阅' },
   ]).catch((e) => console.warn('[bot] setMyCommands failed:', e.message));

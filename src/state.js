@@ -3,8 +3,9 @@ import { config } from './config.js';
 
 // Shape:
 // {
-//   subs: { "<chatId>:<marketId>": { chatId, marketId, conditionId, title, slug, levels, addedAt } },
+//   subs: { "<chatId>:<marketId>": { chatId, marketId, conditionId, title, slug, levels, note, addedAt } },
 //   pendingChoices: { "<chatId>:<token>": { matches: [...], expiresAt } },
+//   pendingNotes:   { "<chatId>:<promptMessageId>": { marketId, expiresAt } },
 //   telegramOffset: number
 // }
 // levels: array picked from ALL_LEVELS — empty array means "watch nothing"
@@ -24,7 +25,7 @@ export function normalizeLevels(levels) {
 }
 
 function emptyState() {
-  return { subs: {}, pendingChoices: {}, telegramOffset: 0 };
+  return { subs: {}, pendingChoices: {}, pendingNotes: {}, telegramOffset: 0 };
 }
 
 let _state = null;
@@ -38,6 +39,7 @@ export async function loadState() {
     _state = { ...emptyState(), ...(json && typeof json === 'object' ? json : {}) };
     if (!_state.subs) _state.subs = {};
     if (!_state.pendingChoices) _state.pendingChoices = {};
+    if (!_state.pendingNotes) _state.pendingNotes = {};
   } catch (err) {
     if (err.code !== 'ENOENT') console.warn(new Date().toISOString(), '[state] load failed:', err.message);
     _state = emptyState();
@@ -71,9 +73,18 @@ export function addSubscription(sub) {
   _state.subs[k] = {
     ...sub,
     levels: normalizeLevels(sub.levels ?? existing?.levels),
+    note: sub.note ?? existing?.note ?? null,
     addedAt: existing?.addedAt ?? Date.now(),
   };
   return k;
+}
+
+export function updateSubscriptionNote(chatId, marketId, note) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  const trimmed = (note ?? '').toString().trim();
+  s.note = trimmed.length ? trimmed.slice(0, 200) : null;
+  return s;
 }
 
 export function getSubscription(chatId, marketId) {
@@ -133,5 +144,31 @@ export function gcPendingChoices() {
   const now = Date.now();
   for (const [k, v] of Object.entries(_state.pendingChoices)) {
     if (!v?.expiresAt || v.expiresAt < now) delete _state.pendingChoices[k];
+  }
+}
+
+// Pending note prompts. Keyed by the bot's prompt-message id (the one
+// sent with ForceReply). When the user replies, message.reply_to_message
+// .message_id matches this key so we know which marketId the text is for.
+const NOTE_TTL_MS = 30 * 60 * 1000;
+
+export function putPendingNote(chatId, promptMessageId, marketId) {
+  const k = `${chatId}:${promptMessageId}`;
+  _state.pendingNotes[k] = { marketId: String(marketId), expiresAt: Date.now() + NOTE_TTL_MS };
+}
+
+export function takePendingNote(chatId, promptMessageId) {
+  const k = `${chatId}:${promptMessageId}`;
+  const entry = _state.pendingNotes[k];
+  if (!entry) return null;
+  delete _state.pendingNotes[k];
+  if (entry.expiresAt < Date.now()) return null;
+  return entry.marketId;
+}
+
+export function gcPendingNotes() {
+  const now = Date.now();
+  for (const [k, v] of Object.entries(_state.pendingNotes)) {
+    if (!v?.expiresAt || v.expiresAt < now) delete _state.pendingNotes[k];
   }
 }
