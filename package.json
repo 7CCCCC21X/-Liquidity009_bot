@@ -1,0 +1,15 @@
+{
+  "name": "liquidity009-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Telegram bot — paste a Predict.fun URL, pick a market card, watch the orderbook change in real time.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "get-chat-id": "node scripts/get-chat-id.js",
+    "check": "node --check src/*.js scripts/*.js"
+  }
+}
