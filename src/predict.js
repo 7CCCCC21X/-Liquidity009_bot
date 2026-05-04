@@ -123,77 +123,47 @@ export async function getMarketsByCategorySlug(slug) {
   return await resolveSlugViaCategories(slug);
 }
 
-// Predict.fun's MarketFilterInput exposes only categoryId (an ID),
-// not categorySlug. So the real chain is:
-//   slug  →  categories(filter: { <slugField>: slug }) → category.id
-//          →  markets(filter: { categoryId })
+// Predict.fun's GraphQL has an undocumented (but production-used)
+// quirk: `category(id: ID!)` accepts a URL slug as the ID argument
+// — the resolver looks the slug up directly. Verified via the Rust
+// SDK at https://github.com/sproot/predict-sdk/blob/main/src/graphql.rs
+// (which selects category.slug and uses slugs in production).
 //
-// We introspect CategoryFilterInput once to find which input field
-// accepts a slug (Predict.fun's exact name is unknown without probing
-// — diagnose run shows it). Cache both the field name and whether
-// it expects a list.
-let _categoryFilterCache = null;
+// So the real chain is:
+//   slug → category(id: <slug>) → numeric category.id
+//        → markets(filter: { categoryId: <numeric-id> })
+//
+// CategoryFilterInput has no slug field, so this overload is the
+// only first-class slug → category lookup the API exposes.
 
-async function findCategoryFilterSlugField() {
-  if (_categoryFilterCache !== null) return _categoryFilterCache;
+async function getCategoryBySlug(slugOrId) {
   try {
     const data = await postGraphQL(
-      `query { __type(name: "CategoryFilterInput") { inputFields { name type { name kind ofType { name kind ofType { name kind } } } } } }`,
-      {},
-      null,
-    );
-    const fields = data?.__type?.inputFields ?? [];
-    // Prefer fields whose name explicitly mentions "slug".
-    const slugLike = fields.filter((f) => /slug/i.test(f.name));
-    const f = slugLike[0] ?? null;
-    if (!f) {
-      _categoryFilterCache = { field: null, isList: false };
-      return _categoryFilterCache;
-    }
-    let t = f.type;
-    let isList = false;
-    while (t) {
-      if (t.kind === 'LIST') { isList = true; break; }
-      t = t.ofType;
-    }
-    _categoryFilterCache = { field: f.name, isList };
-  } catch (err) {
-    console.warn('[predict] CategoryFilterInput introspection failed:', err.message);
-    _categoryFilterCache = { field: null, isList: false };
-  }
-  return _categoryFilterCache;
-}
-
-async function getCategoryIdsBySlug(slug) {
-  const meta = await findCategoryFilterSlugField();
-  if (!meta.field) return [];
-  const filter = { [meta.field]: meta.isList ? [slug] : slug };
-  try {
-    const data = await postGraphQL(
-      `query($f: CategoryFilterInput!) {
-        categories(filter: $f, pagination: { first: 5 }) {
-          edges { node { id } }
+      `query CategoryByIdOrSlug($id: ID!) {
+        category(id: $id) {
+          __typename
+          id
         }
       }`,
-      { f: filter },
+      { id: String(slugOrId) },
       null,
     );
-    return (data?.categories?.edges ?? []).map((e) => e.node.id).filter(Boolean);
+    return data?.category ?? null;
   } catch (err) {
-    console.warn('[predict] categories filter failed:', err.message);
-    return [];
+    console.warn('[predict] category(id:slug) lookup failed:', err.message);
+    return null;
   }
 }
 
 async function getMarketsByCategoryId(categoryId) {
   try {
     const data = await postGraphQL(
-      `query($f: MarketFilterInput!) {
+      `query MarketsByCategory($f: MarketFilterInput!) {
         markets(filter: $f, pagination: { first: 100 }) {
           edges { node { id conditionId title question } }
         }
       }`,
-      { f: { categoryId } },
+      { f: { categoryId: String(categoryId) } },
       null,
     );
     const out = [];
@@ -208,14 +178,15 @@ async function getMarketsByCategoryId(categoryId) {
   }
 }
 
-// Chain-of-resolvers helper for callers that already have a slug. Tries
-// the user's slug first; if categories() returns nothing, also tries
-// any latest/canonical slug (handles Predict.fun's slug-rename redirect).
+// Resolve a URL slug → markets by chaining `category(id: slug)` →
+// `markets(filter: { categoryId })`. Falls back to latestCategorySlug
+// for the renamed-slug redirect case.
 async function resolveSlugViaCategories(originalSlug) {
-  const tried = new Set([originalSlug]);
+  const tried = new Set();
   const slugsToTry = [originalSlug];
-  // Also try the canonical version returned by latestCategorySlug, but
-  // only as a secondary attempt (it's null for current slugs anyway).
+  // If the user pasted a renamed slug, latestCategorySlug returns the
+  // current canonical one. Add it as a secondary attempt; for current
+  // slugs it returns null and we just skip it.
   try {
     const data = await postGraphQL(
       `query($s: String!) { latestCategorySlug(slug: $s) }`,
@@ -223,22 +194,17 @@ async function resolveSlugViaCategories(originalSlug) {
       null,
     );
     const canonical = data?.latestCategorySlug;
-    if (typeof canonical === 'string' && canonical && !tried.has(canonical)) {
+    if (typeof canonical === 'string' && canonical && canonical !== originalSlug) {
       slugsToTry.push(canonical);
-      tried.add(canonical);
     }
-  } catch { /* ignore */ }
+  } catch { /* ignore — fall back to user's slug */ }
   for (const s of slugsToTry) {
-    const ids = await getCategoryIdsBySlug(s);
-    if (!ids.length) continue;
-    // Fetch markets for each matched category, dedup by market id.
-    const out = [];
-    const seen = new Set();
-    for (const cid of ids) {
-      const ms = await getMarketsByCategoryId(cid);
-      for (const m of ms) if (!seen.has(m.id)) { seen.add(m.id); out.push(m); }
-    }
-    if (out.length) return out;
+    if (tried.has(s)) continue;
+    tried.add(s);
+    const cat = await getCategoryBySlug(s);
+    if (!cat?.id) continue;
+    const ms = await getMarketsByCategoryId(cat.id);
+    if (ms.length) return ms;
   }
   return [];
 }

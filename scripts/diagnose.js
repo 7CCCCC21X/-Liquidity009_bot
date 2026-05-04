@@ -418,6 +418,48 @@ for (const field of slugFieldGuesses) {
   }
 }
 
+// THE definitive probe: try category(id: <slug>) directly. The Predict.fun
+// resolver overloads `id: ID!` to also accept slugs (verified via the
+// open-source Rust SDK at github.com/sproot/predict-sdk).
+console.log('\n--- 🔑 category(id: <slug>) probe (Rust SDK pattern) ---');
+let catProbeId = null;
+try {
+  const r = await gql(
+    `query CategoryByIdOrSlug($id: ID!) {
+      category(id: $id) {
+        __typename
+        id
+      }
+    }`,
+    { id: slug },
+  );
+  if (r?.errors) {
+    fail(`category(id: "${slug}") errored: ${JSON.stringify(r.errors[0]?.message ?? r.errors).slice(0, 200)}`);
+  } else if (r?.data?.category?.id) {
+    catProbeId = r.data.category.id;
+    ok(`category(id: "${slug}") → id=${catProbeId} (__typename=${r.data.category.__typename})`);
+    // Now markets(filter: { categoryId })
+    const m = await gql(
+      `query($f: MarketFilterInput!) { markets(filter: $f, pagination: { first: 100 }) { edges { node { id conditionId title question } } } }`,
+      { f: { categoryId: catProbeId } },
+    );
+    const edges = m?.data?.markets?.edges ?? [];
+    if (edges.length) {
+      ok(`markets(filter:{categoryId:${catProbeId}}) → ${edges.length} markets 🎯🎯🎯`);
+      for (const e of edges.slice(0, 12)) console.log(`      • ${e.node.id} ${e.node.title}`);
+      if (edges.length > 12) info(`(${edges.length - 12} more)`);
+      chainMarkets = edges.map((e) => e.node);
+      workingChain = { method: 'category(id:slug)→markets(filter:{categoryId})', categoryId: catProbeId };
+    } else {
+      info(`markets(filter:{categoryId:${catProbeId}}) returned 0 markets`);
+    }
+  } else {
+    info(`category(id: "${slug}") returned null — slug not found by overloaded resolver`);
+  }
+} catch (err) {
+  fail(`category probe failed: ${err.message}`);
+}
+
 // Dump full field list of Category interface AND every concrete Category
 // subtype so we know if any of them expose a `slug` scalar we can select.
 // If they do, the right resolver is "enumerate categories + client-side
