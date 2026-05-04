@@ -44,6 +44,21 @@ npm run get-chat-id    # 顺便找到你的 chat id（可选，用于 admin 提�
 npm start
 ```
 
+## 诊断 slug 解析失败
+如果发了 URL 之后 bot 回复"没匹配到市场"，先在终端跑诊断脚本看链路里每一环：
+```bash
+node scripts/diagnose.js https://predict.fun/zh-cn/market/fifa-world-cup-group-e-winner
+# 或
+npm run diagnose -- https://predict.fun/zh-cn/market/fifa-world-cup-group-e-winner
+```
+脚本会逐步打印：① slug 解析；② GraphQL schema 暴露的字段；③ 全市场列表大小；
+④ 严格匹配（title / question / categorySlug，含年份变体）；⑤ 模糊 token 匹配 top 10；
+⑥ REST `/v1/markets` 兜底扫描；以及一段总结建议。
+
+> Bot 内置的解析器现在依次试 5 层：title-slug → question-slug → 年份变体 →
+> GraphQL categorySlug → REST `/v1/markets` 全表扫描。还匹配不到时会用模糊
+> token 给出"你是不是要找…"的可点选列表。
+
 ## 部署到 Railway
 1. 把仓库 push 到 GitHub。
 2. Railway → New Project → Deploy from GitHub Repo。

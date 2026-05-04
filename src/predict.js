@@ -17,6 +17,27 @@ export function slugify(s) {
     .replace(/^-+|-+$/g, '');
 }
 
+// Predict.fun's URL slug includes the year for dated markets but the
+// API title often omits it. Inject the current year before slugifying
+// so titles like "BNB up or down (May 2)" match URL slugs like
+// "bnb-up-or-down-may-2-2026". For matches that already contain a
+// 20XX year nothing changes.
+export function slugifyWithYear(s) {
+  if (!s) return '';
+  let t = String(s);
+  if (!/\b20\d{2}\b/.test(t)) {
+    const m = t.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}/i);
+    const year = new Date().getUTCFullYear();
+    if (m) {
+      const idx = t.indexOf(m[0]) + m[0].length;
+      t = t.slice(0, idx) + ' ' + year + t.slice(idx);
+    } else {
+      t = `${t} ${year}`;
+    }
+  }
+  return slugify(t);
+}
+
 // Detects an input that's just a numeric market id (e.g. "257916").
 // Returns the trimmed id string, or null. Bot uses this to short-circuit
 // the slug-resolution path when the user already knows the id.
@@ -181,6 +202,65 @@ export async function getMarketById(id) {
   return data?.market ?? null;
 }
 
+// REST `/v1/markets` exposes `categorySlug` (the actual URL slug) on
+// every market, while GraphQL doesn't reliably surface it. Cache an
+// id → categorySlug map so resolveSlugToMarkets has an authoritative
+// fallback when GraphQL title/question slugify produces a different
+// string than the URL.
+let _slugCache = { at: 0, byId: null, inFlight: null };
+
+function pickRestSlug(m) {
+  return m?.categorySlug || m?.slug || m?.marketSlug || m?.category_slug || null;
+}
+
+export async function getSlugMapCached() {
+  const now = Date.now();
+  if (_slugCache.byId && now - _slugCache.at < config.marketsCacheTtlMs) return _slugCache.byId;
+  if (_slugCache.inFlight) return _slugCache.inFlight;
+  _slugCache.inFlight = (async () => {
+    const map = new Map();
+    let lastId = null;
+    for (let page = 0; page < 50; page++) {
+      const params = new URLSearchParams({ first: '100' });
+      if (lastId != null) params.set('after', String(lastId));
+      const url = `${config.restUrl}/markets?${params.toString()}`;
+      let arr = [];
+      try {
+        const json = await fetchJson(url, {
+          headers: restHeaders(),
+          timeoutMs: config.orderbookTimeoutMs,
+          retries: 1,
+        });
+        const data = json?.data ?? json;
+        arr = Array.isArray(data) ? data : (data?.markets ?? data?.items ?? data?.nodes ?? []);
+      } catch {
+        break;
+      }
+      if (!arr.length) break;
+      let progress = 0;
+      for (const m of arr) {
+        if (m?.id == null || map.has(String(m.id))) continue;
+        const slug = pickRestSlug(m);
+        if (slug) {
+          // Store the full record so the resolver can return title/conditionId
+          // without round-tripping back to GraphQL.
+          map.set(String(m.id), { slug: String(slug).toLowerCase(), market: m });
+          progress += 1;
+        }
+      }
+      if (!progress) break;
+      if (arr.length < 100) break;
+      const newLast = arr[arr.length - 1]?.id;
+      if (newLast == null || newLast === lastId) break;
+      lastId = newLast;
+    }
+    _slugCache.byId = map;
+    _slugCache.at = Date.now();
+    return map;
+  })().finally(() => { _slugCache.inFlight = null; });
+  return _slugCache.inFlight;
+}
+
 // Resolve a slug to ALL matching markets — single-market URLs return one
 // hit, event-level URLs (multiple sub-markets share question / categorySlug)
 // return many. Each match: { id, conditionId, title, question, slug }.
@@ -189,7 +269,7 @@ export async function resolveSlugToMarkets(slug) {
   const all = await getAllMarketsCached();
   const seen = new Set();
   const matches = [];
-  const add = (m) => {
+  const add = (m, slugOverride) => {
     const id = String(m.id);
     if (seen.has(id)) return;
     seen.add(id);
@@ -198,20 +278,75 @@ export async function resolveSlugToMarkets(slug) {
       conditionId: m.conditionId ?? null,
       title: m.title ?? null,
       question: m.question ?? null,
-      slug: m.categorySlug ?? m.slug ?? m.marketSlug ?? null,
+      slug: slugOverride ?? m.categorySlug ?? m.slug ?? m.marketSlug ?? null,
     });
   };
+  // Tier 1: exact title-slug match (single-market URLs).
   for (const m of all) {
     if (slugify(m.title ?? '') === slug) add(m);
   }
+  // Tier 2: question slug (event-level URLs whose subs share question text).
   for (const m of all) {
     if (slugify(m.question ?? '') === slug) add(m);
   }
+  // Tier 3: year-augmented variants — Predict.fun URLs often have the
+  // year ("...-2026") that the API title omits.
+  for (const m of all) {
+    if (slugifyWithYear(m.title ?? '') === slug) add(m);
+  }
+  for (const m of all) {
+    if (slugifyWithYear(m.question ?? '') === slug) add(m);
+  }
+  // Tier 4: GraphQL-exposed categorySlug.
   for (const m of all) {
     const cs = m.categorySlug ?? m.slug ?? m.marketSlug;
     if (cs && String(cs).toLowerCase() === slug) add(m);
   }
+  // Tier 5: REST slug map (authoritative — has categorySlug for every
+  // market regardless of whether GraphQL exposes it). Only consult if
+  // the GraphQL pass came up empty, since REST scan is a separate
+  // network round-trip.
+  if (matches.length === 0) {
+    try {
+      const slugMap = await getSlugMapCached();
+      for (const [id, entry] of slugMap.entries()) {
+        if (entry.slug !== slug) continue;
+        // Prefer the GraphQL record (it has rewardTimings etc) but fall
+        // back to the REST one so we still return something.
+        const graphM = all.find((x) => String(x.id) === id);
+        add(graphM ?? entry.market, entry.slug);
+      }
+    } catch {
+      // best-effort
+    }
+  }
   return matches;
+}
+
+// Suggest similar markets when a slug doesn't match exactly. Used by
+// the bot to render "did you mean…" buttons. Returns up to `limit`
+// markets ranked by how many slug tokens they contain.
+export async function fuzzySlugSuggestions(slug, limit = 8) {
+  if (!slug) return [];
+  const tokens = slug.split('-').filter((t) => t.length >= 3);
+  if (!tokens.length) return [];
+  const all = await getAllMarketsCached();
+  const minScore = Math.max(1, Math.ceil(tokens.length / 2));
+  const scored = [];
+  for (const m of all) {
+    const hay = `${slugify(m.title ?? '')} ${slugify(m.question ?? '')} ${m.categorySlug ?? ''}`;
+    let score = 0;
+    for (const t of tokens) if (hay.includes(t)) score += 1;
+    if (score >= minScore) scored.push({ m, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(({ m }) => ({
+    id: String(m.id),
+    conditionId: m.conditionId ?? null,
+    title: m.title ?? null,
+    question: m.question ?? null,
+    slug: m.categorySlug ?? m.slug ?? m.marketSlug ?? null,
+  }));
 }
 
 const ORDERBOOK_DEPTH = 3;

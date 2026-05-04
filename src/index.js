@@ -9,7 +9,7 @@ import {
   putPendingNote, takePendingNote, gcPendingNotes,
   ALL_LEVELS, LEVEL_LABEL,
 } from './state.js';
-import { extractSlugFromUrl, extractMarketId, resolveSlugToMarkets, getMarketById } from './predict.js';
+import { extractSlugFromUrl, extractMarketId, resolveSlugToMarkets, fuzzySlugSuggestions, getMarketById } from './predict.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -137,9 +137,30 @@ async function handleUrl(chatId, text) {
     return;
   }
   if (!matches.length) {
+    // Try a fuzzy fallback so the user gets an actionable list instead
+    // of a dead end. Common cause: URL slug includes the year ("...-2026")
+    // but the API title omits it, or the slug points at an event page
+    // whose sub-markets share a different question text.
+    let suggestions = [];
+    try { suggestions = await fuzzySlugSuggestions(slug, 8); } catch { /* ignore */ }
+    if (suggestions.length) {
+      const token = shortToken();
+      putPendingChoice(chatId, token, suggestions);
+      await saveState();
+      await sendMessage(chatId, [
+        `❓ 没找到完全匹配 slug=<code>${htmlEscape(slug)}</code>，下面是相似的市场：`,
+        `<i>（点选订阅；30 分钟内有效）</i>`,
+      ].join('\n'), { replyMarkup: buildChoiceKeyboard(token, suggestions) });
+      return;
+    }
     await sendMessage(chatId, [
       `❌ 没匹配到市场（slug=<code>${htmlEscape(slug)}</code>）。`,
-      '可能原因：市场已 resolve、slug 拼写不一致、或缓存还没刷新（10 分钟）。',
+      '可能原因：',
+      '• 市场已 resolve（GraphQL 默认过滤已结算）',
+      '• 是事件页 (event)，不是单 market',
+      '• 缓存还没刷新（10 分钟 TTL）',
+      '',
+      '排查：在仓库目录下跑 <code>node scripts/diagnose.js &lt;url&gt;</code> 看每一步实际返回。',
     ].join('\n'));
     return;
   }
