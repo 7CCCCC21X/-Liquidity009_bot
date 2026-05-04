@@ -334,7 +334,7 @@ try {
   fail(`call failed: ${err.message}`);
 }
 
-step(9, 9, 'Chained query: categories(filter) → category.id → markets(filter:{categoryId})');
+step(9, 10, 'Chained query: categories(filter) → category.id → markets(filter:{categoryId})');
 // Introspect CategoryFilterInput first.
 let categoryFilterFields = [];
 try {
@@ -418,6 +418,197 @@ for (const field of slugFieldGuesses) {
   }
 }
 
+// Dump full field list of Category interface AND every concrete Category
+// subtype so we know if any of them expose a `slug` scalar we can select.
+// If they do, the right resolver is "enumerate categories + client-side
+// slug match" (paginated).
+const CATEGORY_TYPES = ['Category', 'DefaultCategory', 'CryptoUpDownCategory', 'SportsMatchCategory', 'SportsTeamMatchCategory', 'TweetCountCategory'];
+console.log('\n--- Full field dump of Category types ---');
+for (const tn of CATEGORY_TYPES) {
+  try {
+    const intro = await gql(`query($n: String!) { __type(name: $n) { kind fields { name type { name kind ofType { name kind ofType { name kind } } } } } }`, { n: tn });
+    const fields = intro?.data?.__type?.fields ?? [];
+    if (!fields.length) { info(`${tn}: (no fields exposed)`); continue; }
+    const slugFields = fields.filter((f) => /slug/i.test(f.name));
+    const summary = slugFields.length
+      ? slugFields.map((f) => `${f.name}: ${typeStr(f.type)}`).join(', ')
+      : `(${fields.length} fields total, none match /slug/)`;
+    console.log(`  ${tn}: ${summary}`);
+    // Always show full field list — short enough
+    if (fields.length <= 20) {
+      console.log(`    all: ${fields.map((f) => f.name).join(', ')}`);
+    } else {
+      console.log(`    first 20: ${fields.slice(0, 20).map((f) => f.name).join(', ')} ...`);
+    }
+  } catch (err) {
+    fail(`${tn} introspection failed: ${err.message}`);
+  }
+}
+
+// Try enumerating categories() with a query that requests slug across
+// every concrete subtype. If any returns slug=<user slug>, we win.
+console.log('\n--- categories() enumeration probe ---');
+let enumCategoryId = null;
+let enumCategoryFields = null;
+try {
+  // Try enumerate first with a kitchen-sink query
+  const r = await gql(
+    `query {
+      categories(pagination: { first: 50 }) {
+        edges {
+          node {
+            __typename
+            id
+            ... on DefaultCategory { slug title }
+            ... on CryptoUpDownCategory { slug title }
+            ... on SportsMatchCategory { slug title }
+            ... on SportsTeamMatchCategory { slug title }
+            ... on TweetCountCategory { slug title }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }`,
+  );
+  if (r?.errors) {
+    fail(`categories() greedy errored: ${JSON.stringify(r.errors[0]?.message ?? r.errors).slice(0, 200)}`);
+  } else {
+    const edges = r?.data?.categories?.edges ?? [];
+    info(`categories() returned ${edges.length} entries (page 1)`);
+    // Match client-side
+    const match = edges.find((e) => e.node?.slug === slug);
+    if (match) {
+      enumCategoryId = match.node.id;
+      enumCategoryFields = match.node;
+      ok(`✓ found by slug! id=${match.node.id}  __typename=${match.node.__typename}`);
+    } else {
+      // Print first 5 to see what slugs look like
+      console.log('    first 5 nodes (for slug-format reference):');
+      for (const e of edges.slice(0, 5)) {
+        console.log(`      ${e.node.__typename}  id=${e.node.id}  slug="${e.node.slug ?? '(no slug field on this subtype)'}"  title="${e.node.title ?? ''}"`);
+      }
+      info(`(slug "${slug}" not in first 50; full enumeration would need to paginate)`);
+    }
+  }
+} catch (err) {
+  fail(`categories() probe failed: ${err.message}`);
+}
+
+if (enumCategoryId) {
+  try {
+    const m = await gql(
+      `query($f: MarketFilterInput!) { markets(filter: $f, pagination: { first: 100 }) { edges { node { id conditionId title question } } } }`,
+      { f: { categoryId: enumCategoryId } },
+    );
+    const edges = m?.data?.markets?.edges ?? [];
+    if (edges.length) {
+      ok(`markets(filter:{categoryId:${enumCategoryId}}) → ${edges.length} markets 🎯🎯🎯`);
+      for (const e of edges.slice(0, 12)) console.log(`      • ${e.node.id} ${e.node.title}`);
+      chainMarkets = edges.map((e) => e.node);
+      workingChain = { method: 'enumerate-then-categoryId', categoryId: enumCategoryId };
+    }
+  } catch (err) {
+    fail(`final markets call failed: ${err.message}`);
+  }
+}
+
+step(10, 10, 'search(query:) — Predict.fun built-in full-text search');
+let searchResultFields = [];
+try {
+  const intro = await gql(`query { __type(name: "SearchResult") { fields { name type { name kind ofType { name kind ofType { name kind } } } } } }`);
+  searchResultFields = intro?.data?.__type?.fields ?? [];
+  if (searchResultFields.length) {
+    console.log('    --- SearchResult fields ---');
+    for (const f of searchResultFields) console.log(`      ${f.name}: ${typeStr(f.type)}`);
+  } else {
+    info('SearchResult has no fields (or not introspectable)');
+  }
+} catch (err) {
+  fail(`SearchResult introspection failed: ${err.message}`);
+}
+
+try {
+  const intro = await gql(`query { __type(name: "SearchFilterInput") { inputFields { name type { name kind ofType { name kind } } } } }`);
+  const fields = intro?.data?.__type?.inputFields ?? [];
+  if (fields.length) {
+    console.log('    --- SearchFilterInput inputFields ---');
+    for (const f of fields) console.log(`      ${f.name}: ${typeStr(f.type)}`);
+  }
+} catch { /* ignore */ }
+
+let searchMarkets = [];
+let searchCategoryId = null;
+const searchText = slug.replace(/-/g, ' ');
+try {
+  const subSel = `{
+    __typename
+    ... on Category { id title }
+    ... on DefaultCategory { id title slug }
+    ... on CryptoUpDownCategory { id title slug }
+    ... on SportsMatchCategory { id title slug }
+    ... on SportsTeamMatchCategory { id title slug }
+    ... on TweetCountCategory { id title slug }
+    ... on Market { id conditionId title question }
+  }`;
+  // Wrap each top-level field as a connection (most are). Server will
+  // ignore extras for non-connection fields and we'll fall back if it
+  // errors entirely.
+  const inner = searchResultFields.map((f) => {
+    let t = f.type;
+    while (t && (t.kind === 'NON_NULL' || t.kind === 'LIST')) t = t.ofType;
+    if (!t) return f.name;
+    if (t.kind === 'SCALAR' || t.kind === 'ENUM') return f.name;
+    return `${f.name} { __typename edges { node ${subSel} } }`;
+  }).join('\n      ');
+  const r = await gql(
+    `query Sr($q: String!) { search(query: $q, pagination: { first: 20 }) { ${inner} } }`,
+    { q: searchText },
+  );
+  if (r?.errors) {
+    fail(`search errored: ${JSON.stringify(r.errors[0]?.message ?? r.errors).slice(0, 300)}`);
+  } else {
+    ok(`search("${searchText}") returned data`);
+    console.log('    raw payload (first 1800 chars):');
+    console.log('   ', JSON.stringify(r.data, null, 2).slice(0, 1800));
+    const cats = [];
+    const mks = [];
+    function walk(node) {
+      if (!node) return;
+      if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+      if (typeof node !== 'object') return;
+      const tn = node.__typename ?? '';
+      if (/Category$/i.test(tn) && node.id) cats.push(node);
+      else if (tn === 'Market' && node.id) mks.push(node);
+      for (const v of Object.values(node)) walk(v);
+    }
+    walk(r.data);
+    info(`walked: ${cats.length} categories, ${mks.length} markets`);
+    if (cats.length) {
+      console.log('    --- categories from search ---');
+      for (const c of cats.slice(0, 8)) console.log(`      • id=${c.id}  title="${c.title}"  slug="${c.slug ?? ''}"`);
+      const exact = cats.find((c) => c.slug === slug) ?? cats[0];
+      searchCategoryId = exact.id;
+      const m = await gql(
+        `query($f: MarketFilterInput!) { markets(filter: $f, pagination: { first: 100 }) { edges { node { id conditionId title question } } } }`,
+        { f: { categoryId: exact.id } },
+      );
+      const edges = m?.data?.markets?.edges ?? [];
+      if (edges.length) {
+        ok(`markets(filter:{categoryId:${exact.id}}) → ${edges.length} markets 🎯`);
+        for (const e of edges.slice(0, 12)) console.log(`      • ${e.node.id} ${e.node.title}`);
+        searchMarkets = edges.map((e) => e.node);
+      }
+    } else if (mks.length) {
+      searchMarkets = mks;
+      ok(`search returned ${mks.length} markets directly 🎯`);
+    } else {
+      info('no Category or Market objects found in search payload');
+    }
+  }
+} catch (err) {
+  fail(`search call failed: ${err.message}`);
+}
+
 console.log('\n----- 总结 -----');
 if (chainMarkets.length) {
   console.log(`✅ Step 9 命中: 用 categories.${workingChain.slugField}=${slug} → categoryId=${workingChain.categoryId}`);
@@ -428,7 +619,8 @@ if (chainMarkets.length) {
   console.log(`✅ Step 7 命中: HTML scrape 拿到 ${htmlMarkets.length} 个。`);
 } else if (dedup.length) {
   console.log('Step 4 命中：slug 匹配到了。');
+} else if (searchMarkets.length) {
+  console.log(`✅ Step 10 命中: search() 找到 ${searchMarkets.length} 个 market via category id ${searchCategoryId}。`);
 } else {
-  console.log('全部失败。把 [9/9] 的 CategoryFilterInput inputFields 输出贴给我，');
-  console.log('特别是有没有像 search/query 之类的字段——可能要换 free-text search 路线。');
+  console.log('全部失败 — 把 [10/10] 的 SearchFilterInput / SearchResult dump 贴回来。');
 }
