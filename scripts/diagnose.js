@@ -10,7 +10,7 @@
 
 import { config } from '../src/config.js';
 import { fetchJson } from '../src/http.js';
-import { extractSlugFromUrl, slugify, getAllMarketsCached, extractMarketsFromHtml } from '../src/predict.js';
+import { extractSlugFromUrl, slugify, getAllMarketsCached, extractMarketsFromHtml, getMarketsByCategorySlug } from '../src/predict.js';
 
 const arg = process.argv[2];
 if (!arg) {
@@ -42,7 +42,7 @@ function slugifyWithYear(s) {
   return slugify(t);
 }
 
-step(1, 6, 'Parse input');
+step(1, 8, 'Parse input');
 const slug = extractSlugFromUrl(arg);
 if (!slug) {
   fail('extractSlugFromUrl returned null — input is neither a recognisable URL nor a slug');
@@ -216,15 +216,32 @@ try {
   fail(`HTML fetch failed: ${err.message}`);
 }
 
+step(8, 8, 'GraphQL latestCategorySlug(slug:) — authoritative resolver');
+let csMarkets = [];
+try {
+  csMarkets = await getMarketsByCategorySlug(slug);
+  if (csMarkets.length) {
+    ok(`got ${csMarkets.length} markets`);
+    for (const m of csMarkets.slice(0, 12)) {
+      console.log(`    id=${m.id}  conditionId=${m.conditionId ? m.conditionId.slice(0, 16) + '…' : '(none — bot will refetch)'}`);
+      console.log(`         title="${m.title}"  question="${m.question}"`);
+    }
+    if (csMarkets.length > 12) info(`(${csMarkets.length - 12} more)`);
+  } else {
+    fail('latestCategorySlug returned null / empty (slug not in any active category)');
+  }
+} catch (err) {
+  fail(`call failed: ${err.message}`);
+}
+
 console.log('\n----- 总结 -----');
-if (htmlMarkets.length) {
-  console.log(`✅ HTML scrape works — bot will use this path for URLs (${htmlMarkets.length} 个 sub-market 已识别).`);
-  console.log('   再发一遍那个 URL 给 bot 就会弹出选择列表。');
-} else if (dedup.length || restHits) {
-  console.log('Slug 路径找到了，HTML 路径没拿到 — 多半是 cache 还没刷新或 bot 没重启。');
+if (csMarkets.length) {
+  console.log(`✅ Tier 1 命中：latestCategorySlug 返回了 ${csMarkets.length} 个 market。`);
+  console.log('   Bot 重启后再发同一个 URL，会弹出这些 market 让你选订哪个。');
+} else if (htmlMarkets.length) {
+  console.log(`✅ Tier 2 命中：HTML 拿到 ${htmlMarkets.length} 个。重启 bot 后可用。`);
+} else if (dedup.length) {
+  console.log('Tier 3 命中：slug 匹配到了。重启 bot 即可。');
 } else {
-  console.log('GraphQL / REST / HTML 三路都没拿到。');
-  console.log('  • 把 [7/7] 的 HTML size 贴给我（如果 size < 5KB 可能是被 CDN 拦了）');
-  console.log('  • 设 PREDICT_API_KEY 后重跑（让 [6/7] REST 兜底起作用）');
-  console.log('  • 检查 [2/7] Query 字段里有没有 event/eventBySlug 类的 resolver');
+  console.log('Tier 1/2/3 都没拿到。请贴 [8/8] 的报错信息和 [2/8] Query 字段输出，我再针对性修。');
 }

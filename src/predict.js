@@ -49,7 +49,10 @@ const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/
 
 // Recursively walk a JSON blob looking for objects shaped like a
 // Predict.fun market: must have an `id` AND at least one of
-// title/question AND a conditionId. Returns deduped list.
+// title/question. conditionId is preserved when present but not
+// required (we can refetch via getMarketById later). The id must
+// look numeric (4–8 digits) to filter out unrelated graph nodes
+// like {id: "edge-1", ...}.
 function collectMarketLikeObjects(node, out, seen) {
   if (node == null) return;
   if (Array.isArray(node)) {
@@ -58,19 +61,16 @@ function collectMarketLikeObjects(node, out, seen) {
   }
   if (typeof node !== 'object') return;
   const id = node.id ?? node.marketId;
-  const cond = node.conditionId ?? node.condition_id;
-  if (id != null && cond && (node.title || node.question)) {
-    const key = String(id);
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push({
-        id: key,
-        conditionId: String(cond),
-        title: node.title ?? null,
-        question: node.question ?? null,
-        slug: node.categorySlug ?? node.slug ?? node.marketSlug ?? null,
-      });
-    }
+  const idStr = id != null ? String(id) : '';
+  if (idStr && /^\d{2,9}$/.test(idStr) && (node.title || node.question) && !seen.has(idStr)) {
+    seen.add(idStr);
+    out.push({
+      id: idStr,
+      conditionId: node.conditionId ?? node.condition_id ?? null,
+      title: node.title ?? null,
+      question: node.question ?? null,
+      slug: node.categorySlug ?? node.slug ?? node.marketSlug ?? null,
+    });
   }
   for (const v of Object.values(node)) collectMarketLikeObjects(v, out, seen);
 }
@@ -110,21 +110,129 @@ export async function extractMarketsFromHtml(url) {
   return { markets: out, meta };
 }
 
-// Top-level resolver used by the bot. If input is a URL → try HTML
-// scrape first (works for events + slug-less GraphQL schemas). If
-// that returns nothing, fall back to the cached slug-based path.
+// Predict.fun's GraphQL exposes a `latestCategorySlug(slug: String)`
+// resolver that maps a URL slug directly to the underlying category +
+// markets. This is the authoritative path — it bypasses every problem
+// with title/question slugify mismatches and works for event pages.
+//
+// We don't know the exact return type up front (might be `Category`,
+// `CategoryEdge`, etc.), so introspect once, build a query that
+// requests every scalar field plus any nested field whose name looks
+// markets-related, then walk the response with collectMarketLikeObjects.
+let _categorySlugQueryCache = null;
+
+async function buildCategorySlugQuery() {
+  if (_categorySlugQueryCache) return _categorySlugQueryCache;
+  // 1. Find the return type name of latestCategorySlug.
+  const root = await postGraphQL(
+    `query { __schema { queryType { fields { name type { name kind ofType { name kind ofType { name kind ofType { name kind } } } } } } } }`,
+    {},
+    null,
+  );
+  const qf = (root?.__schema?.queryType?.fields ?? []).find((f) => f.name === 'latestCategorySlug');
+  if (!qf) throw new Error('latestCategorySlug not exposed by GraphQL');
+  let t = qf.type;
+  while (t && (t.kind === 'NON_NULL' || t.kind === 'LIST')) t = t.ofType;
+  const typeName = t?.name;
+  if (!typeName) throw new Error('latestCategorySlug return type has no concrete name');
+
+  // 2. Introspect that type's fields. Pick scalars + flag any nested
+  // field whose name mentions "market" so we can drill in.
+  const detail = await postGraphQL(
+    `query($n: String!) { __type(name: $n) { fields { name type { name kind ofType { name kind ofType { name kind } } } } } }`,
+    { n: typeName },
+    null,
+  );
+  const fields = detail?.__type?.fields ?? [];
+  const scalarNames = [];
+  const nestedSelections = [];
+  for (const f of fields) {
+    let ft = f.type;
+    while (ft && (ft.kind === 'NON_NULL' || ft.kind === 'LIST')) ft = ft.ofType;
+    if (!ft) continue;
+    if (ft.kind === 'SCALAR' || ft.kind === 'ENUM') {
+      scalarNames.push(f.name);
+    } else if (/market|edge|node|item|connection/i.test(f.name)) {
+      // Drill into market-flavoured fields. Try a generic Market sub-
+      // selection and let the GraphQL server reject any field it
+      // doesn't recognise — we wrap the call in try/catch upstream
+      // and progressively narrow.
+      nestedSelections.push(f.name);
+    }
+  }
+  if (!scalarNames.includes('id')) scalarNames.unshift('id');
+
+  // 3. Build the query. We try a maximally-greedy version first; if
+  // it fails (unknown sub-fields), fall back to scalars-only and rely
+  // on the recursive walker to find market objects deeper in the tree.
+  const marketSubSelection = '{ id conditionId title question }';
+  const greedy = `query Cat($slug: String!) {
+    latestCategorySlug(slug: $slug) {
+      ${scalarNames.join(' ')}
+      ${nestedSelections.map((n) => `${n} ${marketSubSelection}`).join('\n      ')}
+    }
+  }`;
+  const safe = `query Cat($slug: String!) {
+    latestCategorySlug(slug: $slug) {
+      ${scalarNames.join(' ')}
+    }
+  }`;
+  _categorySlugQueryCache = { greedy, safe, typeName, scalarNames, nestedSelections };
+  return _categorySlugQueryCache;
+}
+
+// Resolve a categorySlug → list of markets via GraphQL. Returns [] if
+// the resolver responds null (slug doesn't exist).
+export async function getMarketsByCategorySlug(slug) {
+  if (!slug) return [];
+  const q = await buildCategorySlugQuery();
+  // Try greedy first — usually works because Market is the universal
+  // sub-type. If it errors out, retry the safer scalars-only shape.
+  let data;
+  try {
+    data = await postGraphQL(q.greedy, { slug }, null);
+  } catch (errGreedy) {
+    try {
+      data = await postGraphQL(q.safe, { slug }, null);
+    } catch (errSafe) {
+      throw new Error(`latestCategorySlug failed: greedy=${errGreedy.message} | safe=${errSafe.message}`);
+    }
+  }
+  const cat = data?.latestCategorySlug;
+  if (!cat) return [];
+  const out = [];
+  collectMarketLikeObjects(cat, out, new Set());
+  return out;
+}
+
+// Top-level resolver used by the bot. Tries every known path in order:
+//   1. categorySlug GraphQL resolver (works for events + single markets)
+//   2. HTML scrape of the rendered page (fails behind Cloudflare but
+//      kept for non-CF deployments)
+//   3. Cached slug-based 5-tier matcher
 export async function resolveUrlToMarkets(input) {
+  const slug = extractSlugFromUrl(input);
+  // Tier 1: GraphQL categorySlug resolver — works for the slug regardless
+  // of what the bot's market list looks like, and handles event pages.
+  if (slug) {
+    try {
+      const markets = await getMarketsByCategorySlug(slug);
+      if (markets.length) return { markets, source: 'categorySlug', slug };
+    } catch (err) {
+      console.warn('[predict] categorySlug query failed:', err.message);
+    }
+  }
+  // Tier 2: HTML scrape (may be blocked by Cloudflare on predict.fun).
   const isUrl = /^https?:\/\//i.test(String(input).trim());
   if (isUrl) {
     try {
       const { markets, meta } = await extractMarketsFromHtml(input);
       if (markets.length) return { markets, source: 'html', meta };
     } catch (err) {
-      // Don't bail — try slug path before giving up.
       console.warn('[predict] HTML scrape failed:', err.message);
     }
   }
-  const slug = extractSlugFromUrl(input);
+  // Tier 3: cached title/question slug matcher.
   if (!slug) return { markets: [], source: 'none' };
   const markets = await resolveSlugToMarkets(slug);
   return { markets, source: markets.length ? 'slug' : 'none', slug };
