@@ -34,6 +34,8 @@ export const config = {
   notifyCooldownMs: envNum('NOTIFY_COOLDOWN_SEC', 60) * 1000,
 
   stateFile: envStr('STATE_FILE', './state.json'),
+  historyFile: envStr('HISTORY_FILE', './history.jsonl'),
+  historyMax: envNum('HISTORY_MAX', 5000),
 };
 
 export function requireConfig() {

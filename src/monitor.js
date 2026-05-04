@@ -5,6 +5,7 @@ import {
   listAllSubscriptions, removeSubscription, saveState,
   ALL_LEVELS, LEVEL_LABEL, subKey,
 } from './state.js';
+import { appendHistory } from './history.js';
 
 // Per-sub last-notified snapshot (so each sub diffs against the book
 // at the moment it last got an alert, not against an unrelated sub's
@@ -145,6 +146,16 @@ async function pollOnce() {
         await sendMessage(s.chatId, text);
         lastNotify.set(k, now);
         lastBookPerSub.set(k, snap);
+        appendHistory({
+          ts: now,
+          chatId: s.chatId,
+          marketId: s.marketId,
+          title: s.title,
+          note: s.note,
+          levels,
+          summary,
+          snap,
+        });
       } catch (err) {
         console.warn('[monitor] send failed', s.chatId, err.message);
         if (err.message?.includes('403')) {

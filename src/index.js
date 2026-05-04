@@ -10,6 +10,7 @@ import {
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveSlugToMarkets, getMarketById } from './predict.js';
 import { startMonitorLoop } from './monitor.js';
+import { readHistory } from './history.js';
 
 requireConfig();
 
@@ -28,6 +29,7 @@ const HELP = [
   '/list — 当前订阅的市场',
   '/levels &lt;marketId&gt; — 自定义监控档位',
   '/note &lt;marketId&gt; [备注] — 设置备注（不带文字 = 清除）',
+  '/history [marketId] [N] — 查看最近的推送记录（默认 10 条）',
   '/stop &lt;marketId&gt; — 取消订阅',
   '/stopall — 取消全部订阅',
 ].join('\n');
@@ -180,9 +182,39 @@ async function handleCommand(chatId, text) {
     for (const s of subs) {
       const levels = s.levels?.length ? s.levels.map((l) => LEVEL_LABEL[l]).join('/') : '（无）';
       const noteLine = s.note ? `\n   📝 ${htmlEscape(s.note)}` : '';
-      lines.push(`• <code>${s.marketId}</code> — ${htmlEscape(s.title || '')}${noteLine}\n   档位：${levels}  /levels_${s.marketId}  /note_${s.marketId}`);
+      lines.push(`• <code>${s.marketId}</code> — ${htmlEscape(s.title || '')}${noteLine}\n   档位：${levels}  /levels_${s.marketId}  /note_${s.marketId}  /history_${s.marketId}`);
     }
-    lines.push('', '改档位：/levels &lt;id&gt;\n改备注：/note &lt;id&gt; &lt;文字&gt;（不带文字 = 清除）\n取消单个：/stop &lt;id&gt;\n取消全部：/stopall');
+    lines.push('', '改档位：/levels &lt;id&gt;\n改备注：/note &lt;id&gt; &lt;文字&gt;（不带文字 = 清除）\n查看记录：/history [id] [N]\n取消单个：/stop &lt;id&gt;\n取消全部：/stopall');
+    await sendMessage(chatId, lines.join('\n'));
+    return true;
+  }
+  if (c === '/history' || /^\/history_\d+$/.test(c)) {
+    let marketId = null;
+    let limit = 10;
+    if (/^\/history_\d+$/.test(c)) {
+      marketId = c.slice('/history_'.length);
+      if (args[0] && /^\d+$/.test(args[0])) limit = Number(args[0]);
+    } else {
+      for (const a of args) {
+        if (/^\d{1,9}$/.test(a)) limit = Number(a);
+        else if (/^\d+$/.test(a)) marketId = a;
+      }
+    }
+    limit = Math.min(Math.max(limit, 1), 50);
+    const records = await readHistory({ chatId, marketId, limit });
+    if (!records.length) {
+      await sendMessage(chatId, marketId
+        ? `还没有 <code>${htmlEscape(marketId)}</code> 的推送记录。`
+        : '还没有推送记录。订阅一些市场，订单簿一变动就会记下来。');
+      return true;
+    }
+    const lines = [`<b>📜 最近 ${records.length} 条推送${marketId ? ` · id=${htmlEscape(marketId)}` : ''}</b>`];
+    for (const r of records) {
+      const t = new Date(r.ts).toISOString().replace('T', ' ').slice(5, 16);
+      const title = htmlEscape((r.title || `Market ${r.marketId}`).slice(0, 40));
+      const summary = htmlEscape((r.summary || '').slice(0, 80));
+      lines.push(`• <code>${t}</code> · <code>${r.marketId}</code> ${title}\n   ${summary}`);
+    }
     await sendMessage(chatId, lines.join('\n'));
     return true;
   }
@@ -504,6 +536,7 @@ async function main() {
     { command: 'list', description: '当前订阅' },
     { command: 'levels', description: '自定义监控档位（买1/2/3、卖1/2/3）' },
     { command: 'note', description: '设置/清除订阅备注' },
+    { command: 'history', description: '查看最近的推送记录' },
     { command: 'stop', description: '取消单个订阅' },
     { command: 'stopall', description: '取消全部订阅' },
   ]).catch((e) => console.warn('[bot] setMyCommands failed:', e.message));
