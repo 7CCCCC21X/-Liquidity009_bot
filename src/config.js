@@ -13,6 +13,12 @@ function envNum(key, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function envBool(key, fallback) {
+  const v = process.env[key];
+  if (v == null || v === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(String(v).trim());
+}
+
 export const config = {
   telegramBotToken: envStr('TELEGRAM_BOT_TOKEN', ''),
   telegramChatId: envStr('TELEGRAM_CHAT_ID', ''),
@@ -34,6 +40,10 @@ export const config = {
   notifyCooldownMs: envNum('NOTIFY_COOLDOWN_SEC', 60) * 1000,
 
   stateFile: envStr('STATE_FILE', './state.json'),
+
+  historyEnabled: envBool('HISTORY_ENABLED', true),
+  historyFile: envStr('HISTORY_FILE', './history.jsonl'),
+  historyKeepDays: envNum('HISTORY_KEEP_DAYS', 14),
 };
 
 export function requireConfig() {

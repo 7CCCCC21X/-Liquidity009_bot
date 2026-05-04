@@ -67,6 +67,26 @@ export async function editMessageText(chatId, messageId, text, replyMarkup) {
   return tgApi('editMessageText', payload);
 }
 
+// Upload a small file (e.g. history.jsonl) to a chat. Uses native
+// FormData/Blob — no external dep. Telegram caps documents at 50MB.
+export async function sendDocument(chatId, { fileName, content, caption, contentType = 'application/octet-stream' }) {
+  const fd = new FormData();
+  fd.append('chat_id', String(chatId));
+  if (caption) {
+    fd.append('caption', caption);
+    fd.append('parse_mode', 'HTML');
+  }
+  const blob = content instanceof Blob ? content : new Blob([content], { type: contentType });
+  fd.append('document', blob, fileName);
+  const res = await fetch(tgUrl('sendDocument'), { method: 'POST', body: fd });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`sendDocument ${res.status}: ${text.slice(0, 200)}`);
+  let json;
+  try { json = JSON.parse(text); } catch { throw new Error(`sendDocument bad JSON: ${text.slice(0, 200)}`); }
+  if (!json?.ok) throw new Error(`sendDocument not ok: ${JSON.stringify(json).slice(0, 200)}`);
+  return json.result;
+}
+
 export async function answerCallbackQuery(id, { text, showAlert } = {}) {
   return tgApi('answerCallbackQuery', {
     callback_query_id: id,

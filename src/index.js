@@ -1,5 +1,6 @@
 import { config, requireConfig } from './config.js';
-import { getUpdates, sendMessage, editMessageText, answerCallbackQuery, setMyCommands, getMe, htmlEscape } from './telegram.js';
+import { getUpdates, sendMessage, editMessageText, sendDocument, answerCallbackQuery, setMyCommands, getMe, htmlEscape } from './telegram.js';
+import { readEvents, readWholeFile, fileStats, maybePrune } from './history.js';
 import {
   loadState, saveState, getState,
   addSubscription, removeSubscription, listSubscriptionsForChat,
@@ -28,6 +29,8 @@ const HELP = [
   '/list — 当前订阅的市场',
   '/levels &lt;marketId&gt; — 自定义监控档位',
   '/note &lt;marketId&gt; [备注] — 设置备注（不带文字 = 清除）',
+  '/history &lt;marketId&gt; [N] — 查看历史变动记录（默认最近 10 条）',
+  '/export — 把整个 history.jsonl 文件发回给你',
   '/stop &lt;marketId&gt; — 取消订阅',
   '/stopall — 取消全部订阅',
 ].join('\n');
@@ -225,6 +228,57 @@ async function handleCommand(chatId, text) {
     await sendMessage(chatId, levelsHeader(sub), {
       replyMarkup: buildLevelsKeyboard(sub.marketId, sub.levels),
     });
+    return true;
+  }
+  if (c === '/history' || /^\/history_\d+$/.test(c)) {
+    let id = args[0];
+    let n = Number(args[1]);
+    if (/^\/history_\d+$/.test(c)) {
+      id = c.slice('/history_'.length);
+      n = Number(args[0]);
+    }
+    if (!id) {
+      await sendMessage(chatId, '用法：/history &lt;marketId&gt; [N]\n查看该市场最近 N 条变动记录（默认 10，最多 50）。');
+      return true;
+    }
+    if (!Number.isFinite(n) || n <= 0) n = 10;
+    n = Math.min(50, Math.floor(n));
+    const events = await readEvents({ chatId, marketId: id, limit: n });
+    if (!events.length) {
+      await sendMessage(chatId, `没有 <code>${htmlEscape(id)}</code> 的历史记录。`);
+      return true;
+    }
+    const lines = [`<b>📜 ${htmlEscape(events[0].title || `Market ${id}`)} 最近 ${events.length} 条</b>`];
+    for (const e of events) {
+      const t = new Date(e.ts).toISOString().replace('T', ' ').slice(5, 19);
+      lines.push(`<code>${t}</code> ${htmlEscape(e.summary || '变动')}`);
+    }
+    lines.push('', `完整文件：/export`);
+    await sendMessage(chatId, lines.join('\n'));
+    return true;
+  }
+  if (c === '/export') {
+    const stats = await fileStats();
+    if (!stats.exists || stats.size === 0) {
+      await sendMessage(chatId, '没有历史记录文件可导出。');
+      return true;
+    }
+    const buf = await readWholeFile();
+    if (!buf) {
+      await sendMessage(chatId, '读取历史文件失败。');
+      return true;
+    }
+    const fileName = `history-${new Date().toISOString().slice(0, 10)}.jsonl`;
+    try {
+      await sendDocument(chatId, {
+        fileName,
+        content: buf,
+        contentType: 'application/x-ndjson',
+        caption: `📦 共 ${(stats.size / 1024).toFixed(1)} KiB`,
+      });
+    } catch (err) {
+      await sendMessage(chatId, `❌ 导出失败：${htmlEscape(err.message)}`);
+    }
     return true;
   }
   if (c === '/stop' || /^\/stop_\d+$/.test(c)) {
@@ -504,9 +558,15 @@ async function main() {
     { command: 'list', description: '当前订阅' },
     { command: 'levels', description: '自定义监控档位（买1/2/3、卖1/2/3）' },
     { command: 'note', description: '设置/清除订阅备注' },
+    { command: 'history', description: '查看市场最近 N 条变动记录' },
+    { command: 'export', description: '导出完整 history.jsonl' },
     { command: 'stop', description: '取消单个订阅' },
     { command: 'stopall', description: '取消全部订阅' },
   ]).catch((e) => console.warn('[bot] setMyCommands failed:', e.message));
+
+  // Once-per-startup history compaction (also throttled to ≤1×/24h
+  // internally so frequent restarts don't thrash the file).
+  maybePrune().catch((err) => console.warn('[bot] prune failed:', err.message));
 
   const ctrl = new AbortController();
   const shutdown = (sig) => () => {

@@ -20,6 +20,8 @@
 | `/list` | 列出当前聊天的订阅、监控档位、备注 |
 | `/levels <id>` | 调出档位勾选键盘（买1/2/3、卖1/2/3） |
 | `/note <id> <文字>` | 设置备注（不带文字 → 弹输入框；发 `-` 清除） |
+| `/history <id> [N]` | 查看该市场最近 N 条变动（默认 10，最多 50） |
+| `/export` | 把整个 `history.jsonl` 文件发回到聊天里 |
 | `/stop <id>` | 取消单个订阅 |
 | `/stopall` | 取消全部订阅 |
 
@@ -45,9 +47,24 @@ npm start
 ## 部署到 Railway
 1. 把仓库 push 到 GitHub。
 2. Railway → New Project → Deploy from GitHub Repo。
-3. 环境变量按 `.env.example` 填（至少要 `TELEGRAM_BOT_TOKEN`）。
-4. **强烈建议**：挂一个 Volume，挂载点 `/data`，并设 `STATE_FILE=/data/state.json`，否则 redeploy 会丢订阅状态。
-5. `railway.json` 已配好 `npm start`、自动重启策略。
+3. 添加一个 **Volume**：挂载点 `/data`（推荐 1–5 GB；JSONL 平均一行 ~400 B，14 天内顶多十几 MB）。
+4. 环境变量（按 `.env.example` 填，**最少这三组**）：
+   ```
+   TELEGRAM_BOT_TOKEN=...      # 必填
+   STATE_FILE=/data/state.json
+   HISTORY_FILE=/data/history.jsonl
+   ```
+   其它如 `POLL_INTERVAL_MS`、`PRICE_EPSILON`、`HISTORY_KEEP_DAYS` 都有合理默认值。
+5. `railway.json` 已配好 `npm start`、自动重启策略；启动时自动 prune 旧记录（间隔 ≥24h）。
+
+### 数据文件
+- `STATE_FILE`（默认 `./state.json`） — 订阅、档位、备注、Telegram offset
+- `HISTORY_FILE`（默认 `./history.jsonl`） — 每次推送都 append 一行 JSON：
+  ```json
+  {"ts":1714737000000,"chatId":123,"marketId":"257916","title":"$1B","note":"主仓","levels":["bid1","ask1"],"summary":"买1 价 +0.0050；卖1 量 -120","prev":{...},"cur":{...}}
+  ```
+  在聊天里 `/export` 直接拿到完整文件，或本地 `tail -f /data/history.jsonl | jq` 实时观察。
+- `npm run prune-history` 强制压缩（保留最近 `HISTORY_KEEP_DAYS` 天）。
 
 ## 调参
 所有阈值都是 env 变量，不用改代码：
@@ -56,6 +73,9 @@ npm start
 - `SIZE_RELATIVE_EPSILON`：相对量变阈值，默认 0.10
 - `SIZE_ABSOLUTE_MIN`：绝对量变阈值，默认 50 张
 - `NOTIFY_COOLDOWN_SEC`：单 chat × market 的最短通知间隔，默认 60s
+- `HISTORY_ENABLED`：是否记录历史，默认 `true`
+- `HISTORY_FILE`：历史文件路径，默认 `./history.jsonl`（Railway 应设 `/data/history.jsonl`）
+- `HISTORY_KEEP_DAYS`：自动 prune 阈值（天），默认 14；设 0 关闭自动 prune
 
 ## 项目结构
 ```
