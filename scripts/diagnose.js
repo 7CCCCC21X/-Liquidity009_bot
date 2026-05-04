@@ -70,7 +70,7 @@ info(`graphqlUrl = ${config.graphqlUrl}`);
 info(`restUrl    = ${config.restUrl}`);
 info(`apiKey     = ${config.predictApiKey ? '(set)' : '(empty)'}`);
 
-step(2, 7, 'GraphQL schema introspection');
+step(2, 9, 'GraphQL schema introspection');
 let graphFields = new Set();
 try {
   const intro = await fetchJson(config.graphqlUrl, {
@@ -198,7 +198,7 @@ for (const filter of filterCandidates) {
   }
 }
 
-step(3, 7, 'Fetch all markets via cached GraphQL');
+step(3, 9, 'Fetch all markets via cached GraphQL');
 let all = [];
 try {
   const t0 = Date.now();
@@ -209,7 +209,7 @@ try {
   process.exit(1);
 }
 
-step(4, 7, 'Strict match against title / question / categorySlug');
+step(4, 9, 'Strict match against title / question / categorySlug');
 const titleHits = all.filter((m) => slugify(m.title ?? '') === slug);
 const qHits     = all.filter((m) => slugify(m.question ?? '') === slug);
 const csHits    = all.filter((m) => {
@@ -236,7 +236,7 @@ if (dedup.length) {
   fail('no strict match in cached GraphQL list');
 }
 
-step(5, 7, 'Fuzzy contains match (top 10)');
+step(5, 9, 'Fuzzy contains match (top 10)');
 const tokens = slug.split('-').filter((t) => t.length >= 3);
 const scored = all.map((m) => {
   const hay = `${slugify(m.title ?? '')} ${slugify(m.question ?? '')} ${m.categorySlug ?? ''}`;
@@ -258,7 +258,7 @@ if (!scored.length) {
   }
 }
 
-step(6, 7, 'REST fallback /v1/markets scan for categorySlug');
+step(6, 9, 'REST fallback /v1/markets scan for categorySlug');
 let restHits = 0;
 let scanned = 0;
 let lastId = null;
@@ -291,7 +291,7 @@ for (let page = 0; page < 20 && restHits < 5; page++) {
 }
 info(`scanned ${scanned} REST markets → ${restHits} categorySlug hits`);
 
-step(7, 7, 'HTML scrape — fetch the URL and parse __NEXT_DATA__');
+step(7, 9, 'HTML scrape — fetch the URL and parse __NEXT_DATA__');
 let htmlMarkets = [];
 const urlGuess = /^https?:\/\//i.test(arg)
   ? arg
@@ -316,7 +316,7 @@ try {
   fail(`HTML fetch failed: ${err.message}`);
 }
 
-step(8, 8, 'GraphQL latestCategorySlug(slug:) — authoritative resolver');
+step(8, 9, 'GraphQL latestCategorySlug(slug:) — authoritative resolver');
 let csMarkets = [];
 try {
   csMarkets = await getMarketsByCategorySlug(slug);
@@ -328,20 +328,107 @@ try {
     }
     if (csMarkets.length > 12) info(`(${csMarkets.length - 12} more)`);
   } else {
-    fail('latestCategorySlug returned null / empty (slug not in any active category)');
+    fail('returned 0 markets (will fall back to Step 9 chained query)');
   }
 } catch (err) {
   fail(`call failed: ${err.message}`);
 }
 
+step(9, 9, 'Chained query: categories(filter) → category.id → markets(filter:{categoryId})');
+// Introspect CategoryFilterInput first.
+let categoryFilterFields = [];
+try {
+  const intro = await gql(`query { __type(name: "CategoryFilterInput") { inputFields { name type { name kind ofType { name kind } } } } }`);
+  categoryFilterFields = intro?.data?.__type?.inputFields ?? [];
+  if (categoryFilterFields.length) {
+    console.log('    --- CategoryFilterInput inputFields ---');
+    for (const f of categoryFilterFields) console.log(`      ${f.name}: ${typeStr(f.type)}`);
+  } else {
+    info('CategoryFilterInput has no inputFields (or not introspectable)');
+  }
+} catch (err) {
+  fail(`CategoryFilterInput introspection failed: ${err.message}`);
+}
+
+// Try every plausible slug-shaped field on CategoryFilterInput.
+let chainMarkets = [];
+let workingChain = null;
+const slugFieldGuesses = [
+  ...categoryFilterFields.filter((f) => /slug/i.test(f.name)).map((f) => f.name),
+  'slug', 'slugs', 'slugIn',
+];
+const seenGuess = new Set();
+for (const field of slugFieldGuesses) {
+  if (seenGuess.has(field)) continue;
+  seenGuess.add(field);
+  // Build filter — wrap in array if the field's type is a list.
+  const def = categoryFilterFields.find((f) => f.name === field);
+  let isList = false;
+  let t = def?.type;
+  while (t) {
+    if (t.kind === 'LIST') { isList = true; break; }
+    t = t.ofType;
+  }
+  const filter = { [field]: isList ? [slug] : slug };
+  try {
+    const r = await gql(
+      `query($f: CategoryFilterInput!) {
+        categories(filter: $f, pagination: { first: 5 }) {
+          edges { node { id } }
+        }
+      }`,
+      { f: filter },
+    );
+    if (r?.errors) {
+      console.log(`    categories(filter: ${JSON.stringify(filter)}) → ${JSON.stringify(r.errors[0]?.message ?? r.errors).slice(0, 100)}`);
+      continue;
+    }
+    const ids = (r?.data?.categories?.edges ?? []).map((e) => e.node.id);
+    if (ids.length === 0) {
+      info(`categories(filter: ${JSON.stringify(filter)}) → 0 results`);
+      continue;
+    }
+    ok(`categories(filter: ${JSON.stringify(filter)}) → ${ids.length} categor${ids.length===1?'y':'ies'}: ${ids.join(', ')}`);
+    // Now drill into the first category for markets.
+    const m = await gql(
+      `query($f: MarketFilterInput!) {
+        markets(filter: $f, pagination: { first: 100 }) {
+          edges { node { id conditionId title question } }
+        }
+      }`,
+      { f: { categoryId: ids[0] } },
+    );
+    if (m?.errors) {
+      console.log(`    markets(filter:{categoryId:${ids[0]}}) → ${JSON.stringify(m.errors[0]?.message ?? m.errors).slice(0, 100)}`);
+      continue;
+    }
+    const edges = m?.data?.markets?.edges ?? [];
+    if (edges.length) {
+      ok(`markets(filter: { categoryId: ${ids[0]} }) → ${edges.length} markets 🎯`);
+      for (const e of edges.slice(0, 12)) console.log(`      • ${e.node.id} ${e.node.title}  —  "${e.node.question}"`);
+      if (edges.length > 12) info(`(${edges.length - 12} more)`);
+      chainMarkets = edges.map((e) => e.node);
+      workingChain = { slugField: field, isList, categoryId: ids[0] };
+      break;
+    } else {
+      info(`markets(filter:{categoryId:${ids[0]}}) returned 0 markets`);
+    }
+  } catch (err) {
+    console.log(`    categories(filter: ${JSON.stringify(filter)}) → ${err.message}`);
+  }
+}
+
 console.log('\n----- 总结 -----');
-if (csMarkets.length) {
-  console.log(`✅ Tier 1 命中：latestCategorySlug 返回了 ${csMarkets.length} 个 market。`);
-  console.log('   Bot 重启后再发同一个 URL，会弹出这些 market 让你选订哪个。');
+if (chainMarkets.length) {
+  console.log(`✅ Step 9 命中: 用 categories.${workingChain.slugField}=${slug} → categoryId=${workingChain.categoryId}`);
+  console.log(`   → markets(filter:{categoryId}) 拿到 ${chainMarkets.length} 个 market。Bot 重启后会用这条链路。`);
+} else if (csMarkets.length) {
+  console.log(`✅ Step 8 命中: latestCategorySlug 直接返回 ${csMarkets.length} 个。重启 bot 即可。`);
 } else if (htmlMarkets.length) {
-  console.log(`✅ Tier 2 命中：HTML 拿到 ${htmlMarkets.length} 个。重启 bot 后可用。`);
+  console.log(`✅ Step 7 命中: HTML scrape 拿到 ${htmlMarkets.length} 个。`);
 } else if (dedup.length) {
-  console.log('Tier 3 命中：slug 匹配到了。重启 bot 即可。');
+  console.log('Step 4 命中：slug 匹配到了。');
 } else {
-  console.log('Tier 1/2/3 都没拿到。请贴 [8/8] 的报错信息和 [2/8] Query 字段输出，我再针对性修。');
+  console.log('全部失败。把 [9/9] 的 CategoryFilterInput inputFields 输出贴给我，');
+  console.log('特别是有没有像 search/query 之类的字段——可能要换 free-text search 路线。');
 }
