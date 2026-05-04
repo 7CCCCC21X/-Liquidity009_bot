@@ -9,7 +9,7 @@ import {
   putPendingNote, takePendingNote, gcPendingNotes,
   ALL_LEVELS, LEVEL_LABEL,
 } from './state.js';
-import { extractSlugFromUrl, extractMarketId, resolveSlugToMarkets, fuzzySlugSuggestions, getMarketById } from './predict.js';
+import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById } from './predict.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -129,9 +129,14 @@ async function handleUrl(chatId, text) {
     await sendMessage(chatId, '❌ 没看出来是 Predict.fun 网址或 slug。直接发完整网址就好，例如 <code>https://predict.fun/event/xxxx</code>。');
     return;
   }
-  let matches;
+  let matches = [];
   try {
-    matches = await resolveSlugToMarkets(slug);
+    // First try: if it's a real URL, fetch HTML and read the embedded
+    // __NEXT_DATA__ — this is the only universally reliable path because
+    // GraphQL doesn't expose URL slugs and REST needs an API key.
+    // Falls back to slug-based resolver internally.
+    const r = await resolveUrlToMarkets(text);
+    matches = r.markets;
   } catch (err) {
     await sendMessage(chatId, `❌ 抓取市场列表失败：${htmlEscape(err.message)}`);
     return;

@@ -38,6 +38,98 @@ export function slugifyWithYear(s) {
   return slugify(t);
 }
 
+// Predict.fun's GraphQL Market type doesn't expose any URL slug field
+// (verified via introspection — no slug / marketSlug / categorySlug).
+// REST `/v1/markets` requires PREDICT_API_KEY. So when the user pastes
+// a URL the only universally reliable path is to fetch the rendered
+// HTML and pull market objects out of the Next.js __NEXT_DATA__ JSON
+// blob — exactly what the browser receives.
+
+const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+// Recursively walk a JSON blob looking for objects shaped like a
+// Predict.fun market: must have an `id` AND at least one of
+// title/question AND a conditionId. Returns deduped list.
+function collectMarketLikeObjects(node, out, seen) {
+  if (node == null) return;
+  if (Array.isArray(node)) {
+    for (const x of node) collectMarketLikeObjects(x, out, seen);
+    return;
+  }
+  if (typeof node !== 'object') return;
+  const id = node.id ?? node.marketId;
+  const cond = node.conditionId ?? node.condition_id;
+  if (id != null && cond && (node.title || node.question)) {
+    const key = String(id);
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push({
+        id: key,
+        conditionId: String(cond),
+        title: node.title ?? null,
+        question: node.question ?? null,
+        slug: node.categorySlug ?? node.slug ?? node.marketSlug ?? null,
+      });
+    }
+  }
+  for (const v of Object.values(node)) collectMarketLikeObjects(v, out, seen);
+}
+
+// Fetch a Predict.fun page, extract __NEXT_DATA__, return all markets
+// embedded in it. Works for /event/<slug>, /market/<slug>, and any
+// other SSR page that renders markets. `meta` returned for diagnostics.
+export async function extractMarketsFromHtml(url) {
+  const html = await fetchJson(url, {
+    method: 'GET',
+    headers: {
+      'User-Agent': BROWSER_UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    },
+    timeoutMs: 20_000,
+    retries: 1,
+    parseJson: false,
+  });
+  const meta = { url, htmlSize: html?.length ?? 0, foundNextData: false };
+  if (!html) return { markets: [], meta };
+  // Match the standard Next.js SSR script tag (id and type can swap order).
+  const m = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i)
+         ?? html.match(/<script[^>]*type=["']application\/json["'][^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (!m) return { markets: [], meta };
+  meta.foundNextData = true;
+  let data;
+  try {
+    data = JSON.parse(m[1]);
+  } catch (err) {
+    meta.parseError = err.message;
+    return { markets: [], meta };
+  }
+  const out = [];
+  collectMarketLikeObjects(data, out, new Set());
+  meta.marketCount = out.length;
+  return { markets: out, meta };
+}
+
+// Top-level resolver used by the bot. If input is a URL → try HTML
+// scrape first (works for events + slug-less GraphQL schemas). If
+// that returns nothing, fall back to the cached slug-based path.
+export async function resolveUrlToMarkets(input) {
+  const isUrl = /^https?:\/\//i.test(String(input).trim());
+  if (isUrl) {
+    try {
+      const { markets, meta } = await extractMarketsFromHtml(input);
+      if (markets.length) return { markets, source: 'html', meta };
+    } catch (err) {
+      // Don't bail — try slug path before giving up.
+      console.warn('[predict] HTML scrape failed:', err.message);
+    }
+  }
+  const slug = extractSlugFromUrl(input);
+  if (!slug) return { markets: [], source: 'none' };
+  const markets = await resolveSlugToMarkets(slug);
+  return { markets, source: markets.length ? 'slug' : 'none', slug };
+}
+
 // Detects an input that's just a numeric market id (e.g. "257916").
 // Returns the trimmed id string, or null. Bot uses this to short-circuit
 // the slug-resolution path when the user already knows the id.

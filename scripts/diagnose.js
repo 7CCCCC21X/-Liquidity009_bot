@@ -10,7 +10,7 @@
 
 import { config } from '../src/config.js';
 import { fetchJson } from '../src/http.js';
-import { extractSlugFromUrl, slugify, getAllMarketsCached } from '../src/predict.js';
+import { extractSlugFromUrl, slugify, getAllMarketsCached, extractMarketsFromHtml } from '../src/predict.js';
 
 const arg = process.argv[2];
 if (!arg) {
@@ -53,7 +53,7 @@ info(`graphqlUrl = ${config.graphqlUrl}`);
 info(`restUrl    = ${config.restUrl}`);
 info(`apiKey     = ${config.predictApiKey ? '(set)' : '(empty)'}`);
 
-step(2, 6, 'GraphQL schema introspection');
+step(2, 7, 'GraphQL schema introspection');
 let graphFields = new Set();
 try {
   const intro = await fetchJson(config.graphqlUrl, {
@@ -74,7 +74,31 @@ try {
   fail(`introspection failed: ${err.message}`);
 }
 
-step(3, 6, 'Fetch all markets via cached GraphQL');
+// Bonus: probe Query type so we can see if there's an event/eventBySlug
+// resolver that the bot could use to bypass the slug-matching dance.
+try {
+  const intro = await fetchJson(config.graphqlUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: `query { __type(name: "Query") { fields { name args { name type { name kind ofType { name kind } } } } } }`,
+    }),
+    timeoutMs: 30_000,
+  });
+  const fields = intro?.data?.__type?.fields ?? [];
+  const eventLike = fields.filter((f) => /event|slug/i.test(f.name));
+  if (eventLike.length) {
+    console.log('    Query fields matching /event|slug/:');
+    for (const f of eventLike) {
+      const args = (f.args ?? []).map((a) => `${a.name}: ${a.type?.name ?? a.type?.ofType?.name ?? a.type?.kind}`).join(', ');
+      console.log(`      ${f.name}(${args})`);
+    }
+  } else {
+    console.log('    no event/slug-related Query fields found');
+  }
+} catch { /* already reported above */ }
+
+step(3, 7, 'Fetch all markets via cached GraphQL');
 let all = [];
 try {
   const t0 = Date.now();
@@ -85,7 +109,7 @@ try {
   process.exit(1);
 }
 
-step(4, 6, 'Strict match against title / question / categorySlug');
+step(4, 7, 'Strict match against title / question / categorySlug');
 const titleHits = all.filter((m) => slugify(m.title ?? '') === slug);
 const qHits     = all.filter((m) => slugify(m.question ?? '') === slug);
 const csHits    = all.filter((m) => {
@@ -112,7 +136,7 @@ if (dedup.length) {
   fail('no strict match in cached GraphQL list');
 }
 
-step(5, 6, 'Fuzzy contains match (top 10)');
+step(5, 7, 'Fuzzy contains match (top 10)');
 const tokens = slug.split('-').filter((t) => t.length >= 3);
 const scored = all.map((m) => {
   const hay = `${slugify(m.title ?? '')} ${slugify(m.question ?? '')} ${m.categorySlug ?? ''}`;
@@ -134,7 +158,7 @@ if (!scored.length) {
   }
 }
 
-step(6, 6, 'REST fallback /v1/markets scan for categorySlug');
+step(6, 7, 'REST fallback /v1/markets scan for categorySlug');
 let restHits = 0;
 let scanned = 0;
 let lastId = null;
@@ -167,15 +191,40 @@ for (let page = 0; page < 20 && restHits < 5; page++) {
 }
 info(`scanned ${scanned} REST markets → ${restHits} categorySlug hits`);
 
+step(7, 7, 'HTML scrape — fetch the URL and parse __NEXT_DATA__');
+let htmlMarkets = [];
+const urlGuess = /^https?:\/\//i.test(arg)
+  ? arg
+  : `https://predict.fun/zh-cn/market/${slug}`;
+info(`fetching ${urlGuess}`);
+try {
+  const r = await extractMarketsFromHtml(urlGuess);
+  info(`HTML size: ${r.meta.htmlSize} bytes, __NEXT_DATA__ found: ${r.meta.foundNextData}`);
+  htmlMarkets = r.markets;
+  if (r.meta.parseError) fail(`__NEXT_DATA__ JSON parse error: ${r.meta.parseError}`);
+  if (htmlMarkets.length) {
+    ok(`extracted ${htmlMarkets.length} market objects from page`);
+    for (const m of htmlMarkets.slice(0, 12)) {
+      console.log(`    id=${m.id}  conditionId=${m.conditionId?.slice(0, 16)}…`);
+      console.log(`         title="${m.title}"  question="${m.question}"`);
+    }
+    if (htmlMarkets.length > 12) info(`(${htmlMarkets.length - 12} more)`);
+  } else {
+    fail('no market-shaped objects found in __NEXT_DATA__');
+  }
+} catch (err) {
+  fail(`HTML fetch failed: ${err.message}`);
+}
+
 console.log('\n----- 总结 -----');
-if (dedup.length || restHits) {
-  console.log('找到了。如果 bot 仍说"没匹配到"，可能是缓存还没刷新（默认 10 分钟）：');
-  console.log('  • 重启 bot');
-  console.log('  • 或把 MARKETS_CACHE_TTL_MS 调小');
+if (htmlMarkets.length) {
+  console.log(`✅ HTML scrape works — bot will use this path for URLs (${htmlMarkets.length} 个 sub-market 已识别).`);
+  console.log('   再发一遍那个 URL 给 bot 就会弹出选择列表。');
+} else if (dedup.length || restHits) {
+  console.log('Slug 路径找到了，HTML 路径没拿到 — 多半是 cache 还没刷新或 bot 没重启。');
 } else {
-  console.log('GraphQL + REST 都找不到这个 slug。可能：');
-  console.log('  • 它是事件页 (event) 而不是单个市场页 — Predict.fun 上 /event/<slug> 和 /market/<slug>');
-  console.log('    是不同实体，bot 目前只匹配 markets() 列表');
-  console.log('  • 市场已 resolve（GraphQL 默认过滤 isResolved:false）— 试试 /v1/markets/<id> 直查');
-  console.log('  • slug 拼写不同（看上面 fuzzy 输出有没有相似项）');
+  console.log('GraphQL / REST / HTML 三路都没拿到。');
+  console.log('  • 把 [7/7] 的 HTML size 贴给我（如果 size < 5KB 可能是被 CDN 拦了）');
+  console.log('  • 设 PREDICT_API_KEY 后重跑（让 [6/7] REST 兜底起作用）');
+  console.log('  • 检查 [2/7] Query 字段里有没有 event/eventBySlug 类的 resolver');
 }
