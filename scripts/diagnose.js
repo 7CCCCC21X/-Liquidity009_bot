@@ -42,6 +42,23 @@ function slugifyWithYear(s) {
   return slugify(t);
 }
 
+function typeStr(t) {
+  if (!t) return '?';
+  if (t.kind === 'NON_NULL') return typeStr(t.ofType) + '!';
+  if (t.kind === 'LIST') return '[' + typeStr(t.ofType) + ']';
+  return t.name ?? t.kind;
+}
+
+async function gql(query, variables) {
+  const json = await fetchJson(config.graphqlUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, variables }),
+    timeoutMs: 30_000,
+  });
+  return json;
+}
+
 step(1, 8, 'Parse input');
 const slug = extractSlugFromUrl(arg);
 if (!slug) {
@@ -74,29 +91,112 @@ try {
   fail(`introspection failed: ${err.message}`);
 }
 
-// Bonus: probe Query type so we can see if there's an event/eventBySlug
-// resolver that the bot could use to bypass the slug-matching dance.
+// Comprehensive Query type dump — the real source of truth for what's
+// available. Print every Query field with its args + return type so we
+// can see candidates for slug-based market lookup.
+let allQueryFields = [];
 try {
-  const intro = await fetchJson(config.graphqlUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      query: `query { __type(name: "Query") { fields { name args { name type { name kind ofType { name kind } } } } } }`,
-    }),
-    timeoutMs: 30_000,
-  });
-  const fields = intro?.data?.__type?.fields ?? [];
-  const eventLike = fields.filter((f) => /event|slug/i.test(f.name));
-  if (eventLike.length) {
-    console.log('    Query fields matching /event|slug/:');
-    for (const f of eventLike) {
-      const args = (f.args ?? []).map((a) => `${a.name}: ${a.type?.name ?? a.type?.ofType?.name ?? a.type?.kind}`).join(', ');
-      console.log(`      ${f.name}(${args})`);
-    }
-  } else {
-    console.log('    no event/slug-related Query fields found');
+  const intro = await gql(
+    `query { __type(name: "Query") { fields { name args { name type { name kind ofType { name kind ofType { name kind ofType { name kind } } } } } type { name kind ofType { name kind ofType { name kind ofType { name kind } } } } } } }`,
+  );
+  allQueryFields = intro?.data?.__type?.fields ?? [];
+  ok(`Query has ${allQueryFields.length} fields`);
+  console.log('    --- All Query fields (name(args): returnType) ---');
+  for (const f of allQueryFields) {
+    const args = (f.args ?? []).map((a) => `${a.name}: ${typeStr(a.type)}`).join(', ');
+    console.log(`      ${f.name}(${args}): ${typeStr(f.type)}`);
   }
-} catch { /* already reported above */ }
+} catch (err) {
+  fail(`Query dump failed: ${err.message}`);
+}
+
+// Dump MarketFilterInput so we can see if categorySlug / categoryId /
+// eventSlug / etc. is a supported filter on the markets() query.
+try {
+  const intro = await gql(
+    `query { __type(name: "MarketFilterInput") { inputFields { name type { name kind ofType { name kind } } } } }`,
+  );
+  const fields = intro?.data?.__type?.inputFields ?? [];
+  if (fields.length) {
+    console.log('    --- MarketFilterInput inputFields ---');
+    for (const f of fields) console.log(`      ${f.name}: ${typeStr(f.type)}`);
+  } else {
+    info('MarketFilterInput not introspectable or empty');
+  }
+} catch { /* ignore */ }
+
+// Try to find any type that has a `markets` field — likely the Category
+// or Event wrapper that holds the list we want.
+try {
+  const intro = await gql(
+    `query { __schema { types { name kind fields { name type { name kind ofType { name kind } } } } } }`,
+  );
+  const types = intro?.data?.__schema?.types ?? [];
+  const interesting = [];
+  for (const t of types) {
+    if (!Array.isArray(t.fields)) continue;
+    if (!/category|event|group/i.test(t.name)) continue;
+    const marketField = t.fields.find((f) => /market/i.test(f.name));
+    if (marketField) {
+      interesting.push({ name: t.name, marketField: `${marketField.name}: ${typeStr(marketField.type)}` });
+    }
+  }
+  if (interesting.length) {
+    console.log('    --- Types containing a markets-like field ---');
+    for (const t of interesting) console.log(`      ${t.name} { ${t.marketField} }`);
+  } else {
+    info('no Category/Event/Group types with a markets field');
+  }
+} catch { /* ignore */ }
+
+// Actually CALL latestCategorySlug with the user's slug — see what it
+// returns. The value is the next clue for which downstream query to use.
+try {
+  const r = await gql(`query($s: String!) { latestCategorySlug(slug: $s) }`, { s: slug });
+  if (r?.errors) {
+    fail(`latestCategorySlug call: ${JSON.stringify(r.errors).slice(0, 200)}`);
+  } else {
+    ok(`latestCategorySlug("${slug}") = ${JSON.stringify(r?.data?.latestCategorySlug)}`);
+  }
+} catch (err) {
+  fail(`latestCategorySlug call failed: ${err.message}`);
+}
+
+// Try a few plausible markets() filter shapes — empirically discover
+// which one the API actually accepts. The first one to come back with
+// non-zero results is what the bot should use.
+const filterCandidates = [
+  { categorySlug: slug },
+  { eventSlug: slug },
+  { categorySlugs: [slug] },
+  { slug },
+];
+for (const filter of filterCandidates) {
+  const filterStr = JSON.stringify(filter);
+  try {
+    const r = await gql(
+      `query($f: MarketFilterInput!) {
+        markets(filter: $f, pagination: { first: 5 }) {
+          edges { node { id title question } }
+        }
+      }`,
+      { f: filter },
+    );
+    if (r?.errors) {
+      console.log(`    markets(filter: ${filterStr}) → ${JSON.stringify(r.errors[0]?.message ?? r.errors).slice(0, 120)}`);
+    } else {
+      const edges = r?.data?.markets?.edges ?? [];
+      if (edges.length) {
+        ok(`markets(filter: ${filterStr}) → ${edges.length} results 🎯`);
+        for (const e of edges) console.log(`      • ${e.node.id} ${e.node.title}`);
+      } else {
+        info(`markets(filter: ${filterStr}) → 0 results`);
+      }
+    }
+  } catch (err) {
+    console.log(`    markets(filter: ${filterStr}) → ${err.message}`);
+  }
+}
 
 step(3, 7, 'Fetch all markets via cached GraphQL');
 let all = [];

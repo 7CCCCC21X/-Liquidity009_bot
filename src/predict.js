@@ -123,7 +123,7 @@ let _categorySlugQueryCache = null;
 
 async function buildCategorySlugQuery() {
   if (_categorySlugQueryCache) return _categorySlugQueryCache;
-  // 1. Find the return type name of latestCategorySlug.
+  // 1. Find the return type kind+name of latestCategorySlug.
   const root = await postGraphQL(
     `query { __schema { queryType { fields { name type { name kind ofType { name kind ofType { name kind ofType { name kind } } } } } } } }`,
     {},
@@ -133,11 +133,22 @@ async function buildCategorySlugQuery() {
   if (!qf) throw new Error('latestCategorySlug not exposed by GraphQL');
   let t = qf.type;
   while (t && (t.kind === 'NON_NULL' || t.kind === 'LIST')) t = t.ofType;
+  const typeKind = t?.kind;
   const typeName = t?.name;
+  // Scalar return type means latestCategorySlug just gives us a
+  // canonicalised slug string — no sub-selection allowed. Cache the
+  // naked-query path; getMarketsByCategorySlug will run a follow-up
+  // markets() filter call with the returned string.
+  if (typeKind === 'SCALAR' || typeKind === 'ENUM') {
+    _categorySlugQueryCache = {
+      mode: 'scalar',
+      naked: `query Cat($slug: String!) { latestCategorySlug(slug: $slug) }`,
+    };
+    return _categorySlugQueryCache;
+  }
   if (!typeName) throw new Error('latestCategorySlug return type has no concrete name');
 
-  // 2. Introspect that type's fields. Pick scalars + flag any nested
-  // field whose name mentions "market" so we can drill in.
+  // 2. Object return type: introspect that type's fields.
   const detail = await postGraphQL(
     `query($n: String!) { __type(name: $n) { fields { name type { name kind ofType { name kind ofType { name kind } } } } } }`,
     { n: typeName },
@@ -177,17 +188,37 @@ async function buildCategorySlugQuery() {
       ${scalarNames.join(' ')}
     }
   }`;
-  _categorySlugQueryCache = { greedy, safe, typeName, scalarNames, nestedSelections };
+  _categorySlugQueryCache = { mode: 'object', greedy, safe, typeName, scalarNames, nestedSelections };
   return _categorySlugQueryCache;
 }
 
-// Resolve a categorySlug → list of markets via GraphQL. Returns [] if
-// the resolver responds null (slug doesn't exist).
+// Resolve a categorySlug → list of markets via GraphQL. Returns [] on
+// any failure (rather than throwing) so it can be safely chained as
+// one of several fallback strategies.
 export async function getMarketsByCategorySlug(slug) {
   if (!slug) return [];
-  const q = await buildCategorySlugQuery();
-  // Try greedy first — usually works because Market is the universal
-  // sub-type. If it errors out, retry the safer scalars-only shape.
+  let q;
+  try {
+    q = await buildCategorySlugQuery();
+  } catch (err) {
+    console.warn('[predict] buildCategorySlugQuery failed:', err.message);
+    return [];
+  }
+  // Scalar mode: latestCategorySlug returns a String (the canonicalised
+  // slug). Call it naked, then follow up with a markets(filter:) call.
+  if (q.mode === 'scalar') {
+    let canonical;
+    try {
+      const data = await postGraphQL(q.naked, { slug }, null);
+      canonical = data?.latestCategorySlug;
+    } catch (err) {
+      console.warn('[predict] latestCategorySlug naked call failed:', err.message);
+      return [];
+    }
+    if (!canonical || typeof canonical !== 'string') return [];
+    return await getMarketsByCanonicalSlug(canonical);
+  }
+  // Object mode: latestCategorySlug returns a Category-like object.
   let data;
   try {
     data = await postGraphQL(q.greedy, { slug }, null);
@@ -195,14 +226,57 @@ export async function getMarketsByCategorySlug(slug) {
     try {
       data = await postGraphQL(q.safe, { slug }, null);
     } catch (errSafe) {
-      throw new Error(`latestCategorySlug failed: greedy=${errGreedy.message} | safe=${errSafe.message}`);
+      console.warn('[predict] latestCategorySlug failed:', errGreedy.message, '|', errSafe.message);
+      return [];
     }
   }
   const cat = data?.latestCategorySlug;
   if (!cat) return [];
+  if (typeof cat === 'string') {
+    // Schema lied about kind — handle defensively.
+    return await getMarketsByCanonicalSlug(cat);
+  }
   const out = [];
   collectMarketLikeObjects(cat, out, new Set());
   return out;
+}
+
+// When latestCategorySlug returns a plain string (canonicalised slug)
+// rather than the category object, look up the actual markets via the
+// markets() query with each known filter shape. The first non-empty
+// result wins. Cached: if a particular filter field works once, reuse
+// it for the rest of the process.
+let _workingFilter = null;
+const FILTER_CANDIDATES = ['categorySlug', 'eventSlug', 'slug'];
+
+async function getMarketsByCanonicalSlug(canonicalSlug) {
+  const candidates = _workingFilter
+    ? [_workingFilter, ...FILTER_CANDIDATES.filter((f) => f !== _workingFilter)]
+    : FILTER_CANDIDATES;
+  for (const field of candidates) {
+    try {
+      const data = await postGraphQL(
+        `query($f: MarketFilterInput!) {
+          markets(filter: $f, pagination: { first: 100 }) {
+            edges { node { id conditionId title question } }
+          }
+        }`,
+        { f: { [field]: canonicalSlug } },
+        null,
+      );
+      const edges = data?.markets?.edges ?? [];
+      if (edges.length) {
+        _workingFilter = field;
+        const out = [];
+        const seen = new Set();
+        for (const e of edges) collectMarketLikeObjects(e.node, out, seen);
+        return out;
+      }
+    } catch {
+      // Try next candidate.
+    }
+  }
+  return [];
 }
 
 // Top-level resolver used by the bot. Tries every known path in order:
