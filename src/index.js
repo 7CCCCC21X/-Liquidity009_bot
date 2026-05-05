@@ -139,7 +139,7 @@ function shortToken() {
 //      cycle to verify the bot can actually reach this market.
 //   3. Prime the per-sub baseline snapshot — without this, the next
 //      poll tick fires "🆕 初次抓取" which duplicates this message.
-async function sendSubscribed(chatId, m, { wasExisting = false } = {}) {
+async function sendSubscribed(chatId, m, { wasExisting = false, askForNote = true } = {}) {
   const sub = getSubscription(chatId, m.id);
   const levels = sub?.levels?.length ? sub.levels : ALL_LEVELS;
   const mode = sub?.triggerMode || 'both';
@@ -176,6 +176,31 @@ async function sendSubscribed(chatId, m, { wasExisting = false } = {}) {
     lines.push('', '<i>当前订单簿抓取失败 — 不影响订阅，下一轮轮询会自动重试。</i>');
   }
   await sendMessage(chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(m.id) });
+
+  // Auto follow-up: if the sub doesn't have a note yet, send a separate
+  // ForceReply prompt asking for one. Mirrors the wallet-bot flow:
+  // user fires the URL → orderbook shows up → "想加备注吗?" pops a
+  // reply prompt. ForceReply doesn't block — user can ignore (just
+  // send anything else and the prompt auto-dismisses) or click the
+  // 📝 备注 button on the success card any time later instead.
+  if (askForNote && !sub?.note && !wasExisting) {
+    const promptText = [
+      '📝 <b>给这条订阅加个备注？</b>',
+      `<i>例如「主仓」「短期套利」「${htmlEscape((titleText || '').slice(0, 12))} 风险盘」</i>`,
+      '',
+      '<b>回复此条消息</b>发送文字保存；',
+      '<b>忽略本条</b>即可跳过（也可随时点订阅卡片上的 📝 备注 再加）。',
+    ].join('\n');
+    try {
+      const sent = await sendMessage(chatId, promptText, {
+        replyMarkup: { force_reply: true, selective: true, input_field_placeholder: '备注（可空）' },
+      });
+      putPendingNote(chatId, sent.message_id, m.id);
+      await saveState();
+    } catch (err) {
+      console.warn('[subscribed] note follow-up prompt failed:', err.message);
+    }
+  }
 }
 
 // Send a ForceReply prompt asking the user to type a note. Records the
@@ -214,7 +239,7 @@ function buildChoiceKeyboard(token, matches) {
   return { inline_keyboard: rows };
 }
 
-async function handleUrl(chatId, text) {
+async function handleUrl(chatId, text, { initialNote = null } = {}) {
   const slug = extractSlugFromUrl(text);
   if (!slug) {
     await sendMessage(chatId, '❌ 没看出来是 Predict.fun 网址或 slug。直接发完整网址就好，例如 <code>https://predict.fun/event/xxxx</code>。');
@@ -280,9 +305,11 @@ async function handleUrl(chatId, text) {
       conditionId: m.conditionId,
       title: m.title || m.question || `Market ${m.id}`,
       slug: m.slug,
+      note: initialNote ?? undefined,
     });
     await saveState();
-    await sendSubscribed(chatId, m, { wasExisting });
+    // Skip the auto note-prompt if the user already supplied one inline.
+    await sendSubscribed(chatId, m, { wasExisting, askForNote: !initialNote });
     return;
   }
   const token = shortToken();
@@ -497,7 +524,7 @@ async function handleMessage(msg) {
   await handleUrl(chatId, text);
 }
 
-async function handleMarketIdInput(chatId, marketId) {
+async function handleMarketIdInput(chatId, marketId, { initialNote = null } = {}) {
   let market;
   try {
     market = await getMarketById(marketId);
@@ -526,9 +553,10 @@ async function handleMarketIdInput(chatId, marketId) {
     conditionId: m.conditionId,
     title: m.title || m.question || `Market ${m.id}`,
     slug: m.slug,
+    note: initialNote ?? undefined,
   });
   await saveState();
-  await sendSubscribed(chatId, m, { wasExisting });
+  await sendSubscribed(chatId, m, { wasExisting, askForNote: !initialNote });
 }
 
 // One-shot orderbook fetch + render. Useful to verify a market is
@@ -724,21 +752,23 @@ async function runSpeedtest(chatId, n, explicitId) {
 
 async function promptBulkWatch(chatId) {
   const text = [
-    '👁 <b>批量订阅市场</b>',
+    '👁 <b>开始监控</b>',
     '',
-    '回复此条消息，每行一个 URL / marketId / slug，',
-    '可在后面加备注（用空格、<code>-</code> 或 <code>:</code> 分隔）。',
+    '<b>💡 格式示例</b>',
+    '<code>https://predict.fun/zh-cn/market/foo</code>  — 单个市场',
+    '<code>272779</code>                              — 直接用 marketId',
+    '<code>btc-eom-2026</code>                        — 用 slug',
+    '<code>spain 主仓</code>                          — 带备注',
+    '<code>will-btc-100k - 长期持有</code>            — 带备注（<code>-</code> 分隔）',
+    '<code>btc : 短期套利</code>                      — 带备注（<code>:</code> 分隔）',
     '',
-    '<b>📋 格式示例</b>',
-    '<code>https://predict.fun/zh-cn/market/foo</code>',
-    '<code>272779 主仓</code>',
-    '<code>spain — 西班牙夺冠</code>',
-    '<code>btc-eom-2026 : 短期套利</code>',
+    '📝 <b>回复此条消息</b>，每行一个 URL / marketId / slug',
+    '可在后面跟备注（空格、<code>-</code> 或 <code>:</code> 分隔）。<b>不用再输入 /watch。</b>',
     '',
-    '<i>每行处理一条；URL 是事件页时会跳过提示（请单独发送以选择子市场）。30 分钟内有效。</i>',
+    '<i>30 分钟内有效；URL 是事件页时会跳过提示让你单独发送以选择子市场。</i>',
   ].join('\n');
   const sent = await sendMessage(chatId, text, {
-    replyMarkup: { force_reply: true, selective: true, input_field_placeholder: 'URL/id/slug 备注' },
+    replyMarkup: { force_reply: true, selective: true, input_field_placeholder: 'URL/id/slug [备注]' },
   });
   putPendingWatch(chatId, sent.message_id);
   await saveState();
@@ -762,6 +792,21 @@ async function applyBulkWatchInput(chatId, raw) {
     await sendMessage(chatId, '没有内容。回复 /watch 弹出的消息，每行写一条。');
     return;
   }
+
+  // Single-line shortcut: route through the standard handlers so the
+  // user gets the orderbook + auto-note follow-up just like a direct
+  // URL paste. Multi-line input keeps the bulk-results message below.
+  if (lines.length === 1) {
+    const { target, note } = parseWatchLine(lines[0]);
+    const id = extractMarketId(target);
+    if (id) {
+      await handleMarketIdInput(chatId, id, { initialNote: note });
+    } else {
+      await handleUrl(chatId, target, { initialNote: note });
+    }
+    return;
+  }
+
   const results = [];
   for (const line of lines) {
     const { target, note } = parseWatchLine(line);
