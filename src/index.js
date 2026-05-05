@@ -12,7 +12,7 @@ import {
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -98,17 +98,8 @@ async function sendSubscribed(chatId, m, { existingNote } = {}) {
   ];
   if (existingNote) lines.push(`📝 备注：${htmlEscape(existingNote)}`);
   lines.push('默认监控买1/2/3 + 卖1/2/3 全部 6 档。');
-  lines.push('点下方按钮自定义要看哪几档 / 加备注；订单簿一旦变动立刻推送。');
-  const replyMarkup = {
-    inline_keyboard: [
-      [
-        { text: '📐 配置档位', callback_data: `lvl:${m.id}:open` },
-        { text: '📝 设置备注', callback_data: `note:${m.id}` },
-      ],
-      [{ text: '🛑 取消订阅', callback_data: `unsub:${m.id}` }],
-    ],
-  };
-  await sendMessage(chatId, lines.join('\n'), { replyMarkup });
+  lines.push('订单簿一旦变动立刻推送。下方按钮：探针 / 改档位 / 加备注 / 退订。');
+  await sendMessage(chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(m.id) });
 }
 
 // Send a ForceReply prompt asking the user to type a note. Records the
@@ -133,8 +124,15 @@ function buildChoiceKeyboard(token, matches) {
   const rows = [];
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i];
-    const label = (m.title || m.question || `Market ${m.id}`).slice(0, 60);
-    rows.push([{ text: label, callback_data: `pick:${token}:${i}` }]);
+    // Number prefix + #id suffix disambiguates same-titled cards
+    // (events with multiple sub-markets share Yes/No/Draw labels).
+    // Telegram button text caps at ~64 chars; trim title to fit both
+    // the prefix and the id without overflow.
+    const rawTitle = (m.title || m.question || `#${m.id}`).replace(/\s+/g, ' ').trim();
+    const idSuffix = ` · #${m.id}`;
+    const titleBudget = 64 - String(i + 1).length - 2 - idSuffix.length;
+    const title = rawTitle.length > titleBudget ? rawTitle.slice(0, titleBudget - 1) + '…' : rawTitle;
+    rows.push([{ text: `${i + 1}. ${title}${idSuffix}`, callback_data: `pick:${token}:${i}` }]);
   }
   rows.push([{ text: '✖ 取消', callback_data: `pick:${token}:cancel` }]);
   return { inline_keyboard: rows };
@@ -479,11 +477,14 @@ async function runProbe(chatId, marketId) {
     `<b>${htmlEscape(title)}</b>  <code>id=${marketId}</code>`,
     sub?.note ? `📝 <i>${htmlEscape(sub.note)}</i>` : null,
     '',
-    fmtBook(null, snap, levels),
+    fmtSpreadLine(snap),
     '',
-    `<i>更新时间戳: ${new Date(snap.updatedAtMs).toISOString().slice(11, 19)}</i>`,
+    fmtBook(null, snap, levels),
   ].filter(Boolean).join('\n');
-  await sendMessage(chatId, text);
+  // Only attach the action keyboard when the user actually has a sub
+  // for this market — buttons would 404 otherwise.
+  const replyMarkup = sub ? subActionKeyboard(marketId) : undefined;
+  await sendMessage(chatId, text, { replyMarkup });
 }
 
 // Speed test: hammer one orderbook endpoint N times back-to-back and
@@ -785,6 +786,22 @@ async function handleCallback(cb) {
     const ok = removeSubscription(chatId, id);
     if (ok) await saveState();
     await answerCallbackQuery(cb.id, { text: ok ? '已取消订阅' : '订阅不存在' });
+    // Strip the now-stale buttons from the originating message so the
+    // user can't double-click. Edit caption only if the message has
+    // text we can replace.
+    if (ok && messageId) {
+      try {
+        await editMessageText(chatId, messageId, `🛑 已取消订阅 <code>${htmlEscape(id)}</code>`);
+      } catch { /* old message or no edit perms — ignore */ }
+    }
+    return;
+  }
+
+  const probeMatch = data.match(/^probe:(\d+)$/);
+  if (probeMatch) {
+    const id = probeMatch[1];
+    await answerCallbackQuery(cb.id, { text: '🔍 抓取中…' });
+    await runProbe(chatId, id);
     return;
   }
 

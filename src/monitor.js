@@ -13,6 +13,19 @@ import { appendEvent } from './history.js';
 const lastBookPerSub = new Map();
 const lastNotify = new Map();
 
+// Standard 4-button action row attached to every notification + every
+// /list card. The callback handlers for these live in src/index.js.
+export function subActionKeyboard(marketId) {
+  return {
+    inline_keyboard: [[
+      { text: '🔍 Probe', callback_data: `probe:${marketId}` },
+      { text: '📐 档位',  callback_data: `lvl:${marketId}:open` },
+      { text: '📝 备注',  callback_data: `note:${marketId}` },
+      { text: '🛑 停止',  callback_data: `unsub:${marketId}` },
+    ]],
+  };
+}
+
 export function fmtSide(side) {
   if (!side) return '<i>无</i>';
   const price = side.price.toFixed(4);
@@ -20,24 +33,34 @@ export function fmtSide(side) {
   return `${price} × ${size}`;
 }
 
-// Compact inline delta marker. Returns '' when no meaningful change so
-// the renderer can omit the trailing italics block entirely. Direction
-// arrows: ↑ for increase, ↓ for decrease.
-function fmtInlineDelta(prev, cur) {
+function pad(s, width, align = 'left') {
+  const str = String(s);
+  const need = Math.max(0, width - str.length);
+  return align === 'right' ? ' '.repeat(need) + str : str + ' '.repeat(need);
+}
+
+function fmtPriceCell(side) {
+  return side ? side.price.toFixed(4) : '   —  ';
+}
+function fmtSizeCell(side) {
+  return side ? side.size.toLocaleString('en-US', { maximumFractionDigits: 0 }) : '—';
+}
+
+// Render a per-row delta marker in plain text. Empty string when no
+// change meets thresholds. Used for the change-list section.
+function fmtRowDelta(prev, cur) {
   if (!prev && !cur) return '';
-  if (!prev && cur) return ' <i>(新)</i>';
-  if (prev && !cur) return ' <i>(撤)</i>';
+  if (!prev && cur) return '新挂';
+  if (prev && !cur) return '撤单';
   const dp = cur.price - prev.price;
   const ds = cur.size - prev.size;
   const parts = [];
-  if (Math.abs(dp) >= 1e-9) {
-    parts.push(`${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`);
-  }
+  if (Math.abs(dp) >= 1e-9) parts.push(`${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`);
   if (Math.abs(ds) >= 1) {
     const fmt = Math.abs(ds).toLocaleString('en-US', { maximumFractionDigits: 0 });
-    parts.push(`${ds > 0 ? '↑' : '↓'}${fmt}`);
+    parts.push(`量${ds > 0 ? '↑' : '↓'}${fmt}`);
   }
-  return parts.length ? ` <i>${parts.join(' ')}</i>` : '';
+  return parts.join(' ');
 }
 
 function getLevel(snap, key) {
@@ -72,33 +95,61 @@ function bookChanged(prev, cur, levels, mode = 'both') {
   return false;
 }
 
-// Render the book with deltas inline next to each level. Watched levels
-// get the 👁 marker. Unwatched levels are still shown for context but
-// without an eye and without a delta annotation (to keep them quiet).
+// Render the book as a side-by-side <pre> table (Bid | Ask), plus the
+// spread/mid/timestamp meta line. The <pre> block guarantees monospace
+// alignment in Telegram. ASCII-only content inside <pre> avoids the
+// CJK 2-cell-width alignment problem (markers/labels live OUTSIDE).
 export function fmtBook(prev, snap, levels) {
   const set = new Set(levels);
-  const lines = [];
-  lines.push('<b>买单 (Bids)</b>');
+  // Column widths chosen so 0.7100 (6) and 40,410 (6) both fit; bumping
+  // the size column to 7 leaves room for 5-digit shares.
+  const W_PRICE = 6;
+  const W_SIZE = 7;
+
+  const rows = [];
+  rows.push(`     ${pad('Bid', W_PRICE + W_SIZE + 2)}   ${pad('Ask', W_PRICE + W_SIZE + 2)}`);
   for (let i = 0; i < 3; i++) {
-    const k = `bid${i + 1}`;
-    const watched = set.has(k);
-    const cur = snap.bids?.[i];
-    const p = prev?.bids?.[i];
-    const mark = watched ? '👁' : ' ·';
-    const delta = watched ? fmtInlineDelta(p, cur) : '';
-    lines.push(`  ${mark} L${i + 1}: ${fmtSide(cur)}${delta}`);
+    const bidWatched = set.has(`bid${i + 1}`);
+    const askWatched = set.has(`ask${i + 1}`);
+    const bid = snap.bids?.[i];
+    const ask = snap.asks?.[i];
+    const eyeBid = bidWatched ? '*' : ' ';
+    const eyeAsk = askWatched ? '*' : ' ';
+    const bidPrice = pad(fmtPriceCell(bid), W_PRICE, 'right');
+    const bidSize = pad(fmtSizeCell(bid), W_SIZE, 'right');
+    const askPrice = pad(fmtPriceCell(ask), W_PRICE, 'right');
+    const askSize = pad(fmtSizeCell(ask), W_SIZE, 'right');
+    rows.push(`L${i + 1} ${eyeBid} ${bidPrice} ${bidSize}   ${eyeAsk} ${askPrice} ${askSize}`);
   }
-  lines.push('<b>卖单 (Asks)</b>');
-  for (let i = 0; i < 3; i++) {
-    const k = `ask${i + 1}`;
-    const watched = set.has(k);
-    const cur = snap.asks?.[i];
-    const p = prev?.asks?.[i];
-    const mark = watched ? '👁' : ' ·';
-    const delta = watched ? fmtInlineDelta(p, cur) : '';
-    lines.push(`  ${mark} L${i + 1}: ${fmtSide(cur)}${delta}`);
+  return `<pre>${rows.join('\n')}</pre>`;
+}
+
+// Spread + mid + book-timestamp one-liner shown above the table.
+export function fmtSpreadLine(snap) {
+  const bb = snap.bestBid?.price;
+  const ba = snap.bestAsk?.price;
+  const time = new Date(snap.updatedAtMs ?? Date.now()).toISOString().slice(11, 19);
+  if (bb == null || ba == null) return `<i>${time} UTC · 缺一边</i>`;
+  const spread = ba - bb;
+  const mid = (ba + bb) / 2;
+  return `<i>Spread ${spread.toFixed(4)} · Mid ${mid.toFixed(4)} · ${time} UTC</i>`;
+}
+
+// Compact change-list: one line per watched level whose change cleared
+// the threshold. Nothing emitted if no level fired (caller skips
+// section entirely). Plain text — caller wraps in <i>.
+export function fmtChangeLines(prev, snap, levels, mode = 'both') {
+  if (!prev) return [];
+  const out = [];
+  for (const k of levels) {
+    const p = getLevel(prev, k);
+    const c = getLevel(snap, k);
+    if (!levelDiff(p, c, mode)) continue;
+    const label = LEVEL_LABEL[k] ?? k;
+    const delta = fmtRowDelta(p, c);
+    if (delta) out.push(`  ${label}: ${delta}`);
   }
-  return lines.join('\n');
+  return out;
 }
 
 // Single-line headline summarising what kind of change triggered the
@@ -124,8 +175,11 @@ function fmtHeadline(prev, cur, levels, mode = 'both') {
   const parts = [`${nChanges} 档变动`];
   if (mode !== 'size' && biggestPrice >= 0.0001) parts.push(`最大价 Δ${biggestPrice.toFixed(4)}`);
   if (mode !== 'price' && biggestSize >= 1) parts.push(`最大量 Δ${Math.round(biggestSize).toLocaleString('en-US')}`);
-  if (mode === 'price') parts.push('<i>(只看价)</i>');
-  else if (mode === 'size') parts.push('<i>(只看量)</i>');
+  // Plain-text mode marker — the caller wraps the whole headline in
+  // <i>htmlEscape(...)</i>, so any HTML inserted here would render as
+  // literal "&lt;i&gt;...&lt;/i&gt;" in Telegram.
+  if (mode === 'price') parts.push('只看价');
+  else if (mode === 'size') parts.push('只看量');
   return '📈 ' + parts.join(' · ');
 }
 
@@ -205,19 +259,23 @@ async function pollOnce() {
       if (prev && now - lastSentAt < config.notifyCooldownMs) continue;
       const headline = fmtHeadline(prev, snap, levels, mode);
       const body = fmtBook(prev, snap, levels);
+      const spreadLine = fmtSpreadLine(snap);
+      const changeLines = fmtChangeLines(prev, snap, levels, mode);
       const titleLine = htmlEscape(s.title || `Market ${s.marketId}`);
       const lines = [`<b>📊 ${titleLine}</b>`];
       if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
-      lines.push(
-        `<i>${htmlEscape(headline)}</i>`,
-        '',
-        body,
-        '',
-        `<code>id=${s.marketId}</code> · /probe_${s.marketId} · /levels_${s.marketId} · /note_${s.marketId} · /stop_${s.marketId}`,
-      );
+      lines.push(`<i>${htmlEscape(headline)}</i>`);
+      if (changeLines.length) {
+        lines.push('');
+        lines.push('<b>变动</b>');
+        for (const l of changeLines) lines.push(`<code>${l}</code>`);
+      }
+      lines.push('', spreadLine, '', body);
+      lines.push('', `<code>id=${s.marketId}</code>`);
       const text = lines.join('\n');
+      const replyMarkup = subActionKeyboard(s.marketId);
       try {
-        await sendMessage(s.chatId, text);
+        await sendMessage(s.chatId, text, { replyMarkup });
         lastNotify.set(k, now);
         lastBookPerSub.set(k, snap);
         // Persist a structured record of the change. Keep the payload

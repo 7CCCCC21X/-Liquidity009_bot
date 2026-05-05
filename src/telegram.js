@@ -8,10 +8,70 @@ export function htmlEscape(s) {
     .replaceAll('>', '&gt;');
 }
 
-const TELEGRAM_MAX = 3900;
+// Telegram caps text at 4096 chars (entity-resolved length). 3800 leaves
+// headroom for HTML entities + the ellipsis marker on hard splits.
+const TELEGRAM_MAX = 3800;
 
 function tgUrl(method) {
   return `https://api.telegram.org/bot${config.telegramBotToken}/${method}`;
+}
+
+// Split a long HTML message on line boundaries so we never cut a tag,
+// entity, or <pre> block in half. A line that's individually longer
+// than the limit gets a hard slice with an ellipsis (rare; the
+// notification flow stays well under).
+export function splitHtmlByLines(text, limit = TELEGRAM_MAX) {
+  if (text.length <= limit) return [text];
+  const parts = [];
+  let cur = '';
+  for (const line of text.split('\n')) {
+    const next = cur ? `${cur}\n${line}` : line;
+    if (next.length <= limit) {
+      cur = next;
+      continue;
+    }
+    if (cur) parts.push(cur);
+    if (line.length > limit) {
+      // Hard-slice an over-long single line. Acceptable to lose a bit
+      // here — better than ditching the whole notification.
+      for (let i = 0; i < line.length; i += limit - 1) {
+        const slice = line.slice(i, i + limit - 1);
+        parts.push(i + (limit - 1) < line.length ? slice + '…' : slice);
+      }
+      cur = '';
+    } else {
+      cur = line;
+    }
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
+
+// HTML tags that Telegram's parser rejects when a chunk leaves them
+// open (or vice versa). Order matters for re-balancing: close inner
+// before outer.
+const HTML_TAGS_TO_BALANCE = ['code', 'pre', 'b', 'i', 'u', 's'];
+
+function openTagBalance(text, tag) {
+  const opens = text.match(new RegExp(`<${tag}(?:\\s[^>]*)?>`, 'g'));
+  const closes = text.match(new RegExp(`</${tag}>`, 'g'));
+  return Math.max(0, (opens?.length ?? 0) - (closes?.length ?? 0));
+}
+
+// Walk adjacent chunk pairs — if a tag is left open at end of chunk N,
+// close it there and re-open it at start of chunk N+1. Critical for
+// long <pre> blocks (orderbook tables) that straddle a chunk boundary.
+export function rebalanceHtmlChunks(chunks) {
+  for (let i = 0; i < chunks.length - 1; i++) {
+    for (const tag of HTML_TAGS_TO_BALANCE) {
+      const bal = openTagBalance(chunks[i], tag);
+      if (bal > 0) {
+        chunks[i] = chunks[i] + `</${tag}>`.repeat(bal);
+        chunks[i + 1] = `<${tag}>`.repeat(bal) + chunks[i + 1];
+      }
+    }
+  }
+  return chunks;
 }
 
 export async function tgApi(method, payload, { timeoutMs = 15_000, retries = 2 } = {}) {
@@ -44,15 +104,26 @@ export async function getUpdates({ offset, timeoutSec = 25, signal } = {}) {
 }
 
 export async function sendMessage(chatId, text, { replyMarkup, replyTo } = {}) {
-  const payload = {
-    chat_id: chatId,
-    text: text.length > TELEGRAM_MAX ? text.slice(0, TELEGRAM_MAX - 1) + '…' : text,
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-  };
-  if (replyMarkup) payload.reply_markup = replyMarkup;
-  if (replyTo) payload.reply_to_message_id = replyTo;
-  return tgApi('sendMessage', payload);
+  const chunks = rebalanceHtmlChunks(splitHtmlByLines(text));
+  let last;
+  for (let i = 0; i < chunks.length; i++) {
+    const isFirst = i === 0;
+    const isLast = i === chunks.length - 1;
+    const payload = {
+      chat_id: chatId,
+      text: chunks[i],
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    };
+    // reply_to lives on the first chunk (so the thread anchors
+    // correctly); reply_markup on the last (so buttons render at the
+    // visible bottom of the conversation).
+    if (isFirst && replyTo) payload.reply_to_message_id = replyTo;
+    if (isLast && replyMarkup) payload.reply_markup = replyMarkup;
+    last = await tgApi('sendMessage', payload);
+    if (!isLast) await new Promise((r) => setTimeout(r, 200));
+  }
+  return last;
 }
 
 export async function editMessageText(chatId, messageId, text, replyMarkup) {
