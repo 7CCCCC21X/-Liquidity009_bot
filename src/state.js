@@ -19,6 +19,18 @@ export const LEVEL_LABEL = {
   ask1: '卖1', ask2: '卖2', ask3: '卖3',
 };
 
+// Per-subscription trigger condition. Default 'both' = alert on price
+// OR size change (legacy behavior). 'price' / 'size' suppress the
+// other half so the user can mute one signal entirely.
+export const TRIGGER_MODES = ['both', 'price', 'size'];
+export const TRIGGER_LABEL = { both: '价+量', price: '只看价', size: '只看量' };
+
+export function normalizeTriggerMode(mode) {
+  if (typeof mode !== 'string') return 'both';
+  const m = mode.toLowerCase();
+  return TRIGGER_MODES.includes(m) ? m : 'both';
+}
+
 export function normalizeLevels(levels) {
   if (!Array.isArray(levels)) return [...ALL_LEVELS];
   const set = new Set(levels.filter((l) => ALL_LEVELS.includes(l)));
@@ -76,9 +88,17 @@ export function addSubscription(sub) {
     ...sub,
     levels: normalizeLevels(sub.levels ?? existing?.levels),
     note: sub.note ?? existing?.note ?? null,
+    triggerMode: normalizeTriggerMode(sub.triggerMode ?? existing?.triggerMode),
     addedAt: existing?.addedAt ?? Date.now(),
   };
   return k;
+}
+
+export function updateSubscriptionTriggerMode(chatId, marketId, mode) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  s.triggerMode = normalizeTriggerMode(mode);
+  return s;
 }
 
 export function updateSubscriptionNote(chatId, marketId, note) {
@@ -92,8 +112,9 @@ export function updateSubscriptionNote(chatId, marketId, note) {
 export function getSubscription(chatId, marketId) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
-  // Backfill default levels for subs created before /levels existed.
+  // Backfill defaults for subs created before these fields existed.
   s.levels = normalizeLevels(s.levels);
+  s.triggerMode = normalizeTriggerMode(s.triggerMode);
   return s;
 }
 
@@ -118,6 +139,7 @@ export function listSubscriptionsForChat(chatId) {
 export function listAllSubscriptions() {
   return Object.values(_state.subs).map((s) => {
     s.levels = normalizeLevels(s.levels);
+    s.triggerMode = normalizeTriggerMode(s.triggerMode);
     return s;
   });
 }

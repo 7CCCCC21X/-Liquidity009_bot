@@ -47,21 +47,27 @@ function getLevel(snap, key) {
   return side?.[idx] ?? null;
 }
 
-function levelDiff(prev, cur) {
+// mode: 'both' | 'price' | 'size'. Default 'both' means a change to
+// either price or size triggers; 'price' / 'size' mute the other.
+function levelDiff(prev, cur, mode = 'both') {
   if (!prev && !cur) return false;
   if (!prev || !cur) return true;
-  if (Math.abs(prev.price - cur.price) >= config.priceEpsilon) return true;
-  const sizeDelta = Math.abs(prev.size - cur.size);
-  if (sizeDelta >= config.sizeAbsoluteMin) return true;
-  const base = Math.max(prev.size, cur.size, 1);
-  if (sizeDelta / base >= config.sizeRelativeEpsilon) return true;
+  const checkPrice = mode !== 'size';
+  const checkSize = mode !== 'price';
+  if (checkPrice && Math.abs(prev.price - cur.price) >= config.priceEpsilon) return true;
+  if (checkSize) {
+    const sizeDelta = Math.abs(prev.size - cur.size);
+    if (sizeDelta >= config.sizeAbsoluteMin) return true;
+    const base = Math.max(prev.size, cur.size, 1);
+    if (sizeDelta / base >= config.sizeRelativeEpsilon) return true;
+  }
   return false;
 }
 
-function bookChanged(prev, cur, levels) {
+function bookChanged(prev, cur, levels, mode = 'both') {
   if (!prev) return true;
   for (const k of levels) {
-    if (levelDiff(getLevel(prev, k), getLevel(cur, k))) return true;
+    if (levelDiff(getLevel(prev, k), getLevel(cur, k), mode)) return true;
   }
   return false;
 }
@@ -97,7 +103,7 @@ export function fmtBook(prev, snap, levels) {
 
 // Single-line headline summarising what kind of change triggered the
 // alert. Kept short — the per-level deltas in fmtBook carry the details.
-function fmtHeadline(prev, cur, levels) {
+function fmtHeadline(prev, cur, levels, mode = 'both') {
   if (!prev) return '🆕 初次抓取';
   let nChanges = 0;
   let biggestPrice = 0;
@@ -105,7 +111,7 @@ function fmtHeadline(prev, cur, levels) {
   for (const k of levels) {
     const p = getLevel(prev, k);
     const c = getLevel(cur, k);
-    if (!levelDiff(p, c)) continue;
+    if (!levelDiff(p, c, mode)) continue;
     nChanges += 1;
     if (p && c) {
       const dp = Math.abs(c.price - p.price);
@@ -116,8 +122,10 @@ function fmtHeadline(prev, cur, levels) {
   }
   if (!nChanges) return '深度变动';
   const parts = [`${nChanges} 档变动`];
-  if (biggestPrice >= 0.0001) parts.push(`最大价 Δ${biggestPrice.toFixed(4)}`);
-  if (biggestSize >= 1) parts.push(`最大量 Δ${Math.round(biggestSize).toLocaleString('en-US')}`);
+  if (mode !== 'size' && biggestPrice >= 0.0001) parts.push(`最大价 Δ${biggestPrice.toFixed(4)}`);
+  if (mode !== 'price' && biggestSize >= 1) parts.push(`最大量 Δ${Math.round(biggestSize).toLocaleString('en-US')}`);
+  if (mode === 'price') parts.push('<i>(只看价)</i>');
+  else if (mode === 'size') parts.push('<i>(只看量)</i>');
   return '📈 ' + parts.join(' · ');
 }
 
@@ -149,6 +157,7 @@ async function pollOnce() {
     const now = Date.now();
     for (const s of group) {
       const levels = s.levels?.length ? s.levels : ALL_LEVELS;
+      const mode = s.triggerMode || 'both';
       const k = subKey(s.chatId, s.marketId);
       const prev = lastBookPerSub.get(k);
       // Empty levels = monitoring nothing (user toggled all off). Snapshot
@@ -157,10 +166,10 @@ async function pollOnce() {
         lastBookPerSub.set(k, snap);
         continue;
       }
-      if (!bookChanged(prev, snap, levels)) continue;
+      if (!bookChanged(prev, snap, levels, mode)) continue;
       const lastSentAt = lastNotify.get(k) ?? 0;
       if (prev && now - lastSentAt < config.notifyCooldownMs) continue;
-      const headline = fmtHeadline(prev, snap, levels);
+      const headline = fmtHeadline(prev, snap, levels, mode);
       const body = fmtBook(prev, snap, levels);
       const titleLine = htmlEscape(s.title || `Market ${s.marketId}`);
       const lines = [`<b>📊 ${titleLine}</b>`];

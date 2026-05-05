@@ -5,10 +5,11 @@ import {
   loadState, saveState, getState,
   addSubscription, removeSubscription, listSubscriptionsForChat,
   getSubscription, updateSubscriptionLevels, updateSubscriptionNote,
+  updateSubscriptionTriggerMode,
   putPendingChoice, takePendingChoice, gcPendingChoices,
   putPendingNote, takePendingNote, gcPendingNotes,
   putPendingWatch, takePendingWatch, gcPendingWatch,
-  ALL_LEVELS, LEVEL_LABEL,
+  ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
 import { fmtBook } from './monitor.js';
@@ -44,11 +45,15 @@ const HELP = [
   '/stopall — 取消全部订阅',
 ].join('\n');
 
-function buildLevelsKeyboard(marketId, levels) {
+function buildLevelsKeyboard(marketId, levels, triggerMode) {
   const set = new Set(levels);
   const btn = (k) => ({
     text: (set.has(k) ? '✅ ' : '⬜ ') + LEVEL_LABEL[k],
     callback_data: `lvl:${marketId}:t:${k}`,
+  });
+  const mbtn = (mode, label) => ({
+    text: (triggerMode === mode ? '🟢 ' : '⚪ ') + label,
+    callback_data: `lvl:${marketId}:m:${mode}`,
   });
   return {
     inline_keyboard: [
@@ -59,6 +64,7 @@ function buildLevelsKeyboard(marketId, levels) {
         { text: '全选', callback_data: `lvl:${marketId}:all` },
         { text: '清空', callback_data: `lvl:${marketId}:none` },
       ],
+      [mbtn('both', '价+量'), mbtn('price', '只看价'), mbtn('size', '只看量')],
       [{ text: '✅ 完成', callback_data: `lvl:${marketId}:done` }],
     ],
   };
@@ -68,14 +74,16 @@ function levelsHeader(sub) {
   const watching = sub.levels?.length
     ? sub.levels.map((l) => LEVEL_LABEL[l]).join('、')
     : '（无 — 不会推送）';
+  const mode = TRIGGER_LABEL[sub.triggerMode] ?? '价+量';
   return [
     `<b>📐 配置监控档位</b>`,
     htmlEscape(sub.title || `Market ${sub.marketId}`),
     `<code>id=${sub.marketId}</code>`,
     '',
-    `当前监控：${watching}`,
+    `当前档位：${watching}`,
+    `触发条件：<b>${mode}</b>`,
     '',
-    '点按钮切换档位（✅ = 监控，⬜ = 忽略）。',
+    '点按钮切换档位（✅ = 监控）/ 触发条件（🟢 = 当前选中）。',
   ].join('\n');
 }
 
@@ -217,8 +225,9 @@ async function handleCommand(chatId, text) {
     const lines = ['<b>当前订阅</b>'];
     for (const s of subs) {
       const levels = s.levels?.length ? s.levels.map((l) => LEVEL_LABEL[l]).join('/') : '（无）';
+      const mode = TRIGGER_LABEL[s.triggerMode] ?? '价+量';
       const noteLine = s.note ? `\n   📝 ${htmlEscape(s.note)}` : '';
-      lines.push(`• <code>${s.marketId}</code> — ${htmlEscape(s.title || '')}${noteLine}\n   档位：${levels}  /levels_${s.marketId}  /note_${s.marketId}`);
+      lines.push(`• <code>${s.marketId}</code> — ${htmlEscape(s.title || '')}${noteLine}\n   档位：${levels} · 触发：${mode}  /levels_${s.marketId}  /note_${s.marketId}`);
     }
     lines.push('', '改档位：/levels &lt;id&gt;\n改备注：/note &lt;id&gt; &lt;文字&gt;（不带文字 = 清除）\n取消单个：/stop &lt;id&gt;\n取消全部：/stopall');
     await sendMessage(chatId, lines.join('\n'));
@@ -287,7 +296,7 @@ async function handleCommand(chatId, text) {
       return true;
     }
     await sendMessage(chatId, levelsHeader(sub), {
-      replyMarkup: buildLevelsKeyboard(sub.marketId, sub.levels),
+      replyMarkup: buildLevelsKeyboard(sub.marketId, sub.levels, sub.triggerMode),
     });
     return true;
   }
@@ -696,6 +705,25 @@ async function handleCallback(cb) {
       await answerCallbackQuery(cb.id, { text: '订阅不存在', showAlert: true });
       return;
     }
+    // Trigger-mode toggle (m:both | m:price | m:size).
+    if (action.startsWith('m:')) {
+      const mode = action.slice(2);
+      if (!TRIGGER_MODES.includes(mode)) {
+        await answerCallbackQuery(cb.id, { text: '未知模式' });
+        return;
+      }
+      updateSubscriptionTriggerMode(chatId, marketId, mode);
+      await saveState();
+      const fresh = getSubscription(chatId, marketId);
+      await answerCallbackQuery(cb.id, { text: `触发: ${TRIGGER_LABEL[mode]}` });
+      try {
+        await editMessageText(chatId, messageId, levelsHeader(fresh), buildLevelsKeyboard(marketId, fresh.levels, fresh.triggerMode));
+      } catch {
+        await sendMessage(chatId, levelsHeader(fresh), { replyMarkup: buildLevelsKeyboard(marketId, fresh.levels, fresh.triggerMode) });
+      }
+      return;
+    }
+
     let next = [...(sub.levels ?? ALL_LEVELS)];
     if (action === 'all') next = [...ALL_LEVELS];
     else if (action === 'none') next = [];
@@ -708,11 +736,12 @@ async function handleCallback(cb) {
       await answerCallbackQuery(cb.id, { text: '✅ 已保存' });
       try {
         await editMessageText(chatId, messageId, [
-          `<b>📐 档位已保存</b>`,
+          `<b>📐 设置已保存</b>`,
           htmlEscape(sub.title || `Market ${sub.marketId}`),
           `<code>id=${sub.marketId}</code>`,
           ``,
-          `监控：${summary}`,
+          `监控档位：${summary}`,
+          `触发条件：<b>${TRIGGER_LABEL[sub.triggerMode] ?? '价+量'}</b>`,
         ].join('\n'));
       } catch { /* edit may fail if message too old; ignore */ }
       return;
@@ -737,10 +766,10 @@ async function handleCallback(cb) {
     const fresh = getSubscription(chatId, marketId);
     await answerCallbackQuery(cb.id, { text: 'OK' });
     try {
-      await editMessageText(chatId, messageId, levelsHeader(fresh), buildLevelsKeyboard(marketId, fresh.levels));
+      await editMessageText(chatId, messageId, levelsHeader(fresh), buildLevelsKeyboard(marketId, fresh.levels, fresh.triggerMode));
     } catch (err) {
       // If edit fails (e.g. opened from a notification message we didn't author), send fresh.
-      await sendMessage(chatId, levelsHeader(fresh), { replyMarkup: buildLevelsKeyboard(marketId, fresh.levels) });
+      await sendMessage(chatId, levelsHeader(fresh), { replyMarkup: buildLevelsKeyboard(marketId, fresh.levels, fresh.triggerMode) });
     }
     return;
   }
