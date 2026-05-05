@@ -13,6 +13,19 @@ import { appendEvent } from './history.js';
 const lastBookPerSub = new Map();
 const lastNotify = new Map();
 
+// Seed the per-sub baseline with a snapshot taken at subscribe time.
+// Without this, the user gets a "🆕 初次抓取" alert on the next poll
+// tick — duplicating the orderbook the subscribe-success message
+// already showed. Calling primeSubscriptionSnapshot suppresses that.
+export function primeSubscriptionSnapshot(chatId, marketId, snap) {
+  if (!snap) return;
+  lastBookPerSub.set(subKey(chatId, marketId), snap);
+  // Mark as just-notified so the cooldown still applies even though
+  // we didn't send an in-band alert. Stops a cooldown=1s subscription
+  // from being woken up by the very next poll.
+  lastNotify.set(subKey(chatId, marketId), Date.now());
+}
+
 // Standard 4-button action row attached to every notification + every
 // /list card. The callback handlers for these live in src/index.js.
 export function subActionKeyboard(marketId) {

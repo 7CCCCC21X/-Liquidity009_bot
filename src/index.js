@@ -12,7 +12,7 @@ import {
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook, fmtSpreadLine, subActionKeyboard } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -91,14 +91,49 @@ function shortToken() {
   return Math.random().toString(36).slice(2, 8);
 }
 
-async function sendSubscribed(chatId, m, { existingNote } = {}) {
+// Send the "subscribed" confirmation with current orderbook embedded.
+// Three jobs:
+//   1. Tell the user it worked (and whether this was new vs already
+//      tracked — addSubscription preserves note/levels on re-add but
+//      the user can't tell from the prior message).
+//   2. Show the current book immediately so they don't wait one poll
+//      cycle to verify the bot can actually reach this market.
+//   3. Prime the per-sub baseline snapshot — without this, the next
+//      poll tick fires "🆕 初次抓取" which duplicates this message.
+async function sendSubscribed(chatId, m, { wasExisting = false } = {}) {
+  const sub = getSubscription(chatId, m.id);
+  const levels = sub?.levels?.length ? sub.levels : ALL_LEVELS;
+  const mode = sub?.triggerMode || 'both';
+
+  // Fetch the orderbook so the user gets immediate feedback.
+  let snap = null;
+  try {
+    let market = await getMarketById(m.id);
+    if (!market && m.conditionId) market = { id: m.id, conditionId: m.conditionId };
+    if (market) snap = await getOrderbook(market);
+  } catch (err) {
+    console.warn('[subscribed] orderbook fetch failed:', err.message);
+  }
+
+  const headerEmoji = wasExisting ? 'ℹ️' : '✅';
+  const headerText = wasExisting ? '已在监控中（信息已刷新）' : '已开始监控';
   const lines = [
-    `✅ 已订阅 <b>${htmlEscape(m.title || m.question || m.id)}</b>`,
+    `${headerEmoji} <b>${headerText}</b>`,
+    `🏷 ${htmlEscape(m.title || m.question || m.id)}`,
     `<code>id=${m.id}</code>`,
   ];
-  if (existingNote) lines.push(`📝 备注：${htmlEscape(existingNote)}`);
-  lines.push('默认监控买1/2/3 + 卖1/2/3 全部 6 档。');
-  lines.push('订单簿一旦变动立刻推送。下方按钮：探针 / 改档位 / 加备注 / 退订。');
+  if (sub?.note) lines.push(`📝 <i>${htmlEscape(sub.note)}</i>`);
+  lines.push(`📐 档位：${levels.map((l) => LEVEL_LABEL[l]).join('/')} · 触发：${TRIGGER_LABEL[mode] ?? '价+量'}`);
+  if (snap) {
+    lines.push('');
+    lines.push(fmtSpreadLine(snap));
+    lines.push('');
+    lines.push(fmtBook(null, snap, levels));
+    // Suppress the "initial snapshot" alert on the next poll tick.
+    primeSubscriptionSnapshot(chatId, m.id, snap);
+  } else {
+    lines.push('', '<i>当前订单簿抓取失败 — 不影响订阅，下一轮轮询会自动重试。</i>');
+  }
   await sendMessage(chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(m.id) });
 }
 
@@ -186,7 +221,7 @@ async function handleUrl(chatId, text) {
   }
   if (matches.length === 1) {
     const m = matches[0];
-    const existing = getSubscription(chatId, m.id);
+    const wasExisting = !!getSubscription(chatId, m.id);
     addSubscription({
       chatId,
       marketId: m.id,
@@ -195,7 +230,7 @@ async function handleUrl(chatId, text) {
       slug: m.slug,
     });
     await saveState();
-    await sendSubscribed(chatId, m, { existingNote: existing?.note });
+    await sendSubscribed(chatId, m, { wasExisting });
     return;
   }
   const token = shortToken();
@@ -350,9 +385,24 @@ async function handleCommand(chatId, text) {
   }
   if (c === '/stopall') {
     const subs = listSubscriptionsForChat(chatId);
-    for (const s of subs) removeSubscription(chatId, s.marketId);
-    await saveState();
-    await sendMessage(chatId, `✅ 已取消全部订阅（${subs.length} 个）`);
+    if (!subs.length) {
+      await sendMessage(chatId, '当前没有订阅，无需取消。');
+      return true;
+    }
+    // Confirm before nuking every subscription. The actual delete
+    // happens on the stopall_ok callback below.
+    await sendMessage(chatId, [
+      `⚠️ <b>确认取消全部 ${subs.length} 个订阅？</b>`,
+      ``,
+      `<i>历史记录会保留；订阅本身将被全部清除。</i>`,
+    ].join('\n'), {
+      replyMarkup: {
+        inline_keyboard: [[
+          { text: '✅ 全部停止', callback_data: 'stopall_ok' },
+          { text: '↩️ 返回', callback_data: 'stopall_no' },
+        ]],
+      },
+    });
     return true;
   }
   return false;
@@ -417,7 +467,7 @@ async function handleMarketIdInput(chatId, marketId) {
     question: market.question ?? null,
     slug: market.categorySlug ?? market.slug ?? market.marketSlug ?? null,
   };
-  const existing = getSubscription(chatId, m.id);
+  const wasExisting = !!getSubscription(chatId, m.id);
   addSubscription({
     chatId,
     marketId: m.id,
@@ -426,34 +476,51 @@ async function handleMarketIdInput(chatId, marketId) {
     slug: m.slug,
   });
   await saveState();
-  await sendSubscribed(chatId, m, { existingNote: existing?.note });
+  await sendSubscribed(chatId, m, { wasExisting });
 }
 
 // One-shot orderbook fetch + render. Useful to verify a market is
 // reachable without subscribing, and the latency line doubles as a
 // quick "how slow is this network round trip" gauge.
-// Render each subscription as its own card with the standard 4-button
-// action row, so every sub has a one-tap 停止 right next to it (the
-// previous /list was a single text blob that only showed the
-// /levels_<id> and /note_<id> shortcuts).
-async function renderListView(chatId) {
+const LIST_PAGE_SIZE = 5;
+
+function listPageKeyboard(page, totalPages) {
+  const nav = [];
+  if (page > 0) nav.push({ text: '⬅️ 上一页', callback_data: `list:${page - 1}` });
+  nav.push({ text: `${page + 1} / ${totalPages}`, callback_data: 'noop' });
+  if (page < totalPages - 1) nav.push({ text: '下一页 ➡️', callback_data: `list:${page + 1}` });
+  return {
+    inline_keyboard: [
+      nav,
+      [
+        { text: '🔄 刷新', callback_data: `list:${page}` },
+        { text: '👁 批量加', callback_data: 'list:watch' },
+        { text: '🛑 全部停止', callback_data: 'stopall_confirm' },
+      ],
+    ],
+  };
+}
+
+// Render one page of the subscription list (LIST_PAGE_SIZE per page).
+// Each sub becomes a separate message with its own 4-button action
+// row, plus a header/footer pair carrying the pagination controls.
+// Used by both the /list command and the list:<page> callback.
+async function renderListView(chatId, page = 0) {
   const subs = listSubscriptionsForChat(chatId);
   if (!subs.length) {
     await sendMessage(chatId, '当前没有订阅。直接发个 Predict.fun 网址或 marketId 就能开始监控；批量用 /watch。');
     return;
   }
-  // Header summary first, then one card per sub. Cap at 50 to avoid
-  // accidentally spamming a chat — anything beyond that the user can
-  // /stopall and re-add the ones they want.
-  const cap = 50;
-  const visible = subs.slice(0, cap);
+  const totalPages = Math.max(1, Math.ceil(subs.length / LIST_PAGE_SIZE));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const slice = subs.slice(safePage * LIST_PAGE_SIZE, (safePage + 1) * LIST_PAGE_SIZE);
+
   await sendMessage(chatId, [
     `<b>📋 当前订阅 ${subs.length} 个</b>`,
-    `<i>每张卡片底部按钮可直接操作；批量加 /watch · 全清 /stopall</i>`,
-    subs.length > cap ? `<i>（仅显示前 ${cap} 张；其余请 /stop 后再 /list）</i>` : null,
-  ].filter(Boolean).join('\n'));
+    `<i>第 ${safePage + 1} / ${totalPages} 页 · 每页 ${LIST_PAGE_SIZE} 张</i>`,
+  ].join('\n'));
 
-  for (const s of visible) {
+  for (const s of slice) {
     const levels = s.levels?.length
       ? s.levels.map((l) => LEVEL_LABEL[l]).join('/')
       : '（无 — 不会推送）';
@@ -466,6 +533,13 @@ async function renderListView(chatId) {
     if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
     await sendMessage(chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(s.marketId) });
   }
+
+  // Pagination footer with prev/next/全部停止 buttons.
+  await sendMessage(
+    chatId,
+    `<i>翻页或快捷操作：</i>`,
+    { replyMarkup: listPageKeyboard(safePage, totalPages) },
+  );
 }
 
 async function runProbe(chatId, marketId) {
@@ -803,19 +877,141 @@ async function handleCallback(cb) {
     return;
   }
 
+  // First-tap stop: switch the message to a confirmation prompt
+  // ("确认停止" / "返回"). Actual deletion only happens on unsub_ok.
   const unsubMatch = data.match(/^unsub:(\d+)$/);
   if (unsubMatch) {
     const id = unsubMatch[1];
+    const sub = getSubscription(chatId, id);
+    if (!sub) {
+      await answerCallbackQuery(cb.id, { text: '订阅不存在' });
+      return;
+    }
+    await answerCallbackQuery(cb.id);
+    if (messageId) {
+      try {
+        await editMessageText(
+          chatId,
+          messageId,
+          [
+            `⚠️ <b>确认停止监控？</b>`,
+            `🏷 ${htmlEscape(sub.title || `Market ${id}`)}`,
+            `<code>id=${id}</code>`,
+            sub.note ? `📝 <i>${htmlEscape(sub.note)}</i>` : null,
+            ``,
+            `<i>停止后历史记录保留；如需重新监控，再发一次同样的网址或 id。</i>`,
+          ].filter(Boolean).join('\n'),
+          {
+            inline_keyboard: [[
+              { text: '✅ 确认停止', callback_data: `unsub_ok:${id}` },
+              { text: '↩️ 返回', callback_data: `unsub_no:${id}` },
+            ]],
+          },
+        );
+      } catch { /* old message — fall through with sendMessage */ }
+    }
+    return;
+  }
+
+  // Confirmed stop — actually remove the subscription.
+  const unsubOk = data.match(/^unsub_ok:(\d+)$/);
+  if (unsubOk) {
+    const id = unsubOk[1];
     const ok = removeSubscription(chatId, id);
     if (ok) await saveState();
-    await answerCallbackQuery(cb.id, { text: ok ? '已取消订阅' : '订阅不存在' });
-    // Strip the now-stale buttons from the originating message so the
-    // user can't double-click. Edit caption only if the message has
-    // text we can replace.
-    if (ok && messageId) {
+    await answerCallbackQuery(cb.id, { text: ok ? '已停止' : '订阅已不存在' });
+    if (messageId) {
       try {
-        await editMessageText(chatId, messageId, `🛑 已取消订阅 <code>${htmlEscape(id)}</code>`);
-      } catch { /* old message or no edit perms — ignore */ }
+        await editMessageText(chatId, messageId, ok
+          ? `🛑 已停止监控 <code>${htmlEscape(id)}</code>`
+          : `❌ 订阅已不存在 <code>${htmlEscape(id)}</code>`);
+      } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  // Cancel-stop: restore the original card with its action keyboard.
+  const unsubNo = data.match(/^unsub_no:(\d+)$/);
+  if (unsubNo) {
+    const id = unsubNo[1];
+    const sub = getSubscription(chatId, id);
+    await answerCallbackQuery(cb.id, { text: '已取消' });
+    if (sub && messageId) {
+      const levels = sub.levels?.length
+        ? sub.levels.map((l) => LEVEL_LABEL[l]).join('/')
+        : '（无 — 不会推送）';
+      const mode = TRIGGER_LABEL[sub.triggerMode] ?? '价+量';
+      const lines = [
+        `🟢 <b>${htmlEscape(sub.title || `Market ${sub.marketId}`)}</b>`,
+        `<code>id=${sub.marketId}</code>`,
+        `档位：${levels} · 触发：${mode}`,
+      ];
+      if (sub.note) lines.push(`📝 <i>${htmlEscape(sub.note)}</i>`);
+      try {
+        await editMessageText(chatId, messageId, lines.join('\n'), subActionKeyboard(sub.marketId));
+      } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  // Pagination: list:<n> renders a fresh page; list:watch opens the
+  // bulk-add prompt; noop is the page-indicator (no-op).
+  if (data === 'noop') {
+    await answerCallbackQuery(cb.id);
+    return;
+  }
+  const listMatch = data.match(/^list:(\d+)$/);
+  if (listMatch) {
+    await answerCallbackQuery(cb.id);
+    await renderListView(chatId, Number(listMatch[1]));
+    return;
+  }
+  if (data === 'list:watch') {
+    await answerCallbackQuery(cb.id);
+    await promptBulkWatch(chatId);
+    return;
+  }
+  if (data === 'stopall_confirm') {
+    const subs = listSubscriptionsForChat(chatId);
+    await answerCallbackQuery(cb.id);
+    if (!subs.length) {
+      await sendMessage(chatId, '当前没有订阅，无需取消。');
+      return;
+    }
+    await sendMessage(chatId, [
+      `⚠️ <b>确认取消全部 ${subs.length} 个订阅？</b>`,
+      ``,
+      `<i>历史记录会保留；订阅本身将被全部清除。</i>`,
+    ].join('\n'), {
+      replyMarkup: {
+        inline_keyboard: [[
+          { text: '✅ 全部停止', callback_data: 'stopall_ok' },
+          { text: '↩️ 返回', callback_data: 'stopall_no' },
+        ]],
+      },
+    });
+    return;
+  }
+
+  if (data === 'stopall_ok') {
+    const subs = listSubscriptionsForChat(chatId);
+    for (const s of subs) removeSubscription(chatId, s.marketId);
+    if (subs.length) await saveState();
+    await answerCallbackQuery(cb.id, { text: `已停止 ${subs.length}` });
+    if (messageId) {
+      try {
+        await editMessageText(chatId, messageId, `🛑 已取消全部订阅（共 ${subs.length} 个）`);
+      } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  if (data === 'stopall_no') {
+    await answerCallbackQuery(cb.id, { text: '已取消' });
+    if (messageId) {
+      try {
+        await editMessageText(chatId, messageId, '↩️ 已返回，订阅未变。');
+      } catch { /* ignore */ }
     }
     return;
   }
@@ -847,7 +1043,7 @@ async function handleCallback(cb) {
       await answerCallbackQuery(cb.id, { text: '无效选项', showAlert: true });
       return;
     }
-    const existing = getSubscription(chatId, pick.id);
+    const wasExisting = !!getSubscription(chatId, pick.id);
     addSubscription({
       chatId,
       marketId: pick.id,
@@ -857,7 +1053,7 @@ async function handleCallback(cb) {
     });
     await saveState();
     await answerCallbackQuery(cb.id, { text: '✅ 已订阅' });
-    await sendSubscribed(chatId, pick, { existingNote: existing?.note });
+    await sendSubscribed(chatId, pick, { wasExisting });
     return;
   }
 
