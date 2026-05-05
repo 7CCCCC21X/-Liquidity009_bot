@@ -1168,19 +1168,21 @@ async function main() {
   await loadState();
   const me = await getMe();
   console.log(new Date().toISOString(), `[bot] logged in as @${me.username}`);
+  // Telegram menu (the / dropdown). /help still works as a text
+  // command via the handler, but it's omitted from the menu since
+  // /start now serves the same welcome screen.
   await setMyCommands([
-    { command: 'start', description: '欢迎信息和用法' },
-    { command: 'help', description: '帮助' },
-    { command: 'watch', description: '批量订阅（粘贴多行 URL/id/slug）' },
-    { command: 'list', description: '当前订阅' },
-    { command: 'levels', description: '自定义监控档位（买1/2/3、卖1/2/3）' },
-    { command: 'note', description: '设置/清除订阅备注' },
-    { command: 'history', description: '查看市场最近 N 条变动记录' },
-    { command: 'export', description: '导出完整 history.jsonl' },
-    { command: 'probe', description: '立即抓一次订单簿（不等下次轮询）' },
-    { command: 'speedtest', description: '测试抓取延迟，给出推荐的最快轮询间隔' },
-    { command: 'stop', description: '取消单个订阅' },
-    { command: 'stopall', description: '取消全部订阅' },
+    { command: 'start',     description: '主页 · 开始监控' },
+    { command: 'watch',     description: '批量订阅（粘贴多行 URL/id/slug）' },
+    { command: 'list',      description: '我的订阅（分页 + 操作按钮）' },
+    { command: 'levels',    description: '改档位 + 触发模式' },
+    { command: 'note',      description: '加 / 改备注' },
+    { command: 'probe',     description: '立即抓一次盘口' },
+    { command: 'history',   description: '查看历史变动' },
+    { command: 'export',    description: '导出 history.jsonl' },
+    { command: 'speedtest', description: '测抓取延迟' },
+    { command: 'stop',      description: '取消单个订阅' },
+    { command: 'stopall',   description: '取消全部订阅' },
   ]).catch((e) => console.warn('[bot] setMyCommands failed:', e.message));
 
   // Once-per-startup history compaction (also throttled to ≤1×/24h
