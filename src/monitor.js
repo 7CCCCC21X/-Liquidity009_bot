@@ -129,6 +129,41 @@ function fmtHeadline(prev, cur, levels, mode = 'both') {
   return '📈 ' + parts.join(' · ');
 }
 
+// Fetch a single market's orderbook with the same fallbacks the
+// monitor uses. Returns { snap } on success or { error } on failure;
+// callers decide whether to log or skip.
+async function fetchMarketSnap(marketId, group) {
+  try {
+    let market = await getMarketById(marketId);
+    if (!market) {
+      const s0 = group[0];
+      if (!s0.conditionId) return { marketId, group, error: 'no market record and no cached conditionId' };
+      market = { id: marketId, conditionId: s0.conditionId };
+    }
+    const snap = await getOrderbook(market);
+    return { marketId, group, snap };
+  } catch (err) {
+    return { marketId, group, error: err.message };
+  }
+}
+
+// Run async tasks with a concurrency cap. Simple worker pool — all
+// tasks share a single index counter. Preserves input order in the
+// returned results array.
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const cap = Math.max(1, Math.min(limit | 0, items.length));
+  await Promise.all(Array.from({ length: cap }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i], i);
+    }
+  }));
+  return results;
+}
+
 async function pollOnce() {
   const subs = listAllSubscriptions();
   if (!subs.length) return;
@@ -137,24 +172,23 @@ async function pollOnce() {
     if (!byMarket.has(s.marketId)) byMarket.set(s.marketId, []);
     byMarket.get(s.marketId).push(s);
   }
-  for (const [marketId, group] of byMarket.entries()) {
-    let snap;
-    try {
-      let market = await getMarketById(marketId);
-      if (!market) {
-        const s0 = group[0];
-        if (!s0.conditionId) {
-          console.warn('[monitor] no market record for', marketId);
-          continue;
-        }
-        market = { id: marketId, conditionId: s0.conditionId };
-      }
-      snap = await getOrderbook(market);
-    } catch (err) {
-      console.warn(new Date().toISOString(), `[monitor] ${marketId} fetch failed:`, err.message);
+  // Fetch every market in parallel (bounded). With 1 sub the wall-clock
+  // is one HTTP call; with N subs it's max(L), not N×L.
+  const groups = [...byMarket.entries()];
+  const fetched = await runWithConcurrency(
+    groups,
+    config.pollConcurrency,
+    ([marketId, group]) => fetchMarketSnap(marketId, group),
+  );
+  // Process notifications serially per market so we don't fire
+  // multiple Telegram sends in the same tick (rate-limit friendly).
+  const now = Date.now();
+  for (const result of fetched) {
+    if (result.error) {
+      console.warn(new Date().toISOString(), `[monitor] ${result.marketId} fetch failed:`, result.error);
       continue;
     }
-    const now = Date.now();
+    const { marketId, group, snap } = result;
     for (const s of group) {
       const levels = s.levels?.length ? s.levels : ALL_LEVELS;
       const mode = s.triggerMode || 'both';
@@ -223,7 +257,7 @@ export async function startMonitorLoop({ signal }) {
       console.error(new Date().toISOString(), '[monitor] tick error:', err.message);
     }
     const elapsed = Date.now() - t0;
-    const wait = Math.max(1000, config.pollIntervalMs - elapsed);
+    const wait = Math.max(config.pollMinIntervalMs, config.pollIntervalMs - elapsed);
     await new Promise((r) => setTimeout(r, wait));
   }
   _running = false;

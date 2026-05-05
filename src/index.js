@@ -28,7 +28,7 @@ const HELP = [
   '',
   '订阅后你关注的档位（买1/2/3、卖1/2/3）发生变化就会推送，每张可加备注。',
   '',
-  `⏱ <b>检查间隔</b> ${Math.round(config.pollIntervalMs / 1000)}s · 单订阅最少 ${Math.round(config.notifyCooldownMs / 1000)}s 通知一次`,
+  `⏱ <b>检查间隔</b> ${config.pollIntervalMs}ms · 下限 ${config.pollMinIntervalMs}ms · 并发 ${config.pollConcurrency} · 冷却 ${Math.round(config.notifyCooldownMs / 1000)}s`,
   `📐 <b>触发阈值</b> 价 ≥ ${config.priceEpsilon} · 量 ≥ ${config.sizeAbsoluteMin} 张或 ${(config.sizeRelativeEpsilon * 100).toFixed(0)}%`,
   '',
   '<b>命令</b>',
@@ -550,8 +550,12 @@ async function runSpeedtest(chatId, n, explicitId) {
   const min = valid[0];
   const max = valid[valid.length - 1];
   const p95 = valid[Math.min(valid.length - 1, Math.floor(valid.length * 0.95))];
-  // Recommend POLL_INTERVAL_MS = max(p95 + 50% buffer, 1000).
-  const recommendMs = Math.max(1000, Math.ceil((p95 * 1.5) / 100) * 100);
+  // Recommend POLL_INTERVAL_MS = max(p95 × 1.5, POLL_MIN_INTERVAL_MS).
+  // Round up to a clean 100ms boundary for readability.
+  const recommendMs = Math.max(
+    config.pollMinIntervalMs,
+    Math.ceil((p95 * 1.5) / 100) * 100,
+  );
   const fmt = (t) => t < 0 ? `<s>${-t}ms✗</s>` : `${t}ms`;
   await sendMessage(chatId, [
     `⏱ <b>速度测试结果</b>`,
@@ -562,8 +566,9 @@ async function runSpeedtest(chatId, n, explicitId) {
     '',
     `每次: ${times.map(fmt).join(' · ')}`,
     '',
-    `<i>💡 推荐 <code>POLL_INTERVAL_MS</code> ≥ <b>${recommendMs}</b>（p95 × 1.5 留缓冲）</i>`,
-    `<i>当前: ${config.pollIntervalMs}ms · 单订阅冷却 ${config.notifyCooldownMs / 1000}s</i>`,
+    `<i>💡 推荐 <code>POLL_INTERVAL_MS=${recommendMs}</code>（p95 × 1.5 留缓冲）</i>`,
+    `<i>想最快推送：把 <code>NOTIFY_COOLDOWN_SEC=1</code>（默认 60，防刷屏）</i>`,
+    `<i>当前: 轮询 ${config.pollIntervalMs}ms · 循环下限 ${config.pollMinIntervalMs}ms · 并发 ${config.pollConcurrency} · 冷却 ${config.notifyCooldownMs / 1000}s</i>`,
   ].join('\n'));
 }
 

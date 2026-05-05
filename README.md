@@ -92,14 +92,24 @@ npm run diagnose -- https://predict.fun/zh-cn/market/fifa-world-cup-group-e-winn
 - `npm run prune-history` 强制压缩（保留最近 `HISTORY_KEEP_DAYS` 天）。
 
 ## 调参（频率 + 阈值）
-所有都是 env 变量，不用改代码。**频率两要素**：
+所有都是 env 变量，不用改代码。**频率四要素**：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `POLL_INTERVAL_MS` | `30000` | 多久抓一次订单簿（每个市场） |
+| `POLL_INTERVAL_MS` | `30000` | 多久抓一次订单簿 |
+| `POLL_MIN_INTERVAL_MS` | `200` | 循环硬下限（保险丝；想更快可调更低） |
+| `POLL_CONCURRENCY` | `8` | 一次 tick 同时抓多少个市场（多订阅时关键） |
 | `NOTIFY_COOLDOWN_SEC` | `60` | 单订阅最少多久通知一次（防刷屏） |
 
-实际通知间隔 ≥ max(`POLL_INTERVAL_MS`, `NOTIFY_COOLDOWN_SEC × 1000`)。比如默认配置下，最快也要 60 秒一条；调成 `POLL_INTERVAL_MS=10000` + `NOTIFY_COOLDOWN_SEC=10` 就是最快 10 秒一条。
+实际通知间隔 ≥ max(`POLL_INTERVAL_MS`, `NOTIFY_COOLDOWN_SEC × 1000`)。
+
+**示例**：用 `/speedtest` 看到 p95 ≈ 200ms，要做到秒级提醒：
+```
+POLL_INTERVAL_MS=300       # 1 秒内最多 3 次
+NOTIFY_COOLDOWN_SEC=1
+POLL_MIN_INTERVAL_MS=200
+```
+Bot 内部并行抓多市场（`Promise.all` + 并发上限），所以 N 个订阅的 wall-clock 还是 max(L)，不是 N×L。
 
 **变动阈值**（任意一项触发就算变动）：
 
