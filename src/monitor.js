@@ -13,6 +13,26 @@ import { appendEvent } from './history.js';
 const lastBookPerSub = new Map();
 const lastNotify = new Map();
 
+// Build a Predict.fun market URL, optionally with the configured
+// referral code. Returns null when slug is missing — caller falls
+// back to plain text. Locale and ref code both env-driven.
+export function marketUrl(slug) {
+  if (!slug) return null;
+  const locale = config.predictUrlLocale ? `/${config.predictUrlLocale}` : '';
+  const ref = config.predictRefCode ? `?ref=${encodeURIComponent(config.predictRefCode)}` : '';
+  return `https://predict.fun${locale}/market/${encodeURIComponent(slug)}${ref}`;
+}
+
+// Render a market title as an HTML link if we have the URL slug for
+// it, otherwise as plain HTML-escaped text. Caller can wrap the
+// result in <b>/<i>/etc. — Telegram's HTML parse_mode allows nesting
+// (<b><a href="...">title</a></b>).
+export function marketLink(title, slug) {
+  const safeTitle = htmlEscape(title || '');
+  const url = marketUrl(slug);
+  return url ? `<a href="${url}">${safeTitle}</a>` : safeTitle;
+}
+
 // Seed the per-sub baseline with a snapshot taken at subscribe time.
 // Without this, the user gets a "🆕 初次抓取" alert on the next poll
 // tick — duplicating the orderbook the subscribe-success message
@@ -280,8 +300,8 @@ async function pollOnce() {
       const body = fmtBook(prev, snap, levels);
       const spreadLine = fmtSpreadLine(snap);
       const changeLines = fmtChangeLines(prev, snap, levels, mode);
-      const titleLine = htmlEscape(s.title || `Market ${s.marketId}`);
-      const lines = [`<b>📊 ${titleLine}</b>`];
+      const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
+      const lines = [`<b>📊 ${titleLink}</b>`];
       if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
       lines.push(`<i>${htmlEscape(headline)}</i>`);
       if (changeLines.length) {

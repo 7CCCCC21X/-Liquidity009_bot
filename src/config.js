@@ -26,6 +26,13 @@ export const config = {
   predictApiKey: envStr('PREDICT_API_KEY', ''),
   graphqlUrl: envStr('GRAPHQL_URL', 'https://graphql.predict.fun/graphql'),
   restUrl: envStr('REST_URL', 'https://api.predict.fun/v1'),
+  // Referral code appended to predict.fun market URLs the bot prints
+  // (so clicking a market title in Telegram opens the page with this
+  // ref attribution). Default 'B00EA'; blank to disable.
+  predictRefCode: envStr('PREDICT_REF_CODE', 'B00EA'),
+  // Locale prefix on the URL — predict.fun mirrors the same page at
+  // /, /zh-cn/, /en/, etc. Pick the one you want links to land on.
+  predictUrlLocale: envStr('PREDICT_URL_LOCALE', 'zh-cn'),
   orderbookPathTemplate: envStr('ORDERBOOK_PATH_TEMPLATE', '/markets/{key}/orderbook'),
   orderbookKeyField: envStr('ORDERBOOK_KEY_FIELD', 'conditionId'),
 

@@ -89,6 +89,10 @@ export function addSubscription(sub) {
     levels: normalizeLevels(sub.levels ?? existing?.levels),
     note: sub.note ?? existing?.note ?? null,
     triggerMode: normalizeTriggerMode(sub.triggerMode ?? existing?.triggerMode),
+    // Preserve slug if a re-add (e.g. via marketId) doesn't carry one
+    // — slug drives the clickable URL in messages.
+    slug: sub.slug ?? existing?.slug ?? null,
+    conditionId: sub.conditionId ?? existing?.conditionId ?? null,
     addedAt: existing?.addedAt ?? Date.now(),
   };
   return k;

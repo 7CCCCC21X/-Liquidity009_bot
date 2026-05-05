@@ -12,7 +12,7 @@ import {
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -117,9 +117,11 @@ async function sendSubscribed(chatId, m, { wasExisting = false } = {}) {
 
   const headerEmoji = wasExisting ? 'ℹ️' : '✅';
   const headerText = wasExisting ? '已在监控中（信息已刷新）' : '已开始监控';
+  const titleText = m.title || m.question || m.id;
+  const linkSlug = m.slug || sub?.slug;
   const lines = [
     `${headerEmoji} <b>${headerText}</b>`,
-    `🏷 ${htmlEscape(m.title || m.question || m.id)}`,
+    `🏷 ${marketLink(titleText, linkSlug)}`,
     `<code>id=${m.id}</code>`,
   ];
   if (sub?.note) lines.push(`📝 <i>${htmlEscape(sub.note)}</i>`);
@@ -187,6 +189,17 @@ async function handleUrl(chatId, text) {
     // Falls back to slug-based resolver internally.
     const r = await resolveUrlToMarkets(text);
     matches = r.markets;
+    // Stamp the URL's slug onto matches that don't carry their own.
+    // Predict.fun's GraphQL doesn't expose categorySlug on Market,
+    // so for event pages we use the parent (event) slug as the
+    // clickable URL for every sub-market. Predict.fun resolves both
+    // event and single-market URLs with the same /market/<slug>
+    // path so clicking goes back to the user's source page.
+    if (slug) {
+      for (const m of matches) {
+        if (!m.slug) m.slug = slug;
+      }
+    }
   } catch (err) {
     await sendMessage(chatId, `❌ 抓取市场列表失败：${htmlEscape(err.message)}`);
     return;
@@ -526,7 +539,7 @@ async function renderListView(chatId, page = 0) {
       : '（无 — 不会推送）';
     const mode = TRIGGER_LABEL[s.triggerMode] ?? '价+量';
     const lines = [
-      `🟢 <b>${htmlEscape(s.title || `Market ${s.marketId}`)}</b>`,
+      `🟢 <b>${marketLink(s.title || `Market ${s.marketId}`, s.slug)}</b>`,
       `<code>id=${s.marketId}</code>`,
       `档位：${levels} · 触发：${mode}`,
     ];
@@ -571,7 +584,7 @@ async function runProbe(chatId, marketId) {
   const title = sub?.title || market.title || market.question || `Market ${marketId}`;
   const text = [
     `<b>🔍 即时抓取</b>  <i>(${latency}ms)</i>`,
-    `<b>${htmlEscape(title)}</b>  <code>id=${marketId}</code>`,
+    `<b>${marketLink(title, sub?.slug)}</b>  <code>id=${marketId}</code>`,
     sub?.note ? `📝 <i>${htmlEscape(sub.note)}</i>` : null,
     '',
     fmtSpreadLine(snap),
@@ -895,7 +908,7 @@ async function handleCallback(cb) {
           messageId,
           [
             `⚠️ <b>确认停止监控？</b>`,
-            `🏷 ${htmlEscape(sub.title || `Market ${id}`)}`,
+            `🏷 ${marketLink(sub.title || `Market ${id}`, sub.slug)}`,
             `<code>id=${id}</code>`,
             sub.note ? `📝 <i>${htmlEscape(sub.note)}</i>` : null,
             ``,
@@ -942,7 +955,7 @@ async function handleCallback(cb) {
         : '（无 — 不会推送）';
       const mode = TRIGGER_LABEL[sub.triggerMode] ?? '价+量';
       const lines = [
-        `🟢 <b>${htmlEscape(sub.title || `Market ${sub.marketId}`)}</b>`,
+        `🟢 <b>${marketLink(sub.title || `Market ${sub.marketId}`, sub.slug)}</b>`,
         `<code>id=${sub.marketId}</code>`,
         `档位：${levels} · 触发：${mode}`,
       ];
