@@ -26,15 +26,25 @@ export const TRIGGER_MODES = ['both', 'price', 'size'];
 export const TRIGGER_LABEL = { both: '价+量', price: '只看价', size: '只看量' };
 
 export function normalizeTriggerMode(mode) {
-  if (typeof mode !== 'string') return 'both';
-  const m = mode.toLowerCase();
-  return TRIGGER_MODES.includes(m) ? m : 'both';
+  if (typeof mode === 'string') {
+    const m = mode.toLowerCase();
+    if (TRIGGER_MODES.includes(m)) return m;
+  }
+  // Fall back to env-configured default (e.g. 'price'); guard against a
+  // typo in DEFAULT_TRIGGER_MODE by checking the allowed set.
+  const def = String(config.defaultTriggerMode ?? 'both').toLowerCase();
+  return TRIGGER_MODES.includes(def) ? def : 'both';
 }
 
 export function normalizeLevels(levels) {
-  if (!Array.isArray(levels)) return [...ALL_LEVELS];
-  const set = new Set(levels.filter((l) => ALL_LEVELS.includes(l)));
-  return ALL_LEVELS.filter((l) => set.has(l));
+  if (Array.isArray(levels)) {
+    const set = new Set(levels.filter((l) => ALL_LEVELS.includes(l)));
+    return ALL_LEVELS.filter((l) => set.has(l));
+  }
+  // Fall back to env-configured DEFAULT_LEVELS; ALL_LEVELS if env
+  // produced an empty / invalid list.
+  const def = (config.defaultLevels ?? []).filter((l) => ALL_LEVELS.includes(l));
+  return def.length ? ALL_LEVELS.filter((l) => def.includes(l)) : [...ALL_LEVELS];
 }
 
 function emptyState() {

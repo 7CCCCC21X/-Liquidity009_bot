@@ -19,6 +19,12 @@ function envBool(key, fallback) {
   return /^(1|true|yes|on)$/i.test(String(v).trim());
 }
 
+function envCsv(key, fallback) {
+  const v = process.env[key];
+  if (v == null || v === '') return fallback;
+  return String(v).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+}
+
 export const config = {
   telegramBotToken: envStr('TELEGRAM_BOT_TOKEN', ''),
   telegramChatId: envStr('TELEGRAM_CHAT_ID', ''),
@@ -55,6 +61,14 @@ export const config = {
   sizeRelativeEpsilon: envNum('SIZE_RELATIVE_EPSILON', 0.10),
   sizeAbsoluteMin: envNum('SIZE_ABSOLUTE_MIN', 50),
   notifyCooldownMs: envNum('NOTIFY_COOLDOWN_SEC', 60) * 1000,
+
+  // Defaults applied to NEW subscriptions when the user doesn't pick
+  // anything explicitly. Existing subscriptions keep whatever was
+  // previously saved — change these only affects future subscribes.
+  // DEFAULT_LEVELS: comma-separated subset of bid1,bid2,bid3,ask1,ask2,ask3
+  defaultLevels: envCsv('DEFAULT_LEVELS', ['bid1', 'ask1']),
+  // DEFAULT_TRIGGER_MODE: 'both' | 'price' | 'size'
+  defaultTriggerMode: envStr('DEFAULT_TRIGGER_MODE', 'price'),
 
   stateFile: envStr('STATE_FILE', './state.json'),
 

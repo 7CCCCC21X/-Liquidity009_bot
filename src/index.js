@@ -20,19 +20,31 @@ requireConfig();
 // Welcome screen — same message for /start and /help. Keep it short
 // and action-oriented; the long command list is gated behind the
 // "❓ 命令列表" button so the first impression isn't a wall of text.
-const WELCOME = [
-  '👋 <b>Predict.fun 订单簿监控</b>',
-  '',
-  '直接发我下面任意一种，就开始监控：',
-  '① <b>网址</b> — <code>https://predict.fun/...</code>',
-  '② <b>marketId</b>（纯数字）— <code>272779</code>',
-  '③ <b>slug</b> — <code>btc-eom-2026</code>',
-  '',
-  '<b>变动会立即推送</b>，每订阅可独立改档位、加备注、改触发模式。',
-  '',
-  `⏱ 检查 ${config.pollIntervalMs}ms · 冷却 ${Math.round(config.notifyCooldownMs / 1000)}s`,
-  `📐 阈值 价 ≥ ${config.priceEpsilon} · 量 ≥ ${config.sizeAbsoluteMin} 张 / ${(config.sizeRelativeEpsilon * 100).toFixed(0)}%`,
-].join('\n');
+function welcomeText() {
+  const labelMap = { bid1: '买1', bid2: '买2', bid3: '买3', ask1: '卖1', ask2: '卖2', ask3: '卖3' };
+  const levelsHint = (config.defaultLevels?.length ? config.defaultLevels : ['bid1', 'ask1'])
+    .map((l) => labelMap[l] ?? l).join(' / ');
+  const modeHint = ({ both: '价格 + 数量', price: '只看价格', size: '只看数量' })[config.defaultTriggerMode] ?? '价格 + 数量';
+  return [
+    '👋 <b>Predict.fun 订单簿监控</b>',
+    '',
+    '直接发我下面任意一种，就开始监控：',
+    '① <b>网址</b> — <code>https://predict.fun/...</code>',
+    '② <b>marketId</b>（纯数字）— <code>272779</code>',
+    '③ <b>slug</b> — <code>btc-eom-2026</code>',
+    '',
+    `<b>📐 默认监控档位</b>：${levelsHint}（<b>${modeHint}</b>）`,
+    `<i>份额变动默认不推送；想看更多档位或量变，订阅后点 📐 档位 或用 /levels 修改。</i>`,
+    '',
+    `<b>📝 备注</b>：每个订阅可起昵称（如「主仓」「短期套利」）。`,
+    `点订阅卡片上的 📝 备注 或用 <code>/note &lt;id&gt; &lt;文字&gt;</code> 设置；通知和列表里都会显示。`,
+    '',
+    `<b>🔗 标题链接</b>：点订阅卡片或通知里的市场<b>标题</b>就能跳转到 Predict.fun 对应页面。`,
+    '',
+    `⏱ 检查 ${config.pollIntervalMs}ms · 冷却 ${Math.round(config.notifyCooldownMs / 1000)}s`,
+    `📐 价格阈值 ≥ ${config.priceEpsilon} · 量阈值 ≥ ${config.sizeAbsoluteMin} 张 / ${(config.sizeRelativeEpsilon * 100).toFixed(0)}%`,
+  ].join('\n');
+}
 
 // Detailed command list — opened from the "❓ 命令列表" button on the
 // welcome screen. Mirrors what setMyCommands registers but with the
@@ -286,7 +298,7 @@ async function handleCommand(chatId, text) {
   const [cmd, ...args] = text.trim().split(/\s+/);
   const c = cmd.split('@')[0].toLowerCase();
   if (c === '/start' || c === '/help') {
-    await sendMessage(chatId, WELCOME, { replyMarkup: welcomeKeyboard() });
+    await sendMessage(chatId, welcomeText(), { replyMarkup: welcomeKeyboard() });
     return true;
   }
   if (c === '/list') {
