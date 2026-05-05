@@ -215,20 +215,7 @@ async function handleCommand(chatId, text) {
     return true;
   }
   if (c === '/list') {
-    const subs = listSubscriptionsForChat(chatId);
-    if (!subs.length) {
-      await sendMessage(chatId, '当前没有订阅。直接发个 Predict.fun 网址或 marketId 就能开始监控。');
-      return true;
-    }
-    const lines = ['<b>当前订阅</b>'];
-    for (const s of subs) {
-      const levels = s.levels?.length ? s.levels.map((l) => LEVEL_LABEL[l]).join('/') : '（无）';
-      const mode = TRIGGER_LABEL[s.triggerMode] ?? '价+量';
-      const noteLine = s.note ? `\n   📝 ${htmlEscape(s.note)}` : '';
-      lines.push(`• <code>${s.marketId}</code> — ${htmlEscape(s.title || '')}${noteLine}\n   档位：${levels} · 触发：${mode}  /levels_${s.marketId}  /note_${s.marketId}`);
-    }
-    lines.push('', '改档位：/levels &lt;id&gt;\n改备注：/note &lt;id&gt; &lt;文字&gt;（不带文字 = 清除）\n取消单个：/stop &lt;id&gt;\n取消全部：/stopall');
-    await sendMessage(chatId, lines.join('\n'));
+    await renderListView(chatId);
     return true;
   }
   if (c === '/probe' || /^\/probe_\d+$/.test(c)) {
@@ -445,6 +432,42 @@ async function handleMarketIdInput(chatId, marketId) {
 // One-shot orderbook fetch + render. Useful to verify a market is
 // reachable without subscribing, and the latency line doubles as a
 // quick "how slow is this network round trip" gauge.
+// Render each subscription as its own card with the standard 4-button
+// action row, so every sub has a one-tap 停止 right next to it (the
+// previous /list was a single text blob that only showed the
+// /levels_<id> and /note_<id> shortcuts).
+async function renderListView(chatId) {
+  const subs = listSubscriptionsForChat(chatId);
+  if (!subs.length) {
+    await sendMessage(chatId, '当前没有订阅。直接发个 Predict.fun 网址或 marketId 就能开始监控；批量用 /watch。');
+    return;
+  }
+  // Header summary first, then one card per sub. Cap at 50 to avoid
+  // accidentally spamming a chat — anything beyond that the user can
+  // /stopall and re-add the ones they want.
+  const cap = 50;
+  const visible = subs.slice(0, cap);
+  await sendMessage(chatId, [
+    `<b>📋 当前订阅 ${subs.length} 个</b>`,
+    `<i>每张卡片底部按钮可直接操作；批量加 /watch · 全清 /stopall</i>`,
+    subs.length > cap ? `<i>（仅显示前 ${cap} 张；其余请 /stop 后再 /list）</i>` : null,
+  ].filter(Boolean).join('\n'));
+
+  for (const s of visible) {
+    const levels = s.levels?.length
+      ? s.levels.map((l) => LEVEL_LABEL[l]).join('/')
+      : '（无 — 不会推送）';
+    const mode = TRIGGER_LABEL[s.triggerMode] ?? '价+量';
+    const lines = [
+      `🟢 <b>${htmlEscape(s.title || `Market ${s.marketId}`)}</b>`,
+      `<code>id=${s.marketId}</code>`,
+      `档位：${levels} · 触发：${mode}`,
+    ];
+    if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
+    await sendMessage(chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(s.marketId) });
+  }
+}
+
 async function runProbe(chatId, marketId) {
   const sub = getSubscription(chatId, marketId);
   let market;
@@ -473,7 +496,7 @@ async function runProbe(chatId, marketId) {
   const levels = sub?.levels?.length ? sub.levels : ALL_LEVELS;
   const title = sub?.title || market.title || market.question || `Market ${marketId}`;
   const text = [
-    `<b>🔍 Probe</b>  <i>(${latency}ms)</i>`,
+    `<b>🔍 即时抓取</b>  <i>(${latency}ms)</i>`,
     `<b>${htmlEscape(title)}</b>  <code>id=${marketId}</code>`,
     sub?.note ? `📝 <i>${htmlEscape(sub.note)}</i>` : null,
     '',

@@ -18,10 +18,10 @@ const lastNotify = new Map();
 export function subActionKeyboard(marketId) {
   return {
     inline_keyboard: [[
-      { text: '🔍 Probe', callback_data: `probe:${marketId}` },
-      { text: '📐 档位',  callback_data: `lvl:${marketId}:open` },
-      { text: '📝 备注',  callback_data: `note:${marketId}` },
-      { text: '🛑 停止',  callback_data: `unsub:${marketId}` },
+      { text: '🔍 抓取', callback_data: `probe:${marketId}` },
+      { text: '📐 档位', callback_data: `lvl:${marketId}:open` },
+      { text: '📝 备注', callback_data: `note:${marketId}` },
+      { text: '🛑 停止', callback_data: `unsub:${marketId}` },
     ]],
   };
 }
@@ -107,6 +107,11 @@ export function fmtBook(prev, snap, levels) {
   const W_SIZE = 7;
 
   const rows = [];
+  // ASCII-only inside <pre> so columns stay aligned across monospace
+  // fonts (CJK chars render 2-cell-wide on most Telegram clients but
+  // the pad() math counts chars, not display cells). Bid/Ask are
+  // universal trader column anchors; the headline above already
+  // names them in Chinese (买1/卖1). '*' marks watched levels.
   rows.push(`     ${pad('Bid', W_PRICE + W_SIZE + 2)}   ${pad('Ask', W_PRICE + W_SIZE + 2)}`);
   for (let i = 0; i < 3; i++) {
     const bidWatched = set.has(`bid${i + 1}`);
@@ -124,15 +129,16 @@ export function fmtBook(prev, snap, levels) {
   return `<pre>${rows.join('\n')}</pre>`;
 }
 
-// Spread + mid + book-timestamp one-liner shown above the table.
+// 价差 + 中价 + 抓取时间。Times shown in UTC (avoids per-user TZ
+// config); marker dropped from the line to keep it visually quiet.
 export function fmtSpreadLine(snap) {
   const bb = snap.bestBid?.price;
   const ba = snap.bestAsk?.price;
   const time = new Date(snap.updatedAtMs ?? Date.now()).toISOString().slice(11, 19);
-  if (bb == null || ba == null) return `<i>${time} UTC · 缺一边</i>`;
+  if (bb == null || ba == null) return `<i>抓取于 ${time} · 缺一侧深度</i>`;
   const spread = ba - bb;
   const mid = (ba + bb) / 2;
-  return `<i>Spread ${spread.toFixed(4)} · Mid ${mid.toFixed(4)} · ${time} UTC</i>`;
+  return `<i>价差 ${spread.toFixed(4)} · 中价 ${mid.toFixed(4)} · 抓取于 ${time}</i>`;
 }
 
 // Compact change-list: one line per watched level whose change cleared
