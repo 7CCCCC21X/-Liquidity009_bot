@@ -17,6 +17,7 @@
 | 命令 | 说明 |
 | --- | --- |
 | `/start`, `/help` | 用法说明 |
+| `/watch` | **批量订阅** — 弹出 ForceReply 输入框，每行一条 URL/id/slug + 备注 |
 | `/list` | 列出当前聊天的订阅、监控档位、备注 |
 | `/levels <id>` | 调出档位勾选键盘（买1/2/3、卖1/2/3） |
 | `/note <id> <文字>` | 设置备注（不带文字 → 弹输入框；发 `-` 清除） |
@@ -24,6 +25,15 @@
 | `/export` | 把整个 `history.jsonl` 文件发回到聊天里 |
 | `/stop <id>` | 取消单个订阅 |
 | `/stopall` | 取消全部订阅 |
+
+### `/watch` 批量格式
+```
+https://predict.fun/zh-cn/market/foo
+272779 主仓
+spain — 西班牙夺冠
+btc-eom-2026 : 短期套利
+```
+target 后面可加备注，分隔符接受空格 / `-` / `:` / `—`。事件页（多个子市场）会跳过提示，请单独发送以选择。
 
 `/list` 里每张订阅尾部都有 `/levels_<id>`、`/note_<id>`、`/stop_<id>` 一键链接，不用复制 id。
 
@@ -81,16 +91,31 @@ npm run diagnose -- https://predict.fun/zh-cn/market/fifa-world-cup-group-e-winn
   在聊天里 `/export` 直接拿到完整文件，或本地 `tail -f /data/history.jsonl | jq` 实时观察。
 - `npm run prune-history` 强制压缩（保留最近 `HISTORY_KEEP_DAYS` 天）。
 
-## 调参
-所有阈值都是 env 变量，不用改代码：
-- `POLL_INTERVAL_MS`：轮询间隔，默认 30 000
-- `PRICE_EPSILON`：价格变动阈值，默认 0.005（即 0.5¢）
-- `SIZE_RELATIVE_EPSILON`：相对量变阈值，默认 0.10
-- `SIZE_ABSOLUTE_MIN`：绝对量变阈值，默认 50 张
-- `NOTIFY_COOLDOWN_SEC`：单 chat × market 的最短通知间隔，默认 60s
-- `HISTORY_ENABLED`：是否记录历史，默认 `true`
-- `HISTORY_FILE`：历史文件路径，默认 `./history.jsonl`（Railway 应设 `/data/history.jsonl`）
-- `HISTORY_KEEP_DAYS`：自动 prune 阈值（天），默认 14；设 0 关闭自动 prune
+## 调参（频率 + 阈值）
+所有都是 env 变量，不用改代码。**频率两要素**：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `POLL_INTERVAL_MS` | `30000` | 多久抓一次订单簿（每个市场） |
+| `NOTIFY_COOLDOWN_SEC` | `60` | 单订阅最少多久通知一次（防刷屏） |
+
+实际通知间隔 ≥ max(`POLL_INTERVAL_MS`, `NOTIFY_COOLDOWN_SEC × 1000`)。比如默认配置下，最快也要 60 秒一条；调成 `POLL_INTERVAL_MS=10000` + `NOTIFY_COOLDOWN_SEC=10` 就是最快 10 秒一条。
+
+**变动阈值**（任意一项触发就算变动）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PRICE_EPSILON` | `0.005` | 价格变动 ≥ 0.5¢ |
+| `SIZE_RELATIVE_EPSILON` | `0.10` | 量变 ≥ 10% |
+| `SIZE_ABSOLUTE_MIN` | `50` | 量变 ≥ 50 张 |
+
+**历史记录**：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `HISTORY_ENABLED` | `true` | 是否记录变动到 JSONL |
+| `HISTORY_FILE` | `./history.jsonl` | Railway 推荐 `/data/history.jsonl` |
+| `HISTORY_KEEP_DAYS` | `14` | 自动 prune 阈值（天）；0 关闭 |
 
 ## 项目结构
 ```

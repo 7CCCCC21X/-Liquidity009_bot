@@ -20,6 +20,26 @@ function fmtSide(side) {
   return `${price} × ${size}`;
 }
 
+// Compact inline delta marker. Returns '' when no meaningful change so
+// the renderer can omit the trailing italics block entirely. Direction
+// arrows: ↑ for increase, ↓ for decrease.
+function fmtInlineDelta(prev, cur) {
+  if (!prev && !cur) return '';
+  if (!prev && cur) return ' <i>(新)</i>';
+  if (prev && !cur) return ' <i>(撤)</i>';
+  const dp = cur.price - prev.price;
+  const ds = cur.size - prev.size;
+  const parts = [];
+  if (Math.abs(dp) >= 1e-9) {
+    parts.push(`${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`);
+  }
+  if (Math.abs(ds) >= 1) {
+    const fmt = Math.abs(ds).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    parts.push(`${ds > 0 ? '↑' : '↓'}${fmt}`);
+  }
+  return parts.length ? ` <i>${parts.join(' ')}</i>` : '';
+}
+
 function getLevel(snap, key) {
   if (!snap) return null;
   const idx = Number(key.slice(3)) - 1;
@@ -46,46 +66,59 @@ function bookChanged(prev, cur, levels) {
   return false;
 }
 
-function fmtChange(prev, cur, levels) {
-  if (!prev) return '初次抓取';
-  const out = [];
+// Render the book with deltas inline next to each level. Watched levels
+// get the 👁 marker. Unwatched levels are still shown for context but
+// without an eye and without a delta annotation (to keep them quiet).
+function fmtBook(prev, snap, levels) {
+  const set = new Set(levels);
+  const lines = [];
+  lines.push('<b>买单 (Bids)</b>');
+  for (let i = 0; i < 3; i++) {
+    const k = `bid${i + 1}`;
+    const watched = set.has(k);
+    const cur = snap.bids?.[i];
+    const p = prev?.bids?.[i];
+    const mark = watched ? '👁' : ' ·';
+    const delta = watched ? fmtInlineDelta(p, cur) : '';
+    lines.push(`  ${mark} L${i + 1}: ${fmtSide(cur)}${delta}`);
+  }
+  lines.push('<b>卖单 (Asks)</b>');
+  for (let i = 0; i < 3; i++) {
+    const k = `ask${i + 1}`;
+    const watched = set.has(k);
+    const cur = snap.asks?.[i];
+    const p = prev?.asks?.[i];
+    const mark = watched ? '👁' : ' ·';
+    const delta = watched ? fmtInlineDelta(p, cur) : '';
+    lines.push(`  ${mark} L${i + 1}: ${fmtSide(cur)}${delta}`);
+  }
+  return lines.join('\n');
+}
+
+// Single-line headline summarising what kind of change triggered the
+// alert. Kept short — the per-level deltas in fmtBook carry the details.
+function fmtHeadline(prev, cur, levels) {
+  if (!prev) return '🆕 初次抓取';
+  let nChanges = 0;
+  let biggestPrice = 0;
+  let biggestSize = 0;
   for (const k of levels) {
     const p = getLevel(prev, k);
     const c = getLevel(cur, k);
     if (!levelDiff(p, c)) continue;
-    const label = LEVEL_LABEL[k] ?? k;
-    if (!p && c) {
-      out.push(`${label} 新增 ${c.price.toFixed(4)}×${c.size.toFixed(0)}`);
-    } else if (p && !c) {
-      out.push(`${label} 撤销`);
-    } else {
-      const dp = c.price - p.price;
-      const ds = c.size - p.size;
-      const parts = [];
-      if (Math.abs(dp) >= 1e-9) parts.push(`价 ${dp >= 0 ? '+' : ''}${dp.toFixed(4)}`);
-      if (ds !== 0) parts.push(`量 ${ds > 0 ? '+' : ''}${ds.toFixed(0)}`);
-      out.push(`${label} ${parts.join(' / ')}`);
+    nChanges += 1;
+    if (p && c) {
+      const dp = Math.abs(c.price - p.price);
+      const ds = Math.abs(c.size - p.size);
+      if (dp > biggestPrice) biggestPrice = dp;
+      if (ds > biggestSize) biggestSize = ds;
     }
   }
-  return out.join('；') || '深度变动';
-}
-
-function fmtBook(snap, levels) {
-  const set = new Set(levels);
-  const lines = [];
-  lines.push('<b>买单（Bids）</b>');
-  for (let i = 0; i < 3; i++) {
-    const k = `bid${i + 1}`;
-    const mark = set.has(k) ? '👁' : ' ';
-    lines.push(`  ${mark} L${i + 1}: ${fmtSide(snap.bids?.[i])}`);
-  }
-  lines.push('<b>卖单（Asks）</b>');
-  for (let i = 0; i < 3; i++) {
-    const k = `ask${i + 1}`;
-    const mark = set.has(k) ? '👁' : ' ';
-    lines.push(`  ${mark} L${i + 1}: ${fmtSide(snap.asks?.[i])}`);
-  }
-  return lines.join('\n');
+  if (!nChanges) return '深度变动';
+  const parts = [`${nChanges} 档变动`];
+  if (biggestPrice >= 0.0001) parts.push(`最大价 Δ${biggestPrice.toFixed(4)}`);
+  if (biggestSize >= 1) parts.push(`最大量 Δ${Math.round(biggestSize).toLocaleString('en-US')}`);
+  return '📈 ' + parts.join(' · ');
 }
 
 async function pollOnce() {
@@ -127,15 +160,13 @@ async function pollOnce() {
       if (!bookChanged(prev, snap, levels)) continue;
       const lastSentAt = lastNotify.get(k) ?? 0;
       if (prev && now - lastSentAt < config.notifyCooldownMs) continue;
-      const summary = fmtChange(prev, snap, levels);
-      const body = fmtBook(snap, levels);
+      const headline = fmtHeadline(prev, snap, levels);
+      const body = fmtBook(prev, snap, levels);
       const titleLine = htmlEscape(s.title || `Market ${s.marketId}`);
-      const watching = levels.map((l) => LEVEL_LABEL[l]).join('/');
       const lines = [`<b>📊 ${titleLine}</b>`];
       if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
       lines.push(
-        `<i>监控档位：${watching}</i>`,
-        `<i>${htmlEscape(summary)}</i>`,
+        `<i>${htmlEscape(headline)}</i>`,
         '',
         body,
         '',
@@ -155,7 +186,7 @@ async function pollOnce() {
           title: s.title || null,
           note: s.note || null,
           levels,
-          summary,
+          summary: headline,
           prev: prev ? { bestBid: prev.bestBid, bestAsk: prev.bestAsk } : null,
           cur: { bestBid: snap.bestBid, bestAsk: snap.bestAsk, bids: snap.bids, asks: snap.asks },
           updatedAtMs: snap.updatedAtMs,

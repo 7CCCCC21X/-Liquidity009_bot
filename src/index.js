@@ -7,6 +7,7 @@ import {
   getSubscription, updateSubscriptionLevels, updateSubscriptionNote,
   putPendingChoice, takePendingChoice, gcPendingChoices,
   putPendingNote, takePendingNote, gcPendingNotes,
+  putPendingWatch, takePendingWatch, gcPendingWatch,
   ALL_LEVELS, LEVEL_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById } from './predict.js';
@@ -17,21 +18,26 @@ requireConfig();
 const HELP = [
   '👋 <b>Predict.fun 订单簿监控机器人</b>',
   '',
-  '三种方式订阅：',
-  '① 直接发 Predict.fun <b>网址</b>（事件页/市场页都行）',
-  '② 直接发 <b>marketId</b>（纯数字，如 <code>257916</code>）',
-  '③ 直接发 <b>slug</b>（如 <code>btc-eom-2026</code>）',
+  '<b>三种订阅方式</b>',
+  '① 直接发 Predict.fun <b>网址</b>',
+  '② 直接发 <b>marketId</b>（纯数字）',
+  '③ 直接发 <b>slug</b>',
+  '或用 /watch 一次性订阅多个。',
   '',
-  '订阅后只要你关注的档位（买1/2/3、卖1/2/3）发生变化就会推送给你。还可以给每张订阅加备注，列表和通知里都会显示。',
+  '订阅后你关注的档位（买1/2/3、卖1/2/3）发生变化就会推送，每张可加备注。',
+  '',
+  `⏱ <b>检查间隔</b> ${Math.round(config.pollIntervalMs / 1000)}s · 单订阅最少 ${Math.round(config.notifyCooldownMs / 1000)}s 通知一次`,
+  `📐 <b>触发阈值</b> 价 ≥ ${config.priceEpsilon} · 量 ≥ ${config.sizeAbsoluteMin} 张或 ${(config.sizeRelativeEpsilon * 100).toFixed(0)}%`,
   '',
   '<b>命令</b>',
   '/start, /help — 显示此帮助',
-  '/list — 当前订阅的市场',
-  '/levels &lt;marketId&gt; — 自定义监控档位',
-  '/note &lt;marketId&gt; [备注] — 设置备注（不带文字 = 清除）',
-  '/history &lt;marketId&gt; [N] — 查看历史变动记录（默认最近 10 条）',
-  '/export — 把整个 history.jsonl 文件发回给你',
-  '/stop &lt;marketId&gt; — 取消订阅',
+  '/watch — 批量订阅（回复消息粘贴多行）',
+  '/list — 当前订阅',
+  '/levels &lt;id&gt; — 自定义监控档位',
+  '/note &lt;id&gt; [备注] — 设置备注（不带文字 = 清除）',
+  '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
+  '/export — 把整个 history.jsonl 发回给你',
+  '/stop &lt;id&gt; — 取消订阅',
   '/stopall — 取消全部订阅',
 ].join('\n');
 
@@ -215,6 +221,16 @@ async function handleCommand(chatId, text) {
     await sendMessage(chatId, lines.join('\n'));
     return true;
   }
+  if (c === '/watch') {
+    if (args.length) {
+      // Inline mode: process the args as a single line — useful for
+      // /watch 272779 主仓 from the keyboard.
+      await applyBulkWatchInput(chatId, args.join(' '));
+      return true;
+    }
+    await promptBulkWatch(chatId);
+    return true;
+  }
   if (c === '/note' || /^\/note_\d+$/.test(c)) {
     let id = args[0];
     let noteArgs = args.slice(1);
@@ -334,13 +350,18 @@ async function handleMessage(msg) {
   const text = (msg.text ?? '').trim();
   if (!chatId || !text) return;
 
-  // Reply-to-prompt path: if the user is replying to one of our note
-  // prompts, treat the entire body as the note text.
+  // Reply-to-prompt path: if the user is replying to one of our
+  // ForceReply prompts (note or watch), route the message to the
+  // matching handler instead of treating it as a fresh subscription.
   const replyTo = msg.reply_to_message?.message_id;
   if (replyTo) {
     const marketId = takePendingNote(chatId, replyTo);
     if (marketId) {
       await applyNoteInput(chatId, marketId, text);
+      return;
+    }
+    if (takePendingWatch(chatId, replyTo)) {
+      await applyBulkWatchInput(chatId, text);
       return;
     }
   }
@@ -393,6 +414,104 @@ async function handleMarketIdInput(chatId, marketId) {
   });
   await saveState();
   await sendSubscribed(chatId, m, { existingNote: existing?.note });
+}
+
+async function promptBulkWatch(chatId) {
+  const text = [
+    '👁 <b>批量订阅市场</b>',
+    '',
+    '回复此条消息，每行一个 URL / marketId / slug，',
+    '可在后面加备注（用空格、<code>-</code> 或 <code>:</code> 分隔）。',
+    '',
+    '<b>📋 格式示例</b>',
+    '<code>https://predict.fun/zh-cn/market/foo</code>',
+    '<code>272779 主仓</code>',
+    '<code>spain — 西班牙夺冠</code>',
+    '<code>btc-eom-2026 : 短期套利</code>',
+    '',
+    '<i>每行处理一条；URL 是事件页时会跳过提示（请单独发送以选择子市场）。30 分钟内有效。</i>',
+  ].join('\n');
+  const sent = await sendMessage(chatId, text, {
+    replyMarkup: { force_reply: true, selective: true, input_field_placeholder: 'URL/id/slug 备注' },
+  });
+  putPendingWatch(chatId, sent.message_id);
+  await saveState();
+}
+
+// Split a /watch line into target + optional note. Separator after
+// target can be whitespace, dash, em-dash, hyphen, colon, fullwidth
+// colon, or any combination.
+function parseWatchLine(line) {
+  const ws = line.search(/\s/);
+  if (ws < 0) return { target: line, note: null };
+  const target = line.slice(0, ws);
+  let note = line.slice(ws).trim();
+  note = note.replace(/^[-—–:：]\s*/, '').trim();
+  return { target, note: note || null };
+}
+
+async function applyBulkWatchInput(chatId, raw) {
+  const lines = raw.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) {
+    await sendMessage(chatId, '没有内容。回复 /watch 弹出的消息，每行写一条。');
+    return;
+  }
+  const results = [];
+  for (const line of lines) {
+    const { target, note } = parseWatchLine(line);
+    const noteSuffix = note ? `  📝 ${htmlEscape(note)}` : '';
+    // 1) Pure numeric → marketId direct lookup.
+    const id = extractMarketId(target);
+    if (id) {
+      try {
+        const market = await getMarketById(id);
+        if (!market) { results.push(`✗ <code>${htmlEscape(id)}</code> 市场不存在`); continue; }
+        addSubscription({
+          chatId,
+          marketId: id,
+          conditionId: market.conditionId ?? null,
+          title: market.title || market.question || `Market ${id}`,
+          slug: null,
+          note,
+        });
+        results.push(`✓ <code>${id}</code> ${htmlEscape((market.title ?? '').slice(0, 50))}${noteSuffix}`);
+      } catch (err) {
+        results.push(`✗ <code>${htmlEscape(id)}</code> ${htmlEscape(err.message).slice(0, 60)}`);
+      }
+      continue;
+    }
+    // 2) URL / slug — use the same resolver the single-message path uses.
+    try {
+      const r = await resolveUrlToMarkets(target);
+      if (!r.markets.length) {
+        results.push(`✗ <code>${htmlEscape(target).slice(0, 50)}</code> 找不到`);
+        continue;
+      }
+      if (r.markets.length === 1) {
+        const m = r.markets[0];
+        addSubscription({
+          chatId,
+          marketId: m.id,
+          conditionId: m.conditionId,
+          title: m.title || m.question || `Market ${m.id}`,
+          slug: m.slug,
+          note,
+        });
+        results.push(`✓ <code>${m.id}</code> ${htmlEscape((m.title ?? '').slice(0, 50))}${noteSuffix}`);
+      } else {
+        results.push(`⚠ <code>${htmlEscape(target).slice(0, 40)}</code> 是事件页（${r.markets.length} 个子市场，请单独发送以选择）`);
+      }
+    } catch (err) {
+      results.push(`✗ <code>${htmlEscape(target).slice(0, 40)}</code> ${htmlEscape(err.message).slice(0, 60)}`);
+    }
+  }
+  await saveState();
+  const ok = results.filter((r) => r.startsWith('✓')).length;
+  await sendMessage(chatId, [
+    `<b>📥 批量订阅完成</b>  ✓${ok} / ${results.length}`,
+    '',
+    ...results,
+  ].join('\n'));
 }
 
 async function applyNoteInput(chatId, marketId, raw) {
@@ -571,6 +690,7 @@ async function pollUpdates(signal) {
     }
     gcPendingChoices();
     gcPendingNotes();
+    gcPendingWatch();
   }
 }
 
@@ -581,6 +701,7 @@ async function main() {
   await setMyCommands([
     { command: 'start', description: '欢迎信息和用法' },
     { command: 'help', description: '帮助' },
+    { command: 'watch', description: '批量订阅（粘贴多行 URL/id/slug）' },
     { command: 'list', description: '当前订阅' },
     { command: 'levels', description: '自定义监控档位（买1/2/3、卖1/2/3）' },
     { command: 'note', description: '设置/清除订阅备注' },

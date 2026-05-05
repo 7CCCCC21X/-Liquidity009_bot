@@ -6,6 +6,7 @@ import { config } from './config.js';
 //   subs: { "<chatId>:<marketId>": { chatId, marketId, conditionId, title, slug, levels, note, addedAt } },
 //   pendingChoices: { "<chatId>:<token>": { matches: [...], expiresAt } },
 //   pendingNotes:   { "<chatId>:<promptMessageId>": { marketId, expiresAt } },
+//   pendingWatch:   { "<chatId>:<promptMessageId>": { expiresAt } },
 //   telegramOffset: number
 // }
 // levels: array picked from ALL_LEVELS — empty array means "watch nothing"
@@ -25,7 +26,7 @@ export function normalizeLevels(levels) {
 }
 
 function emptyState() {
-  return { subs: {}, pendingChoices: {}, pendingNotes: {}, telegramOffset: 0 };
+  return { subs: {}, pendingChoices: {}, pendingNotes: {}, pendingWatch: {}, telegramOffset: 0 };
 }
 
 let _state = null;
@@ -40,6 +41,7 @@ export async function loadState() {
     if (!_state.subs) _state.subs = {};
     if (!_state.pendingChoices) _state.pendingChoices = {};
     if (!_state.pendingNotes) _state.pendingNotes = {};
+    if (!_state.pendingWatch) _state.pendingWatch = {};
   } catch (err) {
     if (err.code !== 'ENOENT') console.warn(new Date().toISOString(), '[state] load failed:', err.message);
     _state = emptyState();
@@ -170,5 +172,29 @@ export function gcPendingNotes() {
   const now = Date.now();
   for (const [k, v] of Object.entries(_state.pendingNotes)) {
     if (!v?.expiresAt || v.expiresAt < now) delete _state.pendingNotes[k];
+  }
+}
+
+// /watch ForceReply prompts. Same pattern as pendingNotes — keyed by
+// the bot's prompt-message id, gc'd every poll loop.
+const WATCH_TTL_MS = 30 * 60 * 1000;
+
+export function putPendingWatch(chatId, promptMessageId) {
+  const k = `${chatId}:${promptMessageId}`;
+  _state.pendingWatch[k] = { expiresAt: Date.now() + WATCH_TTL_MS };
+}
+
+export function takePendingWatch(chatId, promptMessageId) {
+  const k = `${chatId}:${promptMessageId}`;
+  const entry = _state.pendingWatch[k];
+  if (!entry) return false;
+  delete _state.pendingWatch[k];
+  return entry.expiresAt >= Date.now();
+}
+
+export function gcPendingWatch() {
+  const now = Date.now();
+  for (const [k, v] of Object.entries(_state.pendingWatch)) {
+    if (!v?.expiresAt || v.expiresAt < now) delete _state.pendingWatch[k];
   }
 }
