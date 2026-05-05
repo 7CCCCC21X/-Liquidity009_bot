@@ -17,33 +17,60 @@ import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
 
-const HELP = [
-  '👋 <b>Predict.fun 订单簿监控机器人</b>',
+// Welcome screen — same message for /start and /help. Keep it short
+// and action-oriented; the long command list is gated behind the
+// "❓ 命令列表" button so the first impression isn't a wall of text.
+const WELCOME = [
+  '👋 <b>Predict.fun 订单簿监控</b>',
   '',
-  '<b>三种订阅方式</b>',
-  '① 直接发 Predict.fun <b>网址</b>',
-  '② 直接发 <b>marketId</b>（纯数字）',
-  '③ 直接发 <b>slug</b>',
-  '或用 /watch 一次性订阅多个。',
+  '直接发我下面任意一种，就开始监控：',
+  '① <b>网址</b> — <code>https://predict.fun/...</code>',
+  '② <b>marketId</b>（纯数字）— <code>272779</code>',
+  '③ <b>slug</b> — <code>btc-eom-2026</code>',
   '',
-  '订阅后你关注的档位（买1/2/3、卖1/2/3）发生变化就会推送，每张可加备注。',
+  '<b>变动会立即推送</b>，每订阅可独立改档位、加备注、改触发模式。',
   '',
-  `⏱ <b>检查间隔</b> ${config.pollIntervalMs}ms · 下限 ${config.pollMinIntervalMs}ms · 并发 ${config.pollConcurrency} · 冷却 ${Math.round(config.notifyCooldownMs / 1000)}s`,
-  `📐 <b>触发阈值</b> 价 ≥ ${config.priceEpsilon} · 量 ≥ ${config.sizeAbsoluteMin} 张或 ${(config.sizeRelativeEpsilon * 100).toFixed(0)}%`,
+  `⏱ 检查 ${config.pollIntervalMs}ms · 冷却 ${Math.round(config.notifyCooldownMs / 1000)}s`,
+  `📐 阈值 价 ≥ ${config.priceEpsilon} · 量 ≥ ${config.sizeAbsoluteMin} 张 / ${(config.sizeRelativeEpsilon * 100).toFixed(0)}%`,
+].join('\n');
+
+// Detailed command list — opened from the "❓ 命令列表" button on the
+// welcome screen. Mirrors what setMyCommands registers but with the
+// extra one-liner explanations.
+const HELP_DETAIL = [
+  '<b>📜 全部命令</b>',
   '',
-  '<b>命令</b>',
-  '/start, /help — 显示此帮助',
-  '/watch — 批量订阅（回复消息粘贴多行）',
-  '/list — 当前订阅',
-  '/levels &lt;id&gt; — 自定义监控档位',
+  '/start, /help — 欢迎页（开始监控按钮）',
+  '/watch — 批量订阅（回复消息粘贴多行 URL/id/slug）',
+  '/list — 我的订阅（分页 + 操作按钮）',
+  '/levels &lt;id&gt; — 自定义档位 + 触发模式（价+量 / 只看价 / 只看量）',
   '/note &lt;id&gt; [备注] — 设置备注（不带文字 = 清除）',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
   '/export — 把整个 history.jsonl 发回给你',
   '/probe &lt;id&gt; — 立即抓一次订单簿（不等下次轮询）',
   '/speedtest [N] — 测延迟（默认 5 次），给出推荐的最快 POLL_INTERVAL_MS',
-  '/stop &lt;id&gt; — 取消订阅',
-  '/stopall — 取消全部订阅',
+  '/stop &lt;id&gt; — 取消订阅（弹确认）',
+  '/stopall — 取消全部订阅（弹确认）',
+  '',
+  '<b>📐 通知里的标记</b>',
+  '👁 = 监控中的档位 · ↑/↓ = 价格或量的变化方向',
+  '* = 当前订单簿表格里被监控的档位',
+  '',
+  '<b>🔗 标题链接</b>',
+  '点订阅卡片或通知里的<b>市场标题</b>就能跳转到 Predict.fun 对应页面。',
 ].join('\n');
+
+function welcomeKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '👁 开始监控', callback_data: 'home:watch' },
+        { text: '📋 我的订阅', callback_data: 'home:list' },
+      ],
+      [{ text: '❓ 命令列表', callback_data: 'home:help' }],
+    ],
+  };
+}
 
 function buildLevelsKeyboard(marketId, levels, triggerMode) {
   const set = new Set(levels);
@@ -259,7 +286,7 @@ async function handleCommand(chatId, text) {
   const [cmd, ...args] = text.trim().split(/\s+/);
   const c = cmd.split('@')[0].toLowerCase();
   if (c === '/start' || c === '/help') {
-    await sendMessage(chatId, HELP);
+    await sendMessage(chatId, WELCOME, { replyMarkup: welcomeKeyboard() });
     return true;
   }
   if (c === '/list') {
@@ -964,6 +991,24 @@ async function handleCallback(cb) {
         await editMessageText(chatId, messageId, lines.join('\n'), subActionKeyboard(sub.marketId));
       } catch { /* ignore */ }
     }
+    return;
+  }
+
+  // Welcome-screen entry buttons (also reachable via the
+  // pagination footer's 👁 批量加 shortcut for the watch flow).
+  if (data === 'home:watch') {
+    await answerCallbackQuery(cb.id);
+    await promptBulkWatch(chatId);
+    return;
+  }
+  if (data === 'home:list') {
+    await answerCallbackQuery(cb.id);
+    await renderListView(chatId);
+    return;
+  }
+  if (data === 'home:help') {
+    await answerCallbackQuery(cb.id);
+    await sendMessage(chatId, HELP_DETAIL);
     return;
   }
 
