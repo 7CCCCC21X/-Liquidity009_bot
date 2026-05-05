@@ -13,7 +13,7 @@ import { appendEvent } from './history.js';
 const lastBookPerSub = new Map();
 const lastNotify = new Map();
 
-function fmtSide(side) {
+export function fmtSide(side) {
   if (!side) return '<i>无</i>';
   const price = side.price.toFixed(4);
   const size = side.size.toLocaleString('en-US', { maximumFractionDigits: 0 });
@@ -69,7 +69,7 @@ function bookChanged(prev, cur, levels) {
 // Render the book with deltas inline next to each level. Watched levels
 // get the 👁 marker. Unwatched levels are still shown for context but
 // without an eye and without a delta annotation (to keep them quiet).
-function fmtBook(prev, snap, levels) {
+export function fmtBook(prev, snap, levels) {
   const set = new Set(levels);
   const lines = [];
   lines.push('<b>买单 (Bids)</b>');
@@ -170,7 +170,7 @@ async function pollOnce() {
         '',
         body,
         '',
-        `<code>id=${s.marketId}</code> · /levels_${s.marketId} · /note_${s.marketId} · /stop_${s.marketId}`,
+        `<code>id=${s.marketId}</code> · /probe_${s.marketId} · /levels_${s.marketId} · /note_${s.marketId} · /stop_${s.marketId}`,
       );
       const text = lines.join('\n');
       try {

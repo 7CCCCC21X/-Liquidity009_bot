@@ -10,7 +10,8 @@ import {
   putPendingWatch, takePendingWatch, gcPendingWatch,
   ALL_LEVELS, LEVEL_LABEL,
 } from './state.js';
-import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById } from './predict.js';
+import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
+import { fmtBook } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -37,6 +38,8 @@ const HELP = [
   '/note &lt;id&gt; [备注] — 设置备注（不带文字 = 清除）',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
   '/export — 把整个 history.jsonl 发回给你',
+  '/probe &lt;id&gt; — 立即抓一次订单簿（不等下次轮询）',
+  '/speedtest [N] — 测延迟（默认 5 次），给出推荐的最快 POLL_INTERVAL_MS',
   '/stop &lt;id&gt; — 取消订阅',
   '/stopall — 取消全部订阅',
 ].join('\n');
@@ -219,6 +222,22 @@ async function handleCommand(chatId, text) {
     }
     lines.push('', '改档位：/levels &lt;id&gt;\n改备注：/note &lt;id&gt; &lt;文字&gt;（不带文字 = 清除）\n取消单个：/stop &lt;id&gt;\n取消全部：/stopall');
     await sendMessage(chatId, lines.join('\n'));
+    return true;
+  }
+  if (c === '/probe' || /^\/probe_\d+$/.test(c)) {
+    let id = args[0];
+    if (!id && /^\/probe_\d+$/.test(c)) id = c.slice('/probe_'.length);
+    if (!id) {
+      await sendMessage(chatId, '用法：/probe &lt;marketId&gt;\n立即抓一次订单簿（不等下次轮询）。');
+      return true;
+    }
+    await runProbe(chatId, id);
+    return true;
+  }
+  if (c === '/speedtest') {
+    const n = Math.max(2, Math.min(20, Number(args[0]) || 5));
+    const explicitId = args[1];
+    await runSpeedtest(chatId, n, explicitId);
     return true;
   }
   if (c === '/watch') {
@@ -414,6 +433,129 @@ async function handleMarketIdInput(chatId, marketId) {
   });
   await saveState();
   await sendSubscribed(chatId, m, { existingNote: existing?.note });
+}
+
+// One-shot orderbook fetch + render. Useful to verify a market is
+// reachable without subscribing, and the latency line doubles as a
+// quick "how slow is this network round trip" gauge.
+async function runProbe(chatId, marketId) {
+  const sub = getSubscription(chatId, marketId);
+  let market;
+  try {
+    market = await getMarketById(marketId);
+  } catch (err) {
+    await sendMessage(chatId, `❌ getMarketById 失败: ${htmlEscape(err.message)}`);
+    return;
+  }
+  if (!market && sub?.conditionId) {
+    market = { id: marketId, conditionId: sub.conditionId };
+  }
+  if (!market) {
+    await sendMessage(chatId, `❌ 找不到市场 <code>${htmlEscape(marketId)}</code>`);
+    return;
+  }
+  const t0 = Date.now();
+  let snap;
+  try {
+    snap = await getOrderbook(market);
+  } catch (err) {
+    await sendMessage(chatId, `❌ getOrderbook 失败: ${htmlEscape(err.message)}`);
+    return;
+  }
+  const latency = Date.now() - t0;
+  const levels = sub?.levels?.length ? sub.levels : ALL_LEVELS;
+  const title = sub?.title || market.title || market.question || `Market ${marketId}`;
+  const text = [
+    `<b>🔍 Probe</b>  <i>(${latency}ms)</i>`,
+    `<b>${htmlEscape(title)}</b>  <code>id=${marketId}</code>`,
+    sub?.note ? `📝 <i>${htmlEscape(sub.note)}</i>` : null,
+    '',
+    fmtBook(null, snap, levels),
+    '',
+    `<i>更新时间戳: ${new Date(snap.updatedAtMs).toISOString().slice(11, 19)}</i>`,
+  ].filter(Boolean).join('\n');
+  await sendMessage(chatId, text);
+}
+
+// Speed test: hammer one orderbook endpoint N times back-to-back and
+// report the latency distribution. Tells the user the floor for
+// POLL_INTERVAL_MS without trial-and-erroring it on Railway.
+async function runSpeedtest(chatId, n, explicitId) {
+  let target;
+  if (explicitId) {
+    const sub = getSubscription(chatId, explicitId);
+    if (sub?.conditionId) {
+      target = { id: explicitId, conditionId: sub.conditionId, title: sub.title };
+    } else {
+      try {
+        const m = await getMarketById(explicitId);
+        if (m) target = { id: explicitId, conditionId: m.conditionId, title: m.title };
+      } catch { /* ignore */ }
+    }
+    if (!target) {
+      await sendMessage(chatId, `❌ 找不到市场 <code>${htmlEscape(explicitId)}</code>`);
+      return;
+    }
+  } else {
+    const subs = listSubscriptionsForChat(chatId);
+    if (!subs.length) {
+      await sendMessage(chatId, '需要至少一个订阅来测速。先订阅个市场，或 <code>/speedtest 5 &lt;marketId&gt;</code> 直接指定。');
+      return;
+    }
+    const sub = subs[0];
+    target = { id: sub.marketId, conditionId: sub.conditionId, title: sub.title };
+    if (!target.conditionId) {
+      try {
+        const m = await getMarketById(sub.marketId);
+        if (m?.conditionId) target.conditionId = m.conditionId;
+      } catch { /* ignore */ }
+    }
+  }
+  if (!target.conditionId) {
+    await sendMessage(chatId, '❌ 该市场缺 conditionId，无法直接测速。');
+    return;
+  }
+
+  await sendMessage(chatId, `⏱ 速度测试 <b>${htmlEscape(target.title || target.id)}</b> · ${n} 次 …`);
+
+  const market = { id: target.id, conditionId: target.conditionId };
+  const times = [];
+  let okCount = 0;
+  for (let i = 0; i < n; i++) {
+    const t0 = Date.now();
+    try {
+      await getOrderbook(market);
+      times.push(Date.now() - t0);
+      okCount += 1;
+    } catch (err) {
+      times.push(-Math.abs(Date.now() - t0));
+    }
+  }
+  const valid = times.filter((t) => t > 0).slice().sort((a, b) => a - b);
+  if (!valid.length) {
+    await sendMessage(chatId, `❌ ${n} 次全部失败`);
+    return;
+  }
+  const avg = valid.reduce((a, b) => a + b, 0) / valid.length;
+  const median = valid[Math.floor(valid.length / 2)];
+  const min = valid[0];
+  const max = valid[valid.length - 1];
+  const p95 = valid[Math.min(valid.length - 1, Math.floor(valid.length * 0.95))];
+  // Recommend POLL_INTERVAL_MS = max(p95 + 50% buffer, 1000).
+  const recommendMs = Math.max(1000, Math.ceil((p95 * 1.5) / 100) * 100);
+  const fmt = (t) => t < 0 ? `<s>${-t}ms✗</s>` : `${t}ms`;
+  await sendMessage(chatId, [
+    `⏱ <b>速度测试结果</b>`,
+    `市场: ${htmlEscape(target.title || target.id)}  <code>id=${target.id}</code>`,
+    '',
+    `成功: <b>${okCount}/${n}</b>`,
+    `延迟: 最快 <b>${min}ms</b> · 中位 <b>${median}ms</b> · 平均 <b>${avg.toFixed(0)}ms</b> · p95 <b>${p95}ms</b> · 最慢 <b>${max}ms</b>`,
+    '',
+    `每次: ${times.map(fmt).join(' · ')}`,
+    '',
+    `<i>💡 推荐 <code>POLL_INTERVAL_MS</code> ≥ <b>${recommendMs}</b>（p95 × 1.5 留缓冲）</i>`,
+    `<i>当前: ${config.pollIntervalMs}ms · 单订阅冷却 ${config.notifyCooldownMs / 1000}s</i>`,
+  ].join('\n'));
 }
 
 async function promptBulkWatch(chatId) {
@@ -707,6 +849,8 @@ async function main() {
     { command: 'note', description: '设置/清除订阅备注' },
     { command: 'history', description: '查看市场最近 N 条变动记录' },
     { command: 'export', description: '导出完整 history.jsonl' },
+    { command: 'probe', description: '立即抓一次订单簿（不等下次轮询）' },
+    { command: 'speedtest', description: '测试抓取延迟，给出推荐的最快轮询间隔' },
     { command: 'stop', description: '取消单个订阅' },
     { command: 'stopall', description: '取消全部订阅' },
   ]).catch((e) => console.warn('[bot] setMyCommands failed:', e.message));
