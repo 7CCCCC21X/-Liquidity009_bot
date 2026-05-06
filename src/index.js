@@ -12,7 +12,7 @@ import {
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -110,7 +110,7 @@ function fmtRelativeRemaining(untilMs) {
 // what the JSONL records (we save the full top-3 for cur, but prev is
 // just bestBid/bestAsk to keep entries small).
 function fmtHistoryEntry(e) {
-  const t = new Date(e.ts).toISOString().slice(11, 19);
+  const t = fmtClockTime(e.ts);
   const head = `<code>${t}</code>`;
   if (!e.prev) {
     const bb = e.cur?.bestBid;
@@ -244,8 +244,11 @@ async function sendSubscribed(chatId, m, { wasExisting = false, askForNote = tru
     lines.push(fmtSpreadLine(snap));
     lines.push('');
     lines.push(fmtBook(null, snap, levels));
-    // Suppress the "initial snapshot" alert on the next poll tick.
+    // Suppress the "initial snapshot" alert on the next poll tick AND
+    // persist the snapshot as the "vs 监控起点" baseline so notifications
+    // can show cumulative deltas across restarts.
     primeSubscriptionSnapshot(chatId, m.id, snap);
+    await saveState();
   } else {
     lines.push('', '<i>当前订单簿抓取失败 — 不影响订阅，下一轮轮询会自动重试。</i>');
   }

@@ -3,6 +3,7 @@ import { getOrderbook, getMarketById } from './predict.js';
 import { sendMessage, htmlEscape } from './telegram.js';
 import {
   listAllSubscriptions, removeSubscription, saveState,
+  setSubscriptionInitial,
   ALL_LEVELS, LEVEL_LABEL, subKey,
 } from './state.js';
 import { appendEvent } from './history.js';
@@ -37,13 +38,25 @@ export function marketLink(title, slug) {
 // Without this, the user gets a "🆕 初次抓取" alert on the next poll
 // tick — duplicating the orderbook the subscribe-success message
 // already showed. Calling primeSubscriptionSnapshot suppresses that.
+//
+// Also persists s.initial so notifications can render the "vs 监控
+// 起点" cumulative diff across restarts. Caller should saveState()
+// after to flush the new initial to disk.
 export function primeSubscriptionSnapshot(chatId, marketId, snap) {
   if (!snap) return;
-  lastBookPerSub.set(subKey(chatId, marketId), snap);
+  const k = subKey(chatId, marketId);
+  lastBookPerSub.set(k, snap);
   // Mark as just-notified so the cooldown still applies even though
   // we didn't send an in-band alert. Stops a cooldown=1s subscription
   // from being woken up by the very next poll.
-  lastNotify.set(subKey(chatId, marketId), Date.now());
+  lastNotify.set(k, Date.now());
+  setSubscriptionInitial(chatId, marketId, {
+    bestBid: snap.bestBid,
+    bestAsk: snap.bestAsk,
+    bids: snap.bids,
+    asks: snap.asks,
+    atMs: Date.now(),
+  });
 }
 
 // Standard 4-button action row attached to every notification + every
@@ -80,16 +93,20 @@ function fmtSizeCell(side) {
 }
 
 // Render a per-row delta marker in plain text. Empty string when no
-// change meets thresholds. Used for the change-list section.
-function fmtRowDelta(prev, cur) {
+// change meets thresholds. Mode-aware: 'price' suppresses size deltas,
+// 'size' suppresses price deltas, 'both' shows everything. This way
+// 只看价 mode no longer leaks 量↓ noise into the alert.
+function fmtRowDelta(prev, cur, mode = 'both') {
   if (!prev && !cur) return '';
   if (!prev && cur) return '新挂';
   if (prev && !cur) return '撤单';
   const dp = cur.price - prev.price;
   const ds = cur.size - prev.size;
   const parts = [];
-  if (Math.abs(dp) >= 1e-9) parts.push(`${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`);
-  if (Math.abs(ds) >= 1) {
+  if (mode !== 'size' && Math.abs(dp) >= 1e-9) {
+    parts.push(`${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`);
+  }
+  if (mode !== 'price' && Math.abs(ds) >= 1) {
     const fmt = Math.abs(ds).toLocaleString('en-US', { maximumFractionDigits: 0 });
     parts.push(`量${ds > 0 ? '↑' : '↓'}${fmt}`);
   }
@@ -162,16 +179,49 @@ export function fmtBook(prev, snap, levels) {
   return `<pre>${rows.join('\n')}</pre>`;
 }
 
+// Format a timestamp in the configured display timezone (default
+// Asia/Shanghai → UTC+8). Falls back to UTC ISO if Intl is unavailable.
+export function fmtClockTime(ms) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: config.displayTz,
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false,
+    }).format(new Date(ms));
+  } catch {
+    return new Date(ms).toISOString().slice(11, 19);
+  }
+}
+
+// Same but includes month-day for the "vs 监控起点" header where the
+// reference snapshot may be hours / days old. "06-30 11:19".
+export function fmtClockDateTime(ms) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: config.displayTz,
+      month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit',
+      hour12: false,
+    });
+    const parts = fmt.formatToParts(new Date(ms));
+    const get = (t) => parts.find((p) => p.type === t)?.value ?? '';
+    return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
+  } catch {
+    return new Date(ms).toISOString().slice(5, 16).replace('T', ' ');
+  }
+}
+
 // 价差 + 中价 + 抓取时间。Times shown in UTC (avoids per-user TZ
 // config); marker dropped from the line to keep it visually quiet.
 export function fmtSpreadLine(snap) {
   const bb = snap.bestBid?.price;
   const ba = snap.bestAsk?.price;
-  const time = new Date(snap.updatedAtMs ?? Date.now()).toISOString().slice(11, 19);
-  if (bb == null || ba == null) return `<i>抓取于 ${time} · 缺一侧深度</i>`;
+  const time = fmtClockTime(snap.updatedAtMs ?? Date.now());
+  const tzLabel = config.displayTzLabel ? ` ${config.displayTzLabel}` : '';
+  if (bb == null || ba == null) return `<i>抓取于 ${time}${tzLabel} · 缺一侧深度</i>`;
   const spread = ba - bb;
   const mid = (ba + bb) / 2;
-  return `<i>价差 ${spread.toFixed(4)} · 中价 ${mid.toFixed(4)} · 抓取于 ${time}</i>`;
+  return `<i>价差 ${spread.toFixed(4)} · 中价 ${mid.toFixed(4)} · 抓取于 ${time}${tzLabel}</i>`;
 }
 
 // Compact change-list: one line per watched level whose change cleared
@@ -185,8 +235,36 @@ export function fmtChangeLines(prev, snap, levels, mode = 'both') {
     const c = getLevel(snap, k);
     if (!levelDiff(p, c, mode)) continue;
     const label = LEVEL_LABEL[k] ?? k;
-    const delta = fmtRowDelta(p, c);
+    const delta = fmtRowDelta(p, c, mode);
     if (delta) out.push(`  ${label}: ${delta}`);
+  }
+  return out;
+}
+
+// Cumulative change vs the snapshot taken when the user subscribed.
+// Always shows "prev → cur" so the absolute origin is visible, plus
+// the directional delta (gated by mode the same way as fmtRowDelta).
+// Returns one line per watched level that has both an initial and a
+// current value (no "新挂"/"撤单" — those are the live delta's job).
+export function fmtSinceInitialLines(initial, snap, levels, mode = 'both') {
+  if (!initial) return [];
+  const out = [];
+  for (const k of levels) {
+    const i = getLevel(initial, k);
+    const c = getLevel(snap, k);
+    if (!i || !c) continue;
+    const dp = c.price - i.price;
+    const ds = c.size - i.size;
+    const sub = [];
+    if (mode !== 'size' && Math.abs(dp) >= 1e-9) {
+      sub.push(`${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`);
+    }
+    if (mode !== 'price' && Math.abs(ds) >= 1) {
+      const fmt = Math.abs(ds).toLocaleString('en-US', { maximumFractionDigits: 0 });
+      sub.push(`量${ds > 0 ? '↑' : '↓'}${fmt}`);
+    }
+    if (!sub.length) continue;
+    out.push(`  ${LEVEL_LABEL[k] ?? k}: ${i.price.toFixed(4)}→${c.price.toFixed(4)}  ${sub.join(' ')}`);
   }
   return out;
 }
@@ -260,6 +338,7 @@ async function runWithConcurrency(items, limit, worker) {
 async function pollOnce() {
   const subs = listAllSubscriptions();
   if (!subs.length) return;
+  let needsSave = false;
   const byMarket = new Map();
   for (const s of subs) {
     if (!byMarket.has(s.marketId)) byMarket.set(s.marketId, []);
@@ -287,6 +366,19 @@ async function pollOnce() {
       const mode = s.triggerMode || 'both';
       const k = subKey(s.chatId, s.marketId);
       const prev = lastBookPerSub.get(k);
+      // Backfill the "vs 监控起点" baseline for subs created before
+      // this feature shipped. Set once per sub on the first poll
+      // after upgrade; saveState lazily after the loop.
+      if (!s.initial) {
+        setSubscriptionInitial(s.chatId, s.marketId, {
+          bestBid: snap.bestBid,
+          bestAsk: snap.bestAsk,
+          bids: snap.bids,
+          asks: snap.asks,
+          atMs: Date.now(),
+        });
+        needsSave = true;
+      }
       // Skip paused subs; reset baseline so resume doesn't dump a
       // stale diff. Auto-clear when the timer is up — handled by
       // index.js periodically since we can't write state from here.
@@ -307,14 +399,22 @@ async function pollOnce() {
       const body = fmtBook(prev, snap, levels);
       const spreadLine = fmtSpreadLine(snap);
       const changeLines = fmtChangeLines(prev, snap, levels, mode);
+      const sinceInitialLines = fmtSinceInitialLines(s.initial, snap, levels, mode);
       const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
       const lines = [`<b>📊 ${titleLink}</b>`];
       if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
       lines.push(`<i>${htmlEscape(headline)}</i>`);
       if (changeLines.length) {
         lines.push('');
-        lines.push('<b>变动</b>');
+        lines.push('<b>本次变动</b>');
         for (const l of changeLines) lines.push(`<code>${l}</code>`);
+      }
+      if (sinceInitialLines.length && s.initial?.atMs) {
+        lines.push('');
+        const initialTime = fmtClockDateTime(s.initial.atMs);
+        const tzLabel = config.displayTzLabel ? ` ${config.displayTzLabel}` : '';
+        lines.push(`<b>vs 监控起点</b>  <i>${initialTime}${tzLabel}</i>`);
+        for (const l of sinceInitialLines) lines.push(`<code>${l}</code>`);
       }
       lines.push('', spreadLine, '', body);
       lines.push('', `<code>id=${s.marketId}</code>`);
@@ -352,6 +452,13 @@ async function pollOnce() {
           await saveState();
         }
       }
+    }
+  }
+  // Flush any state mutations done above (initial-baseline backfill,
+  // pause clears, etc) in a single save so we don't write per-tick.
+  if (needsSave) {
+    try { await saveState(); } catch (err) {
+      console.warn('[monitor] saveState failed:', err.message);
     }
   }
 }

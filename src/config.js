@@ -39,6 +39,13 @@ export const config = {
   // Locale prefix on the URL — predict.fun mirrors the same page at
   // /, /zh-cn/, /en/, etc. Pick the one you want links to land on.
   predictUrlLocale: envStr('PREDICT_URL_LOCALE', 'zh-cn'),
+
+  // Timezone for timestamps in messages (notifications, /history).
+  // Accepts any IANA name; default 'Asia/Shanghai' (UTC+8). The label
+  // is appended after the time so users know the offset.
+  displayTz: envStr('DISPLAY_TZ', 'Asia/Shanghai'),
+  displayTzLabel: envStr('DISPLAY_TZ_LABEL', '北京时间'),
+
   orderbookPathTemplate: envStr('ORDERBOOK_PATH_TEMPLATE', '/markets/{key}/orderbook'),
   orderbookKeyField: envStr('ORDERBOOK_KEY_FIELD', 'conditionId'),
 

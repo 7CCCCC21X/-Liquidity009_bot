@@ -115,6 +115,16 @@ export function updateSubscriptionTriggerMode(chatId, marketId, mode) {
   return s;
 }
 
+// Snapshot of the orderbook at subscribe time, persisted so the
+// notification can show "vs 监控起点" cumulative deltas across restarts.
+// Stored on the sub itself so it travels with /list, /export, etc.
+export function setSubscriptionInitial(chatId, marketId, snapshot) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  s.initial = snapshot;
+  return s;
+}
+
 // Per-sub pause window. untilMs=null clears the pause; otherwise stores
 // a UTC ms timestamp after which the sub auto-resumes (monitor.js does
 // the resume-check on every tick so no scheduler is needed).
