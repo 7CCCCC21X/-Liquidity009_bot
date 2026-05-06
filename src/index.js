@@ -5,7 +5,7 @@ import {
   loadState, saveState, getState,
   addSubscription, removeSubscription, listSubscriptionsForChat,
   getSubscription, updateSubscriptionLevels, updateSubscriptionNote,
-  updateSubscriptionTriggerMode,
+  updateSubscriptionTriggerMode, setSubscriptionPause, pauseAllForChat,
   putPendingChoice, takePendingChoice, gcPendingChoices,
   putPendingNote, takePendingNote, gcPendingNotes,
   putPendingWatch, takePendingWatch, gcPendingWatch,
@@ -82,6 +82,80 @@ function welcomeKeyboard() {
       [{ text: '❓ 命令列表', callback_data: 'home:help' }],
     ],
   };
+}
+
+// Parse a human duration like "30m", "2h", "1d" or a bare number (treated
+// as minutes) into milliseconds. Returns null on invalid input.
+function parseDurationMs(raw) {
+  if (!raw) return null;
+  const m = String(raw).trim().match(/^(\d+(?:\.\d+)?)\s*([smhdSMHD])?$/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = (m[2] ?? 'm').toLowerCase();
+  const mult = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[unit];
+  return mult ? Math.round(n * mult) : null;
+}
+
+function fmtRelativeRemaining(untilMs) {
+  const sec = Math.max(0, Math.floor((untilMs - Date.now()) / 1000));
+  if (sec < 60) return `${sec} 秒`;
+  if (sec < 3600) return `${Math.floor(sec / 60)} 分`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时 ${Math.floor((sec % 3600) / 60)} 分`;
+  return `${Math.floor(sec / 86400)} 天 ${Math.floor((sec % 86400) / 3600)} 小时`;
+}
+
+// Render one history entry as a compact 1-2 line block: timestamp +
+// per-level prev→cur deltas. Uses bestBid/bestAsk only because that's
+// what the JSONL records (we save the full top-3 for cur, but prev is
+// just bestBid/bestAsk to keep entries small).
+function fmtHistoryEntry(e) {
+  const t = new Date(e.ts).toISOString().slice(11, 19);
+  const head = `<code>${t}</code>`;
+  if (!e.prev) {
+    const bb = e.cur?.bestBid;
+    const ba = e.cur?.bestAsk;
+    if (bb && ba) {
+      return `${head}  🆕 初次 · 买1 ${bb.price.toFixed(4)} × ${bb.size} · 卖1 ${ba.price.toFixed(4)} × ${ba.size}`;
+    }
+    return `${head}  🆕 初次抓取`;
+  }
+  const fmtSideDiff = (label, p, c) => {
+    if (!p && c) return `${label} 新挂 ${c.price.toFixed(4)}×${c.size}`;
+    if (p && !c) return `${label} 撤 ${p.price.toFixed(4)}`;
+    if (!p || !c) return null;
+    const pieces = [];
+    if (Math.abs(c.price - p.price) >= 1e-9) {
+      const dp = c.price - p.price;
+      const arrow = dp > 0 ? '↑' : '↓';
+      pieces.push(`${p.price.toFixed(4)}→${c.price.toFixed(4)} ${arrow}${Math.abs(dp).toFixed(4)}`);
+    }
+    if (Math.abs(c.size - p.size) >= 1) {
+      const ds = c.size - p.size;
+      const fmt = Math.abs(ds).toLocaleString('en-US', { maximumFractionDigits: 0 });
+      pieces.push(`量${ds > 0 ? '↑' : '↓'}${fmt}`);
+    }
+    if (!pieces.length) return null;
+    return `${label} ${pieces.join(' ')}`;
+  };
+  const out = [];
+  const bidLine = fmtSideDiff('买1', e.prev.bestBid, e.cur?.bestBid);
+  const askLine = fmtSideDiff('卖1', e.prev.bestAsk, e.cur?.bestAsk);
+  if (bidLine) out.push(bidLine);
+  if (askLine) out.push(askLine);
+  // Spread delta — only if both sides changed visibly.
+  if (e.prev.bestBid && e.prev.bestAsk && e.cur?.bestBid && e.cur?.bestAsk) {
+    const sp = e.prev.bestAsk.price - e.prev.bestBid.price;
+    const sc = e.cur.bestAsk.price - e.cur.bestBid.price;
+    if (Math.abs(sp - sc) >= 1e-9) {
+      out.push(`价差 ${sp.toFixed(4)}→${sc.toFixed(4)}`);
+    }
+  }
+  if (!out.length) return `${head}  深度变动`;
+  // Single-line if short, two-line if multi-clause.
+  return out.length === 1
+    ? `${head}  ${out[0]}`
+    : `${head}\n  ${out.join('\n  ')}`;
 }
 
 function buildLevelsKeyboard(marketId, levels, triggerMode) {
@@ -417,12 +491,12 @@ async function handleCommand(chatId, text) {
       await sendMessage(chatId, `没有 <code>${htmlEscape(id)}</code> 的历史记录。`);
       return true;
     }
-    const lines = [`<b>📜 ${htmlEscape(events[0].title || `Market ${id}`)} 最近 ${events.length} 条</b>`];
-    for (const e of events) {
-      const t = new Date(e.ts).toISOString().replace('T', ' ').slice(5, 19);
-      lines.push(`<code>${t}</code> ${htmlEscape(e.summary || '变动')}`);
-    }
-    lines.push('', `完整文件：/export`);
+    const lines = [
+      `<b>📜 ${marketLink(events[0].title || `Market ${id}`, events[0].slug)}</b>`,
+      `<i>最近 ${events.length} 条变动（新→旧）· /export 拿完整文件</i>`,
+      '',
+    ];
+    for (const e of events) lines.push(fmtHistoryEntry(e));
     await sendMessage(chatId, lines.join('\n'));
     return true;
   }
@@ -460,6 +534,100 @@ async function handleCommand(chatId, text) {
     const ok = removeSubscription(chatId, id);
     if (ok) await saveState();
     await sendMessage(chatId, ok ? `✅ 已取消订阅 <code>${htmlEscape(id)}</code>` : `❌ 没有订阅 <code>${htmlEscape(id)}</code>`);
+    return true;
+  }
+  // /pause [duration]               — pause all subs in this chat
+  // /pause <id> [duration]          — pause one sub
+  // duration formats: 30m, 2h, 1d, or bare minutes; default 1h
+  if (c === '/pause' || /^\/pause_\d+$/.test(c)) {
+    let id, durRaw;
+    if (/^\/pause_\d+$/.test(c)) {
+      id = c.slice('/pause_'.length);
+      durRaw = args[0];
+    } else if (args.length === 0) {
+      durRaw = null;
+    } else if (/^\d+$/.test(args[0]) && parseDurationMs(args[0]) == null) {
+      // Pure-numeric ID without duration unit (e.g. "/pause 272779")
+      id = args[0];
+      durRaw = args[1];
+    } else if (/^\d+$/.test(args[0]) && args.length >= 2) {
+      // "/pause 272779 2h"
+      id = args[0];
+      durRaw = args[1];
+    } else {
+      // "/pause 2h"  → all subs
+      durRaw = args[0];
+    }
+    const durMs = parseDurationMs(durRaw) ?? 60 * 60 * 1000; // default 1h
+    const untilMs = Date.now() + durMs;
+    if (id) {
+      const sub = getSubscription(chatId, id);
+      if (!sub) {
+        await sendMessage(chatId, `❌ 没有订阅 <code>${htmlEscape(id)}</code>`);
+        return true;
+      }
+      setSubscriptionPause(chatId, id, untilMs);
+      await saveState();
+      await sendMessage(chatId, [
+        `⏸ 已暂停 <code>${id}</code>`,
+        `<i>${fmtRelativeRemaining(untilMs)}后自动恢复，期间不会推送变动通知。</i>`,
+        `<i>提前恢复：/resume ${id}</i>`,
+      ].join('\n'));
+    } else {
+      const n = pauseAllForChat(chatId, untilMs);
+      if (!n) {
+        await sendMessage(chatId, '当前没有订阅可暂停。');
+        return true;
+      }
+      await saveState();
+      await sendMessage(chatId, [
+        `⏸ 已暂停全部 <b>${n}</b> 个订阅`,
+        `<i>${fmtRelativeRemaining(untilMs)}后自动恢复。</i>`,
+        `<i>提前恢复全部：/resume</i>`,
+      ].join('\n'));
+    }
+    return true;
+  }
+  if (c === '/resume' || /^\/resume_\d+$/.test(c)) {
+    let id = args[0];
+    if (/^\/resume_\d+$/.test(c)) id = c.slice('/resume_'.length);
+    if (id) {
+      const sub = getSubscription(chatId, id);
+      if (!sub) {
+        await sendMessage(chatId, `❌ 没有订阅 <code>${htmlEscape(id)}</code>`);
+        return true;
+      }
+      setSubscriptionPause(chatId, id, 0);
+      await saveState();
+      await sendMessage(chatId, `▶️ 已恢复 <code>${id}</code>，下次轮询会重新推送变动。`);
+    } else {
+      const subs = listSubscriptionsForChat(chatId).filter((s) => s.pausedUntil);
+      for (const s of subs) setSubscriptionPause(chatId, s.marketId, 0);
+      if (subs.length) await saveState();
+      await sendMessage(chatId, subs.length
+        ? `▶️ 已恢复 ${subs.length} 个暂停的订阅。`
+        : '当前没有处于暂停状态的订阅。');
+    }
+    return true;
+  }
+  if (c === '/status') {
+    const subs = listSubscriptionsForChat(chatId);
+    const pausedCount = subs.filter((s) => s.pausedUntil && s.pausedUntil > Date.now()).length;
+    const histStats = await fileStats();
+    const histSize = histStats.exists ? `${(histStats.size / 1024).toFixed(1)} KiB` : '0';
+    const lines = [
+      '🟢 <b>Bot 正常运行</b>',
+      '',
+      `<b>订阅</b>: ${subs.length} 个${pausedCount ? ` (⏸ ${pausedCount} 暂停中)` : ''}`,
+      `<b>轮询</b>: 每 ${config.pollIntervalMs}ms · 下限 ${config.pollMinIntervalMs}ms · 并发 ${config.pollConcurrency}`,
+      `<b>冷却</b>: ${Math.round(config.notifyCooldownMs / 1000)}s`,
+      `<b>价格阈值</b>: ≥ ${config.priceEpsilon}`,
+      `<b>数量阈值</b>: ≥ ${config.sizeAbsoluteMin} 张 / ${(config.sizeRelativeEpsilon * 100).toFixed(0)}%`,
+      `<b>新订阅默认</b>: ${(config.defaultLevels ?? []).map((l) => LEVEL_LABEL[l] ?? l).join('/')} · ${TRIGGER_LABEL[config.defaultTriggerMode] ?? '价+量'}`,
+      `<b>历史记录</b>: ${config.historyEnabled ? `${histSize} (保留 ${config.historyKeepDays} 天)` : '已关闭'}`,
+      `<b>状态文件</b>: <code>${htmlEscape(config.stateFile)}</code>`,
+    ];
+    await sendMessage(chatId, lines.join('\n'));
     return true;
   }
   if (c === '/stopall') {
@@ -605,11 +773,14 @@ async function renderListView(chatId, page = 0) {
       ? s.levels.map((l) => LEVEL_LABEL[l]).join('/')
       : '（无 — 不会推送）';
     const mode = TRIGGER_LABEL[s.triggerMode] ?? '价+量';
+    const isPaused = s.pausedUntil && s.pausedUntil > Date.now();
+    const dot = isPaused ? '⏸' : '🟢';
     const lines = [
-      `🟢 <b>${marketLink(s.title || `Market ${s.marketId}`, s.slug)}</b>`,
+      `${dot} <b>${marketLink(s.title || `Market ${s.marketId}`, s.slug)}</b>`,
       `<code>id=${s.marketId}</code>`,
       `档位：${levels} · 触发：${mode}`,
     ];
+    if (isPaused) lines.push(`<i>⏸ 已暂停，${fmtRelativeRemaining(s.pausedUntil)}后恢复 · /resume_${s.marketId}</i>`);
     if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
     await sendMessage(chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(s.marketId) });
   }
@@ -1236,6 +1407,9 @@ async function main() {
     { command: 'note',      description: '加 / 改备注' },
     { command: 'probe',     description: '立即抓一次盘口' },
     { command: 'history',   description: '查看历史变动' },
+    { command: 'pause',     description: '暂停推送（默认 1h）' },
+    { command: 'resume',    description: '恢复推送' },
+    { command: 'status',    description: 'Bot 健康状态' },
     { command: 'export',    description: '导出 history.jsonl' },
     { command: 'speedtest', description: '测抓取延迟' },
     { command: 'stop',      description: '取消单个订阅' },

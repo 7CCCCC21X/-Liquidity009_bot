@@ -287,6 +287,13 @@ async function pollOnce() {
       const mode = s.triggerMode || 'both';
       const k = subKey(s.chatId, s.marketId);
       const prev = lastBookPerSub.get(k);
+      // Skip paused subs; reset baseline so resume doesn't dump a
+      // stale diff. Auto-clear when the timer is up — handled by
+      // index.js periodically since we can't write state from here.
+      if (s.pausedUntil && now < s.pausedUntil) {
+        lastBookPerSub.set(k, snap);
+        continue;
+      }
       // Empty levels = monitoring nothing (user toggled all off). Snapshot
       // the book so re-enabling levels later doesn't dump a stale diff.
       if (!s.levels?.length) {
@@ -327,8 +334,15 @@ async function pollOnce() {
           note: s.note || null,
           levels,
           summary: headline,
-          prev: prev ? { bestBid: prev.bestBid, bestAsk: prev.bestAsk } : null,
+          // Save full top-3 in both prev and cur so /history can show
+          // changes on bid2/3 + ask2/3 too. Old records still parse —
+          // /history's renderer falls back to bestBid/bestAsk only.
+          prev: prev ? {
+            bestBid: prev.bestBid, bestAsk: prev.bestAsk,
+            bids: prev.bids, asks: prev.asks,
+          } : null,
           cur: { bestBid: snap.bestBid, bestAsk: snap.bestAsk, bids: snap.bids, asks: snap.asks },
+          slug: s.slug || null,
           updatedAtMs: snap.updatedAtMs,
         });
       } catch (err) {

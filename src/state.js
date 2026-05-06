@@ -115,6 +115,28 @@ export function updateSubscriptionTriggerMode(chatId, marketId, mode) {
   return s;
 }
 
+// Per-sub pause window. untilMs=null clears the pause; otherwise stores
+// a UTC ms timestamp after which the sub auto-resumes (monitor.js does
+// the resume-check on every tick so no scheduler is needed).
+export function setSubscriptionPause(chatId, marketId, untilMs) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  s.pausedUntil = (typeof untilMs === 'number' && untilMs > Date.now()) ? untilMs : null;
+  return s;
+}
+
+// Pause every sub in a chat. Returns the count actually changed so the
+// caller can render an accurate confirmation.
+export function pauseAllForChat(chatId, untilMs) {
+  let n = 0;
+  for (const s of Object.values(_state.subs)) {
+    if (String(s.chatId) !== String(chatId)) continue;
+    s.pausedUntil = (typeof untilMs === 'number' && untilMs > Date.now()) ? untilMs : null;
+    n += 1;
+  }
+  return n;
+}
+
 export function updateSubscriptionNote(chatId, marketId, note) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
