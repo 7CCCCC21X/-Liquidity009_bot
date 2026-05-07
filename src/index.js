@@ -6,7 +6,7 @@ import {
   addSubscription, removeSubscription, listSubscriptionsForChat,
   getSubscription, updateSubscriptionLevels, updateSubscriptionNote,
   updateSubscriptionTriggerMode, setSubscriptionPause, pauseAllForChat,
-  putPendingChoice, takePendingChoice, gcPendingChoices,
+  putPendingChoice, peekPendingChoice, takePendingChoice, gcPendingChoices,
   putPendingNote, takePendingNote, gcPendingNotes,
   putPendingWatch, takePendingWatch, gcPendingWatch,
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
@@ -298,22 +298,166 @@ async function promptForNote(chatId, marketId) {
   await saveState();
 }
 
-function buildChoiceKeyboard(token, matches) {
+function buildChoiceKeyboard(token, matches, selected = []) {
+  const sel = new Set(selected);
   const rows = [];
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i];
     // Number prefix + #id suffix disambiguates same-titled cards
     // (events with multiple sub-markets share Yes/No/Draw labels).
-    // Telegram button text caps at ~64 chars; trim title to fit both
-    // the prefix and the id without overflow.
+    // Telegram button text caps at ~64 chars; trim title to fit the
+    // ✅/⬜ checkbox + prefix + id without overflow.
     const rawTitle = (m.title || m.question || `#${m.id}`).replace(/\s+/g, ' ').trim();
     const idSuffix = ` · #${m.id}`;
-    const titleBudget = 64 - String(i + 1).length - 2 - idSuffix.length;
+    const checkbox = sel.has(i) ? '✅' : '⬜';
+    const titleBudget = 64 - 2 /* checkbox+space */ - String(i + 1).length - 2 - idSuffix.length;
     const title = rawTitle.length > titleBudget ? rawTitle.slice(0, titleBudget - 1) + '…' : rawTitle;
-    rows.push([{ text: `${i + 1}. ${title}${idSuffix}`, callback_data: `pick:${token}:${i}` }]);
+    rows.push([{ text: `${checkbox} ${i + 1}. ${title}${idSuffix}`, callback_data: `pick:${token}:t:${i}` }]);
   }
-  rows.push([{ text: '✖ 取消', callback_data: `pick:${token}:cancel` }]);
+  rows.push([
+    { text: '✅ 全选', callback_data: `pick:${token}:all` },
+    { text: '⬜ 清空', callback_data: `pick:${token}:none` },
+  ]);
+  rows.push([
+    { text: `✓ 完成 (${sel.size})`, callback_data: `pick:${token}:done` },
+    { text: '✖ 取消', callback_data: `pick:${token}:cancel` },
+  ]);
   return { inline_keyboard: rows };
+}
+
+function buildChoiceHeaderText(matches, selectedCount) {
+  return [
+    `🔎 识别出 <b>${matches.length}</b> 个市场卡片，请<b>勾选</b>要监控的：`,
+    `<i>已选 <b>${selectedCount}</b> 个 · 可全选或多选 · 30 分钟内有效</i>`,
+  ].join('\n');
+}
+
+// Single source of truth for the pick:<token>:<action> callback router.
+// Actions: t:<idx> (toggle), all, none, done, cancel.
+async function handlePickCallback(chatId, messageId, callbackId, token, action) {
+  // 'cancel' / 'done' consume the entry; everything else just peeks.
+  if (action === 'cancel') {
+    takePendingChoice(chatId, token);
+    await answerCallbackQuery(callbackId, { text: '已取消' });
+    if (messageId) {
+      try { await editMessageText(chatId, messageId, '✖ 已取消选择。'); } catch { /* old msg */ }
+    }
+    return;
+  }
+
+  const entry = peekPendingChoice(chatId, token);
+  if (!entry) {
+    await answerCallbackQuery(callbackId, { text: '选项已过期，请重新发送网址', showAlert: true });
+    return;
+  }
+  const { matches } = entry;
+
+  if (action === 'all') {
+    entry.selected = matches.map((_, i) => i);
+    await saveState();
+    await answerCallbackQuery(callbackId, { text: `已全选 ${matches.length}` });
+    await refreshChoiceKeyboard(chatId, messageId, token, matches, entry.selected);
+    return;
+  }
+  if (action === 'none') {
+    entry.selected = [];
+    await saveState();
+    await answerCallbackQuery(callbackId, { text: '已清空' });
+    await refreshChoiceKeyboard(chatId, messageId, token, matches, entry.selected);
+    return;
+  }
+  if (action.startsWith('t:')) {
+    const idx = Number(action.slice(2));
+    if (!Number.isInteger(idx) || idx < 0 || idx >= matches.length) {
+      await answerCallbackQuery(callbackId);
+      return;
+    }
+    const set = new Set(entry.selected);
+    if (set.has(idx)) set.delete(idx); else set.add(idx);
+    entry.selected = [...set].sort((a, b) => a - b);
+    await saveState();
+    await answerCallbackQuery(callbackId);
+    await refreshChoiceKeyboard(chatId, messageId, token, matches, entry.selected);
+    return;
+  }
+  if (action === 'done') {
+    if (!entry.selected.length) {
+      await answerCallbackQuery(callbackId, { text: '请先勾选至少一个市场', showAlert: true });
+      return;
+    }
+    takePendingChoice(chatId, token);
+    await answerCallbackQuery(callbackId, { text: `订阅 ${entry.selected.length} 个…` });
+    await commitPickedSubscriptions(chatId, messageId, matches, entry.selected);
+    return;
+  }
+  await answerCallbackQuery(callbackId);
+}
+
+async function refreshChoiceKeyboard(chatId, messageId, token, matches, selected) {
+  if (!messageId) return;
+  try {
+    await editMessageText(
+      chatId,
+      messageId,
+      buildChoiceHeaderText(matches, selected.length),
+      buildChoiceKeyboard(token, matches, selected),
+    );
+  } catch { /* edit may fail on old messages — ignore */ }
+}
+
+async function commitPickedSubscriptions(chatId, messageId, matches, selectedIdx) {
+  // Single pick → full sendSubscribed flow (orderbook + note prompt).
+  // Multi-pick → batch addSubscription + one summary message; defer
+  // baseline + note prompts to the natural per-tick flow.
+  if (selectedIdx.length === 1) {
+    const m = matches[selectedIdx[0]];
+    const wasExisting = !!getSubscription(chatId, m.id);
+    addSubscription({
+      chatId,
+      marketId: m.id,
+      conditionId: m.conditionId,
+      title: m.title || m.question || `Market ${m.id}`,
+      slug: m.slug,
+    });
+    await saveState();
+    if (messageId) {
+      try { await editMessageText(chatId, messageId, `✅ 已订阅 1 个市场`); } catch { /* */ }
+    }
+    await sendSubscribed(chatId, m, { wasExisting });
+    return;
+  }
+  // Batch path: subscribe each silently, then send one summary.
+  const lines = [];
+  let ok = 0;
+  for (const idx of selectedIdx) {
+    const m = matches[idx];
+    try {
+      addSubscription({
+        chatId,
+        marketId: m.id,
+        conditionId: m.conditionId,
+        title: m.title || m.question || `Market ${m.id}`,
+        slug: m.slug,
+      });
+      const titleShort = (m.title || m.question || '').slice(0, 50);
+      lines.push(`✓ <code>${m.id}</code> ${marketLink(titleShort, m.slug)}`);
+      ok += 1;
+    } catch (err) {
+      lines.push(`✗ <code>${m.id}</code> ${htmlEscape(err.message).slice(0, 60)}`);
+    }
+  }
+  await saveState();
+  if (messageId) {
+    try { await editMessageText(chatId, messageId, `✅ 已订阅 ${ok} 个市场（详见下条）`); } catch { /* */ }
+  }
+  await sendMessage(chatId, [
+    `<b>📥 批量订阅完成</b>  ✓${ok} / ${selectedIdx.length}`,
+    '',
+    ...lines,
+    '',
+    `<i>下次轮询会自动设置「监控起点」基线，之后通知就能看到累计 Δ 了。</i>`,
+    `/list 查看全部 · /watch 加更多`,
+  ].join('\n'));
 }
 
 async function handleUrl(chatId, text, { initialNote = null } = {}) {
@@ -354,12 +498,13 @@ async function handleUrl(chatId, text, { initialNote = null } = {}) {
     try { suggestions = await fuzzySlugSuggestions(slug, 8); } catch { /* ignore */ }
     if (suggestions.length) {
       const token = shortToken();
-      putPendingChoice(chatId, token, suggestions);
+      putPendingChoice(chatId, token, suggestions, []);
       await saveState();
       await sendMessage(chatId, [
         `❓ 没找到完全匹配 slug=<code>${htmlEscape(slug)}</code>，下面是相似的市场：`,
-        `<i>（点选订阅；30 分钟内有效）</i>`,
-      ].join('\n'), { replyMarkup: buildChoiceKeyboard(token, suggestions) });
+        ``,
+        buildChoiceHeaderText(suggestions, 0).split('\n').slice(1).join('\n'),
+      ].join('\n'), { replyMarkup: buildChoiceKeyboard(token, suggestions, []) });
       return;
     }
     await sendMessage(chatId, [
@@ -390,12 +535,11 @@ async function handleUrl(chatId, text, { initialNote = null } = {}) {
     return;
   }
   const token = shortToken();
-  putPendingChoice(chatId, token, matches);
+  putPendingChoice(chatId, token, matches, []);
   await saveState();
-  await sendMessage(chatId, [
-    `🔎 识别出 <b>${matches.length}</b> 个市场卡片，请选择要监控的：`,
-    `<i>（30 分钟内有效）</i>`,
-  ].join('\n'), { replyMarkup: buildChoiceKeyboard(token, matches) });
+  await sendMessage(chatId, buildChoiceHeaderText(matches, 0), {
+    replyMarkup: buildChoiceKeyboard(token, matches, []),
+  });
 }
 
 async function handleCommand(chatId, text) {
@@ -1316,33 +1460,8 @@ async function handleCallback(cb) {
   const pickMatch = data.match(/^pick:([a-z0-9]+):(.+)$/);
   if (pickMatch) {
     const token = pickMatch[1];
-    const choice = pickMatch[2];
-    if (choice === 'cancel') {
-      await answerCallbackQuery(cb.id, { text: '已取消' });
-      return;
-    }
-    const idx = Number(choice);
-    const matches = takePendingChoice(chatId, token);
-    if (!matches) {
-      await answerCallbackQuery(cb.id, { text: '选项已过期，请重新发送网址', showAlert: true });
-      return;
-    }
-    const pick = matches[idx];
-    if (!pick) {
-      await answerCallbackQuery(cb.id, { text: '无效选项', showAlert: true });
-      return;
-    }
-    const wasExisting = !!getSubscription(chatId, pick.id);
-    addSubscription({
-      chatId,
-      marketId: pick.id,
-      conditionId: pick.conditionId,
-      title: pick.title || pick.question || `Market ${pick.id}`,
-      slug: pick.slug,
-    });
-    await saveState();
-    await answerCallbackQuery(cb.id, { text: '✅ 已订阅' });
-    await sendSubscribed(chatId, pick, { wasExisting });
+    const action = pickMatch[2];
+    await handlePickCallback(chatId, messageId, cb.id, token, action);
     return;
   }
 

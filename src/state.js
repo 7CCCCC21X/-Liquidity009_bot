@@ -194,12 +194,18 @@ export function listAllSubscriptions() {
 // data stays under Telegram's 64-byte limit. Auto-expire after 30 min.
 const CHOICE_TTL_MS = 30 * 60 * 1000;
 
-export function putPendingChoice(chatId, token, matches) {
+export function putPendingChoice(chatId, token, matches, selected = []) {
   const k = `${chatId}:${token}`;
-  _state.pendingChoices[k] = { matches, expiresAt: Date.now() + CHOICE_TTL_MS };
+  _state.pendingChoices[k] = {
+    matches,
+    selected: Array.from(selected ?? []),
+    expiresAt: Date.now() + CHOICE_TTL_MS,
+  };
 }
 
-export function takePendingChoice(chatId, token) {
+// Read without consuming — used by toggle/select-all/none flows so
+// the entry stays around until "完成" or "取消" finalises it.
+export function peekPendingChoice(chatId, token) {
   const k = `${chatId}:${token}`;
   const entry = _state.pendingChoices[k];
   if (!entry) return null;
@@ -207,7 +213,21 @@ export function takePendingChoice(chatId, token) {
     delete _state.pendingChoices[k];
     return null;
   }
-  return entry.matches;
+  if (!Array.isArray(entry.selected)) entry.selected = [];
+  return entry;
+}
+
+export function takePendingChoice(chatId, token) {
+  const k = `${chatId}:${token}`;
+  const entry = _state.pendingChoices[k];
+  if (!entry) return null;
+  delete _state.pendingChoices[k];
+  if (entry.expiresAt < Date.now()) return null;
+  // Backwards compat: callers used to receive the matches array; now
+  // they get the full entry { matches, selected }. The legacy callers
+  // already destructure entry.matches so this stays compatible.
+  if (!Array.isArray(entry.selected)) entry.selected = [];
+  return entry;
 }
 
 export function gcPendingChoices() {
