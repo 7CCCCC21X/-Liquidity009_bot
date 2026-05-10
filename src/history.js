@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { config } from './config.js';
 
 // Append-only JSONL log of every notification we send. One line per
@@ -6,17 +7,34 @@ import { config } from './config.js';
 // point HISTORY_FILE at /data/history.jsonl so it survives redeploys.
 
 let _appendQueue = Promise.resolve();
+let _dirEnsured = false;
 
 export async function appendEvent(evt) {
   if (!config.historyEnabled) return;
   const line = JSON.stringify({ ts: Date.now(), ...evt }) + '\n';
   // Serialize appends so concurrent ticks don't interleave bytes
-  // mid-line. fs.appendFile is atomic per-call on most platforms but
-  // chaining keeps that property even under busy schedulers.
-  _appendQueue = _appendQueue.then(() => fs.appendFile(config.historyFile, line));
-  return _appendQueue.catch((err) => {
-    console.warn(new Date().toISOString(), '[history] append failed:', err.message);
-  });
+  // mid-line. The leading .catch() resets the chain after a failure
+  // so one bad write (full disk, EACCES, …) doesn't leave the queue
+  // permanently rejected and silently drop every subsequent event.
+  // mkdir -p once per process so /data style mounts work even if the
+  // directory wasn't pre-created.
+  _appendQueue = _appendQueue
+    .catch(() => {})
+    .then(async () => {
+      if (!_dirEnsured) {
+        try { await fs.mkdir(path.dirname(config.historyFile), { recursive: true }); } catch { /* root or already there */ }
+        _dirEnsured = true;
+      }
+      await fs.appendFile(config.historyFile, line);
+    })
+    .catch((err) => {
+      console.warn(new Date().toISOString(), '[history] append failed:', err.message);
+      // Re-throw so caller (if any) sees it; the next .catch() in line
+      // will reset the chain on the next call.
+      throw err;
+    });
+  // Caller's await sees a clean resolution either way.
+  return _appendQueue.catch(() => {});
 }
 
 // Tail the file for the last N events matching a filter. Reads the

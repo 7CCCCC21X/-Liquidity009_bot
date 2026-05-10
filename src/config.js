@@ -28,6 +28,11 @@ function envCsv(key, fallback) {
 export const config = {
   telegramBotToken: envStr('TELEGRAM_BOT_TOKEN', ''),
   telegramChatId: envStr('TELEGRAM_CHAT_ID', ''),
+  // Whitelist of chat IDs allowed to use the bot. Empty → open to
+  // anyone who finds the bot (the prior default). Set to "123,456"
+  // to restrict — every other chat gets a polite "not authorised"
+  // refusal at the message/callback entry point.
+  allowedChatIds: envCsv('ALLOWED_CHAT_IDS', []),
 
   predictApiKey: envStr('PREDICT_API_KEY', ''),
   graphqlUrl: envStr('GRAPHQL_URL', 'https://graphql.predict.fun/graphql'),

@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { config } from './config.js';
 
 // Shape:
@@ -52,7 +53,14 @@ function emptyState() {
 }
 
 let _state = null;
-let _saveQueued = false;
+// Save coalescing — concurrent callers all set _dirty; the lone
+// _saving worker keeps draining until _dirty stays false. This
+// guarantees: (a) the on-disk file is always a valid serialisation
+// of some past _state, (b) the LATEST mutation always lands on disk
+// before saveState resolves to an empty queue, (c) no two writers
+// ever race on the same .tmp filename (each carries pid+ts).
+let _saving = false;
+let _dirty = false;
 
 export async function loadState() {
   if (_state) return _state;
@@ -78,13 +86,28 @@ export function getState() {
 
 export async function saveState() {
   if (!_state) return;
-  if (_saveQueued) return;
-  _saveQueued = true;
-  await new Promise((r) => setImmediate(r));
-  _saveQueued = false;
-  const tmp = `${config.stateFile}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(_state, null, 2));
-  await fs.rename(tmp, config.stateFile);
+  _dirty = true;
+  if (_saving) return; // another caller already in the loop
+  _saving = true;
+  try {
+    while (_dirty) {
+      _dirty = false;
+      const dir = path.dirname(config.stateFile);
+      // mkdir -p in case STATE_FILE points inside an unmounted volume
+      // dir (e.g. /data on Railway when the volume hasn't attached
+      // yet); avoids the very first save crashing on ENOENT.
+      try { await fs.mkdir(dir, { recursive: true }); } catch { /* root or already exists */ }
+      // Unique tmp filename per write attempt — protects against the
+      // tiny window where two saves race (different processes / two
+      // event-loop turns within the same process).
+      const tmp = `${config.stateFile}.${process.pid}.${Date.now()}.tmp`;
+      const payload = JSON.stringify(_state, null, 2);
+      await fs.writeFile(tmp, payload);
+      await fs.rename(tmp, config.stateFile);
+    }
+  } finally {
+    _saving = false;
+  }
 }
 
 export function subKey(chatId, marketId) {

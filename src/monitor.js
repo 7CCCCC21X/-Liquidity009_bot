@@ -303,13 +303,23 @@ function fmtHeadline(prev, cur, levels, mode = 'both') {
 // Fetch a single market's orderbook with the same fallbacks the
 // monitor uses. Returns { snap } on success or { error } on failure;
 // callers decide whether to log or skip.
+//
+// Cached-conditionId fast path: every subscription persists the
+// conditionId from when it was first added. The orderbook endpoint
+// only needs id+conditionId, so for steady-state polls we skip the
+// GraphQL getMarketById round-trip entirely and only fall back to
+// it when the sub was added before we started persisting conditionId
+// (or the sub object is incomplete for any reason).
 async function fetchMarketSnap(marketId, group) {
   try {
-    let market = await getMarketById(marketId);
+    const s0 = group[0];
+    let market = s0?.conditionId
+      ? { id: marketId, conditionId: s0.conditionId, title: s0.title, slug: s0.slug }
+      : null;
     if (!market) {
-      const s0 = group[0];
-      if (!s0.conditionId) return { marketId, group, error: 'no market record and no cached conditionId' };
-      market = { id: marketId, conditionId: s0.conditionId };
+      const m = await getMarketById(marketId);
+      if (!m) return { marketId, group, error: 'no market record and no cached conditionId' };
+      market = m;
     }
     const snap = await getOrderbook(market);
     return { marketId, group, snap };

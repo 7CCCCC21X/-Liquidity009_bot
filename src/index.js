@@ -648,23 +648,27 @@ async function handleCommand(chatId, text) {
     return true;
   }
   if (c === '/export') {
-    const stats = await fileStats();
-    if (!stats.exists || stats.size === 0) {
-      await sendMessage(chatId, '没有历史记录文件可导出。');
+    // Filter to the calling chat only — /export used to dump the
+    // global file (containing every chat's history). Privacy fix.
+    // Cap pulls a generous N of recent events so even very busy chats
+    // get exported without OOM-ing on a multi-MB file.
+    const events = await readEvents({ chatId, limit: 50_000 });
+    if (!events.length) {
+      await sendMessage(chatId, '当前聊天没有历史记录可导出。');
       return true;
     }
-    const buf = await readWholeFile();
-    if (!buf) {
-      await sendMessage(chatId, '读取历史文件失败。');
-      return true;
-    }
-    const fileName = `history-${new Date().toISOString().slice(0, 10)}.jsonl`;
+    // readEvents returns newest→oldest; flip to chronological for the
+    // exported file so a tail/cat reads time-ordered.
+    const chronological = events.slice().reverse();
+    const body = chronological.map((e) => JSON.stringify(e)).join('\n') + '\n';
+    const buf = Buffer.from(body, 'utf8');
+    const fileName = `history-${chatId}-${new Date().toISOString().slice(0, 10)}.jsonl`;
     try {
       await sendDocument(chatId, {
         fileName,
         content: buf,
         contentType: 'application/x-ndjson',
-        caption: `📦 共 ${(stats.size / 1024).toFixed(1)} KiB`,
+        caption: `📦 当前聊天 ${events.length} 条 · ${(buf.length / 1024).toFixed(1)} KiB`,
       });
     } catch (err) {
       await sendMessage(chatId, `❌ 导出失败：${htmlEscape(err.message)}`);
@@ -802,10 +806,30 @@ async function handleCommand(chatId, text) {
   return false;
 }
 
+// Allowed-chat check. When ALLOWED_CHAT_IDS is empty the bot is open
+// (legacy behaviour); when populated, every entry point gates on it.
+function isAllowedChat(chatId) {
+  if (chatId == null) return false;
+  if (!config.allowedChatIds.length) return true;
+  return config.allowedChatIds.includes(String(chatId));
+}
+
+async function denyChat(chatId) {
+  try {
+    await sendMessage(chatId, [
+      '⛔ <b>此机器人未对当前聊天开放。</b>',
+      '',
+      `你的 chat ID: <code>${chatId}</code>`,
+      `如需使用，请管理员把这个 ID 加到 <code>ALLOWED_CHAT_IDS</code> 环境变量。`,
+    ].join('\n'));
+  } catch { /* don't crash on send-fail */ }
+}
+
 async function handleMessage(msg) {
   const chatId = msg.chat?.id;
   const text = (msg.text ?? '').trim();
   if (!chatId || !text) return;
+  if (!isAllowedChat(chatId)) { await denyChat(chatId); return; }
 
   // Reply-to-prompt path: if the user is replying to one of our
   // ForceReply prompts (note or watch), route the message to the
@@ -1209,6 +1233,10 @@ async function handleCallback(cb) {
   const chatId = cb.message?.chat?.id;
   const messageId = cb.message?.message_id;
   const data = cb.data ?? '';
+  if (!isAllowedChat(chatId)) {
+    try { await answerCallbackQuery(cb.id, { text: '此聊天未授权使用本机器人', showAlert: true }); } catch {}
+    return;
+  }
   if (!chatId) {
     await answerCallbackQuery(cb.id);
     return;

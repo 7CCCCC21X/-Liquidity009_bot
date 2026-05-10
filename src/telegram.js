@@ -16,6 +16,14 @@ function tgUrl(method) {
   return `https://api.telegram.org/bot${config.telegramBotToken}/${method}`;
 }
 
+// Strip the bot token from any string before logging or surfacing as
+// an error. Without this an upstream HTTP error like "HTTP 502 https://
+// api.telegram.org/bot12345:ABCDEFGH/sendMessage" would leak the token
+// into Railway logs.
+export function redactTokens(s) {
+  return String(s ?? '').replace(/\/bot[^/?\s]+/gi, '/bot<redacted>');
+}
+
 // Split a long HTML message on line boundaries so we never cut a tag,
 // entity, or <pre> block in half. A line that's individually longer
 // than the limit gets a hard slice with an ellipsis (rare; the
@@ -75,32 +83,46 @@ export function rebalanceHtmlChunks(chunks) {
 }
 
 export async function tgApi(method, payload, { timeoutMs = 15_000, retries = 2 } = {}) {
-  const json = await fetchJson(tgUrl(method), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    timeoutMs,
-    retries,
-  });
-  if (!json?.ok) throw new Error(`Telegram ${method} not ok: ${JSON.stringify(json).slice(0, 200)}`);
-  return json.result;
+  try {
+    const json = await fetchJson(tgUrl(method), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      timeoutMs,
+      retries,
+    });
+    if (!json?.ok) {
+      throw new Error(`Telegram ${method} not ok: ${JSON.stringify(json).slice(0, 200)}`);
+    }
+    return json.result;
+  } catch (err) {
+    // Strip the bot token from any error message before it bubbles
+    // out into a logger or user-facing reply.
+    err.message = redactTokens(err.message);
+    throw err;
+  }
 }
 
 export async function getUpdates({ offset, timeoutSec = 25, signal } = {}) {
-  const res = await fetch(tgUrl('getUpdates'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      offset,
-      timeout: timeoutSec,
-      allowed_updates: ['message', 'callback_query', 'my_chat_member'],
-    }),
-    signal,
-  });
-  if (!res.ok) throw new Error(`getUpdates ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const json = await res.json();
-  if (!json?.ok) throw new Error(`getUpdates not ok: ${JSON.stringify(json).slice(0, 200)}`);
-  return json.result;
+  try {
+    const res = await fetch(tgUrl('getUpdates'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        offset,
+        timeout: timeoutSec,
+        allowed_updates: ['message', 'callback_query', 'my_chat_member'],
+      }),
+      signal,
+    });
+    if (!res.ok) throw new Error(`getUpdates ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const json = await res.json();
+    if (!json?.ok) throw new Error(`getUpdates not ok: ${JSON.stringify(json).slice(0, 200)}`);
+    return json.result;
+  } catch (err) {
+    err.message = redactTokens(err.message);
+    throw err;
+  }
 }
 
 export async function sendMessage(chatId, text, { replyMarkup, replyTo } = {}) {

@@ -38,6 +38,20 @@ export function slugifyWithYear(s) {
   return slugify(t);
 }
 
+// SSRF guard. Only allow https://predict.fun (and subdomains). Anything
+// else returns false; callers must refuse to fetch. extractSlugFromUrl
+// will still successfully parse non-predict URLs (so users get a
+// useful "not a Predict.fun URL" error instead of a silent failure).
+export function isAllowedPredictHost(input) {
+  try {
+    const u = new URL(String(input));
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    return u.hostname === 'predict.fun' || u.hostname.endsWith('.predict.fun');
+  } catch {
+    return false;
+  }
+}
+
 // Predict.fun's GraphQL Market type doesn't expose any URL slug field
 // (verified via introspection — no slug / marketSlug / categorySlug).
 // REST `/v1/markets` requires PREDICT_API_KEY. So when the user pastes
@@ -79,6 +93,10 @@ function collectMarketLikeObjects(node, out, seen) {
 // embedded in it. Works for /event/<slug>, /market/<slug>, and any
 // other SSR page that renders markets. `meta` returned for diagnostics.
 export async function extractMarketsFromHtml(url) {
+  // SSRF defence — never fetch arbitrary URLs the user might paste.
+  if (!isAllowedPredictHost(url)) {
+    throw new Error('refusing to fetch non-predict.fun host');
+  }
   const html = await fetchJson(url, {
     method: 'GET',
     headers: {
@@ -215,6 +233,12 @@ async function resolveSlugViaCategories(originalSlug) {
 //      kept for non-CF deployments)
 //   3. Cached slug-based 5-tier matcher
 export async function resolveUrlToMarkets(input) {
+  const isUrl = /^https?:\/\//i.test(String(input).trim());
+  // SSRF defence — refuse full URLs that don't point at predict.fun.
+  // Bare slugs / marketIds still go through (no fetch on user input).
+  if (isUrl && !isAllowedPredictHost(input)) {
+    return { markets: [], source: 'blocked-non-predict-host' };
+  }
   const slug = extractSlugFromUrl(input);
   // Tier 1: GraphQL categorySlug resolver — works for the slug regardless
   // of what the bot's market list looks like, and handles event pages.
@@ -227,7 +251,6 @@ export async function resolveUrlToMarkets(input) {
     }
   }
   // Tier 2: HTML scrape (may be blocked by Cloudflare on predict.fun).
-  const isUrl = /^https?:\/\//i.test(String(input).trim());
   if (isUrl) {
     try {
       const { markets, meta } = await extractMarketsFromHtml(input);
