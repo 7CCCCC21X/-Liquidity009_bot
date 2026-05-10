@@ -271,6 +271,79 @@ export function fmtSinceInitialLines(initial, snap, levels, mode = 'both') {
 
 // Single-line headline summarising what kind of change triggered the
 // alert. Kept short — the per-level deltas in fmtBook carry the details.
+// Build a high-contrast alert headline: a colored emoji + bold
+// one-line change summary. The FIRST line of the message — drives both
+// the in-chat visual distinction and the iOS/Android notification
+// preview banner. Distinct from ✅ subscribe-success and 🔍 probe so
+// the user can tell at a glance what kind of message just arrived.
+//
+// Emoji legend:
+//   🟢  price up (single level or all moves up)
+//   🔴  price down (single level or all moves down)
+//   🟡  size-only change, or 新挂/撤单 (no price direction)
+//   🔔  multi-level mixed up+down
+export function fmtAlertHeadline(prev, snap, levels, mode = 'both') {
+  if (!prev) return { emoji: '🆕', text: '初次抓取' };
+  const changes = [];
+  for (const k of levels) {
+    const p = getLevel(prev, k);
+    const c = getLevel(snap, k);
+    if (!levelDiff(p, c, mode)) continue;
+    changes.push({ k, p, c });
+  }
+  if (changes.length === 0) return { emoji: '🔔', text: '深度变动' };
+
+  // Single change → headline carries the entire delta verbatim.
+  if (changes.length === 1) {
+    const { k, p, c } = changes[0];
+    const label = LEVEL_LABEL[k] ?? k;
+    if (!p && c) {
+      return { emoji: '🟡', text: `${label} 新挂 ${c.price.toFixed(4)} × ${c.size.toLocaleString('en-US')}` };
+    }
+    if (p && !c) {
+      return { emoji: '🟡', text: `${label} 撤单 ${p.price.toFixed(4)}` };
+    }
+    const dp = c.price - p.price;
+    const ds = c.size - p.size;
+    if (mode !== 'size' && Math.abs(dp) >= 1e-9) {
+      const arrow = dp > 0 ? '↑' : '↓';
+      const emoji = dp > 0 ? '🟢' : '🔴';
+      return { emoji, text: `${label} ${arrow}${Math.abs(dp).toFixed(4)}` };
+    }
+    if (mode !== 'price' && Math.abs(ds) >= 1) {
+      const arrow = ds > 0 ? '↑' : '↓';
+      const fmt = Math.abs(ds).toLocaleString('en-US', { maximumFractionDigits: 0 });
+      return { emoji: '🟡', text: `${label} 量${arrow}${fmt}` };
+    }
+    return { emoji: '🔔', text: `${label} 变动` };
+  }
+
+  // Multi-level — pick dominant direction across watched levels.
+  let priceUp = 0, priceDown = 0;
+  let biggestSignedDp = 0;
+  for (const { p, c } of changes) {
+    if (!p || !c) continue;
+    const dp = c.price - p.price;
+    if (Math.abs(dp) < 1e-9) continue;
+    if (dp > 0) priceUp++; else priceDown++;
+    if (Math.abs(dp) > Math.abs(biggestSignedDp)) biggestSignedDp = dp;
+  }
+  let emoji = '🔔';
+  if (priceUp > 0 && priceDown === 0) emoji = '🟢';
+  else if (priceDown > 0 && priceUp === 0) emoji = '🔴';
+  else if (priceUp === 0 && priceDown === 0) emoji = '🟡';
+
+  const parts = [`${changes.length} 档变动`];
+  if (Math.abs(biggestSignedDp) >= 1e-9) {
+    const arrow = biggestSignedDp > 0 ? '↑' : '↓';
+    parts.push(`最大 ${arrow}${Math.abs(biggestSignedDp).toFixed(4)}`);
+  }
+  return { emoji, text: parts.join(' · ') };
+}
+
+// Single-line headline (legacy) used for the persisted history record.
+// Same data as fmtAlertHeadline but in plain text form so old
+// /history viewers still see something useful.
 function fmtHeadline(prev, cur, levels, mode = 'both') {
   if (!prev) return '🆕 初次抓取';
   let nChanges = 0;
@@ -405,16 +478,24 @@ async function pollOnce() {
       if (!bookChanged(prev, snap, levels, mode)) continue;
       const lastSentAt = lastNotify.get(k) ?? 0;
       if (prev && now - lastSentAt < config.notifyCooldownMs) continue;
-      const headline = fmtHeadline(prev, snap, levels, mode);
+      const alertHead = fmtAlertHeadline(prev, snap, levels, mode);
+      const headlineText = `${alertHead.emoji} ${alertHead.text}`;
       const body = fmtBook(prev, snap, levels);
       const spreadLine = fmtSpreadLine(snap);
       const changeLines = fmtChangeLines(prev, snap, levels, mode);
       const sinceInitialLines = fmtSinceInitialLines(s.initial, snap, levels, mode);
       const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
-      const lines = [`<b>📊 ${titleLink}</b>`];
+      // Layout: high-contrast emoji+bold change FIRST so the chat
+      // visually pops vs subscribe-success (✅) and probe (🔍), and
+      // the iOS/Android notification banner shows the actionable bit.
+      // Title link below for context.
+      const lines = [`${alertHead.emoji} <b>${htmlEscape(alertHead.text)}</b>`];
+      lines.push(`📊 ${titleLink}`);
       if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
-      lines.push(`<i>${htmlEscape(headline)}</i>`);
-      if (changeLines.length) {
+      // Skip the "本次变动" detail block when the headline already
+      // says it (single-level change). Keep it for multi-level so
+      // each row's delta is visible.
+      if (changeLines.length >= 2) {
         lines.push('');
         lines.push('<b>本次变动</b>');
         for (const l of changeLines) lines.push(`<code>${l}</code>`);
@@ -443,7 +524,7 @@ async function pollOnce() {
           title: s.title || null,
           note: s.note || null,
           levels,
-          summary: headline,
+          summary: headlineText,
           // Save full top-3 in both prev and cur so /history can show
           // changes on bid2/3 + ask2/3 too. Old records still parse —
           // /history's renderer falls back to bestBid/bestAsk only.

@@ -298,21 +298,28 @@ async function promptForNote(chatId, marketId) {
   await saveState();
 }
 
-function buildChoiceKeyboard(token, matches, selected = []) {
+function buildChoiceKeyboard(token, matches, selected = [], existingIds = new Set()) {
   const sel = new Set(selected);
   const rows = [];
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i];
     // Number prefix + #id suffix disambiguates same-titled cards
     // (events with multiple sub-markets share Yes/No/Draw labels).
-    // Telegram button text caps at ~64 chars; trim title to fit the
-    // ✅/⬜ checkbox + prefix + id without overflow.
+    // 🟢 suffix flags markets the user already has a subscription for
+    // — clicking such a row "re-subscribes" but addSubscription
+    // preserves the existing levels/note/triggerMode.
+    // Telegram button text caps at ~64 chars; trim title to fit.
     const rawTitle = (m.title || m.question || `#${m.id}`).replace(/\s+/g, ' ').trim();
     const idSuffix = ` · #${m.id}`;
     const checkbox = sel.has(i) ? '✅' : '⬜';
-    const titleBudget = 64 - 2 /* checkbox+space */ - String(i + 1).length - 2 - idSuffix.length;
+    const monitoringSuffix = existingIds.has(String(m.id)) ? ' 🟢' : '';
+    const titleBudget = 64 - 2 /* checkbox+space */ - String(i + 1).length - 2
+                          - idSuffix.length - monitoringSuffix.length;
     const title = rawTitle.length > titleBudget ? rawTitle.slice(0, titleBudget - 1) + '…' : rawTitle;
-    rows.push([{ text: `${checkbox} ${i + 1}. ${title}${idSuffix}`, callback_data: `pick:${token}:t:${i}` }]);
+    rows.push([{
+      text: `${checkbox} ${i + 1}. ${title}${idSuffix}${monitoringSuffix}`,
+      callback_data: `pick:${token}:t:${i}`,
+    }]);
   }
   rows.push([
     { text: '✅ 全选', callback_data: `pick:${token}:all` },
@@ -325,11 +332,26 @@ function buildChoiceKeyboard(token, matches, selected = []) {
   return { inline_keyboard: rows };
 }
 
-function buildChoiceHeaderText(matches, selectedCount) {
+function buildChoiceHeaderText(matches, selectedCount, existingCount = 0) {
+  const existingHint = existingCount
+    ? ` · 🟢 ${existingCount} 个已在监控（再次勾选会刷新信息，不会动档位/备注）`
+    : '';
   return [
     `🔎 识别出 <b>${matches.length}</b> 个市场卡片，请<b>勾选</b>要监控的：`,
-    `<i>已选 <b>${selectedCount}</b> 个 · 可全选或多选 · 30 分钟内有效</i>`,
+    `<i>已选 <b>${selectedCount}</b> 个${existingHint} · 30 分钟内有效</i>`,
   ].join('\n');
+}
+
+// Helper: which marketIds in this match list are already subscribed
+// in this chat. Recomputed on every render so it stays current after
+// the user stops a sub from a different message during the picker
+// session.
+function existingMatchIds(chatId, matches) {
+  const out = new Set();
+  for (const m of matches) {
+    if (getSubscription(chatId, m.id)) out.add(String(m.id));
+  }
+  return out;
 }
 
 // Single source of truth for the pick:<token>:<action> callback router.
@@ -395,12 +417,13 @@ async function handlePickCallback(chatId, messageId, callbackId, token, action) 
 
 async function refreshChoiceKeyboard(chatId, messageId, token, matches, selected) {
   if (!messageId) return;
+  const existingIds = existingMatchIds(chatId, matches);
   try {
     await editMessageText(
       chatId,
       messageId,
-      buildChoiceHeaderText(matches, selected.length),
-      buildChoiceKeyboard(token, matches, selected),
+      buildChoiceHeaderText(matches, selected.length, existingIds.size),
+      buildChoiceKeyboard(token, matches, selected, existingIds),
     );
   } catch { /* edit may fail on old messages — ignore */ }
 }
@@ -500,11 +523,12 @@ async function handleUrl(chatId, text, { initialNote = null } = {}) {
       const token = shortToken();
       putPendingChoice(chatId, token, suggestions, []);
       await saveState();
+      const existingIds = existingMatchIds(chatId, suggestions);
       await sendMessage(chatId, [
         `❓ 没找到完全匹配 slug=<code>${htmlEscape(slug)}</code>，下面是相似的市场：`,
         ``,
-        buildChoiceHeaderText(suggestions, 0).split('\n').slice(1).join('\n'),
-      ].join('\n'), { replyMarkup: buildChoiceKeyboard(token, suggestions, []) });
+        buildChoiceHeaderText(suggestions, 0, existingIds.size).split('\n').slice(1).join('\n'),
+      ].join('\n'), { replyMarkup: buildChoiceKeyboard(token, suggestions, [], existingIds) });
       return;
     }
     await sendMessage(chatId, [
@@ -537,8 +561,9 @@ async function handleUrl(chatId, text, { initialNote = null } = {}) {
   const token = shortToken();
   putPendingChoice(chatId, token, matches, []);
   await saveState();
-  await sendMessage(chatId, buildChoiceHeaderText(matches, 0), {
-    replyMarkup: buildChoiceKeyboard(token, matches, []),
+  const existingIds = existingMatchIds(chatId, matches);
+  await sendMessage(chatId, buildChoiceHeaderText(matches, 0, existingIds.size), {
+    replyMarkup: buildChoiceKeyboard(token, matches, [], existingIds),
   });
 }
 
