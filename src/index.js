@@ -10,7 +10,8 @@ import {
   putPendingChoice, peekPendingChoice, takePendingChoice, gcPendingChoices,
   putPendingNote, takePendingNote, gcPendingNotes,
   putPendingWatch, takePendingWatch, gcPendingWatch,
-  getChatSettings, setChatDigest,
+  putPendingPrompt, takePendingPrompt, gcPendingPrompts,
+  getChatSettings, setChatDigest, setChatQuiet, isChatInQuietHours,
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
@@ -60,6 +61,7 @@ const HELP_DETAIL = [
   '/levels &lt;id&gt; — 自定义档位 + 触发模式（价+量 / 只看价 / 只看量）',
   '/note &lt;id&gt; — 弹输入框输入备注（或 /note &lt;id&gt; 文字 直接设；/note &lt;id&gt; - 清除）',
   '/digest [时长] — 定期摘要，例 <code>/digest 30m</code>；不带参数显示当前 + 立即来一份',
+  '/quiet &lt;HH:MM-HH:MM&gt; — 勿扰时段（例 23:00-08:00），勿扰期间只写历史不推送',
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
   '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
@@ -100,6 +102,12 @@ function parseDurationMs(raw) {
   const unit = (m[2] ?? 'm').toLowerCase();
   const mult = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[unit];
   return mult ? Math.round(n * mult) : null;
+}
+
+function fmtMinOfDay(min) {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
 function fmtRelativeRemaining(untilMs) {
@@ -237,6 +245,46 @@ function thresholdHeader(sub) {
   ].join('\n');
 }
 
+// Render the "📝 …" line that appears under titles in /list, alert,
+// probe, subscribe-success, etc. Returns null when there's nothing to
+// show. Tags come before note text and are rendered as hashtags so
+// /list #tag filters and the chat-side search both stay obvious.
+// /list search predicate. `#tag` form filters exactly on sub.tags
+// (case-insensitive); anything else does substring on title / note /
+// marketId. Tags + plain text can be mixed: "#主仓 btc" matches subs
+// tagged 主仓 AND whose title/note/id contain "btc".
+function filterSubsBySearch(subs, search) {
+  if (!search) return subs;
+  const tokens = String(search).split(/\s+/).filter(Boolean);
+  const tagFilters = [];
+  const textFilters = [];
+  for (const t of tokens) {
+    if (t.startsWith('#') && t.length > 1) tagFilters.push(t.slice(1).toLowerCase());
+    else textFilters.push(t.toLowerCase());
+  }
+  return subs.filter((s) => {
+    const tagsLower = (s.tags ?? []).map((x) => String(x).toLowerCase());
+    for (const t of tagFilters) {
+      if (!tagsLower.includes(t)) return false;
+    }
+    for (const t of textFilters) {
+      const hay = `${(s.title || '').toLowerCase()} ${(s.note || '').toLowerCase()} ${s.marketId}`;
+      if (!hay.includes(t)) return false;
+    }
+    return true;
+  });
+}
+
+function fmtNoteLine(sub) {
+  const tags = Array.isArray(sub?.tags) ? sub.tags : [];
+  const note = sub?.note ? String(sub.note) : '';
+  if (!tags.length && !note) return null;
+  const tagStr = tags.length ? tags.map((t) => `#${htmlEscape(t)}`).join(' ') : '';
+  if (tagStr && note) return `📝 <i>${tagStr} ${htmlEscape(note)}</i>`;
+  if (tagStr) return `📝 <i>${tagStr}</i>`;
+  return `📝 <i>${htmlEscape(note)}</i>`;
+}
+
 function buildLevelsKeyboard(marketId, levels, triggerMode) {
   const set = new Set(levels);
   const btn = (k) => ({
@@ -316,7 +364,7 @@ async function sendSubscribed(chatId, m, { wasExisting = false, askForNote = tru
     `🏷 ${marketLink(titleText, linkSlug)}`,
     `<code>id=${m.id}</code>`,
   ];
-  if (sub?.note) lines.push(`📝 <i>${htmlEscape(sub.note)}</i>`);
+  { const nl = fmtNoteLine(sub); if (nl) lines.push(nl); }
   lines.push(`📐 档位：${levels.map((l) => LEVEL_LABEL[l]).join('/')} · 触发：${TRIGGER_LABEL[mode] ?? '价+量'}`);
   if (snap) {
     lines.push('');
@@ -686,7 +734,9 @@ async function handleCommand(chatId, text) {
     let id = args[0];
     if (!id && /^\/probe_\d+$/.test(c)) id = c.slice('/probe_'.length);
     if (!id) {
-      await sendMessage(chatId, '用法：/probe &lt;marketId&gt;\n立即抓一次订单簿（不等下次轮询）。');
+      await promptCommandTarget(chatId, 'probe', {
+        headline: '<b>🔍 即时抓取</b>  <i>回复要抓的市场</i>',
+      });
       return true;
     }
     await runProbe(chatId, id);
@@ -736,7 +786,9 @@ async function handleCommand(chatId, text) {
     let id = args[0];
     if (!id && /^\/levels_\d+$/.test(c)) id = c.slice('/levels_'.length);
     if (!id) {
-      await sendMessage(chatId, '用法：/levels &lt;marketId&gt;\n（可以从 /list 里复制 id）');
+      await promptCommandTarget(chatId, 'levels', {
+        headline: '<b>📐 改档位 + 触发模式</b>  <i>回复要改的市场</i>',
+      });
       return true;
     }
     const sub = getSubscription(chatId, id);
@@ -757,23 +809,16 @@ async function handleCommand(chatId, text) {
       n = Number(args[0]);
     }
     if (!id) {
-      await sendMessage(chatId, '用法：/history &lt;marketId&gt; [N]\n查看该市场最近 N 条变动记录（默认 10，最多 50）。');
+      // No id → prompt the user to reply with URL/id/slug.
+      await promptCommandTarget(chatId, 'history', {
+        args: { n: Number.isFinite(n) && n > 0 ? Math.min(50, Math.floor(n)) : 10 },
+        headline: '<b>📜 历史变动</b>  <i>回复要查的市场</i>',
+      });
       return true;
     }
     if (!Number.isFinite(n) || n <= 0) n = 10;
     n = Math.min(50, Math.floor(n));
-    const events = await readEvents({ chatId, marketId: id, limit: n });
-    if (!events.length) {
-      await sendMessage(chatId, `没有 <code>${htmlEscape(id)}</code> 的历史记录。`);
-      return true;
-    }
-    const lines = [
-      `<b>📜 ${marketLink(events[0].title || `Market ${id}`, events[0].slug)}</b>`,
-      `<i>最近 ${events.length} 条变动（新→旧）· /export 拿完整文件</i>`,
-      '',
-    ];
-    for (const e of events) lines.push(fmtHistoryEntry(e));
-    await sendMessage(chatId, lines.join('\n'));
+    await runHistoryView(chatId, id, n);
     return true;
   }
   if (c === '/export') {
@@ -894,7 +939,9 @@ async function handleCommand(chatId, text) {
     let id = args[0];
     if (/^\/threshold_\d+$/.test(c)) id = c.slice('/threshold_'.length);
     if (!id) {
-      await sendMessage(chatId, '用法：/threshold &lt;marketId&gt;\n（点订阅卡片上的 📐 档位 → 也能调阈值）');
+      await promptCommandTarget(chatId, 'threshold', {
+        headline: '<b>🎚 改阈值</b>  <i>回复要改的市场</i>',
+      });
       return true;
     }
     const sub = getSubscription(chatId, id);
@@ -912,11 +959,57 @@ async function handleCommand(chatId, text) {
     let id = args[0];
     if (/^\/stats_\d+$/.test(c)) id = c.slice('/stats_'.length);
     if (!id) {
-      await sendMessage(chatId, '用法：/stats &lt;marketId&gt; [小时数=24]');
+      const hours = Math.max(1, Math.min(24 * 30, Number(args[0]) || 24));
+      await promptCommandTarget(chatId, 'stats', {
+        args: { hours },
+        headline: `<b>📊 市场统计</b>  <i>回复要查的市场（窗口 ${hours}h）</i>`,
+      });
       return true;
     }
     const hours = Math.max(1, Math.min(24 * 30, Number(args[1] ?? args[0]) || 24));
     await runStats(chatId, id, hours);
+    return true;
+  }
+  if (c === '/quiet') {
+    const arg = args[0];
+    const settings = getChatSettings(chatId);
+    if (!arg) {
+      const cur = (settings?.quietStartMin != null && settings?.quietEndMin != null)
+        ? `${fmtMinOfDay(settings.quietStartMin)}-${fmtMinOfDay(settings.quietEndMin)}`
+        : '未设置';
+      const inside = isChatInQuietHours(chatId);
+      await sendMessage(chatId, [
+        `<b>🌙 勿扰时段</b>  (${config.displayTzLabel || config.displayTz})`,
+        `当前：${cur}${inside ? ' · <b>正在勿扰中</b>' : ''}`,
+        '',
+        '<b>用法</b>',
+        '<code>/quiet 23:00-08:00</code>  — 跨天勿扰',
+        '<code>/quiet 12:00-14:00</code>  — 中午勿扰',
+        '<code>/quiet off</code>          — 关闭',
+        '',
+        '<i>勿扰期间订单簿变化只写历史、不发即时通知；用 /digest 或 /history 回看。</i>',
+      ].join('\n'));
+      return true;
+    }
+    if (arg === 'off' || arg === '0') {
+      setChatQuiet(chatId, null, null);
+      await saveState();
+      await sendMessage(chatId, '✓ 已关闭勿扰时段。');
+      return true;
+    }
+    const m = arg.match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/);
+    if (!m) {
+      await sendMessage(chatId, '用法：<code>/quiet 23:00-08:00</code> 或 <code>/quiet off</code>');
+      return true;
+    }
+    const sh = Number(m[1]), sm = Number(m[2]), eh = Number(m[3]), em = Number(m[4]);
+    if (sh > 23 || sm > 59 || eh > 23 || em > 59) {
+      await sendMessage(chatId, '❌ 小时 0-23、分钟 0-59');
+      return true;
+    }
+    setChatQuiet(chatId, sh * 60 + sm, eh * 60 + em);
+    await saveState();
+    await sendMessage(chatId, `🌙 已设勿扰 <b>${sh.toString().padStart(2,'0')}:${m[2]}-${eh.toString().padStart(2,'0')}:${m[4]}</b> (${config.displayTzLabel || config.displayTz})\n<i>勿扰期间订单簿变化只写历史，不发即时通知。</i>`);
     return true;
   }
   if (c === '/digest') {
@@ -1039,8 +1132,9 @@ async function handleMessage(msg) {
   if (!isAllowedChat(chatId)) { await denyChat(chatId); return; }
 
   // Reply-to-prompt path: if the user is replying to one of our
-  // ForceReply prompts (note or watch), route the message to the
-  // matching handler instead of treating it as a fresh subscription.
+  // ForceReply prompts (note / watch / generic command-target),
+  // route the message to the matching handler instead of treating
+  // it as a fresh subscription.
   const replyTo = msg.reply_to_message?.message_id;
   if (replyTo) {
     const marketId = takePendingNote(chatId, replyTo);
@@ -1050,6 +1144,11 @@ async function handleMessage(msg) {
     }
     if (takePendingWatch(chatId, replyTo)) {
       await applyBulkWatchInput(chatId, text);
+      return;
+    }
+    const prompt = takePendingPrompt(chatId, replyTo);
+    if (prompt) {
+      await resolveAndDispatchPrompt(chatId, text, prompt.cmd, prompt.args ?? {});
       return;
     }
   }
@@ -1135,11 +1234,7 @@ async function renderListView(chatId, page = 0, { onlyPaused = false, search = n
   let subs = listSubscriptionsForChat(chatId);
   if (onlyPaused) subs = subs.filter((s) => s.pausedUntil && s.pausedUntil > Date.now());
   if (search) {
-    const q = search.toLowerCase();
-    subs = subs.filter((s) =>
-      (s.title || '').toLowerCase().includes(q)
-      || (s.note || '').toLowerCase().includes(q)
-      || String(s.marketId).includes(q));
+    subs = filterSubsBySearch(subs, search);
   }
   if (!subs.length) {
     await sendMessage(chatId, onlyPaused
@@ -1169,7 +1264,7 @@ async function renderListView(chatId, page = 0, { onlyPaused = false, search = n
       `档位：${levels} · 触发：${mode}`,
     ];
     if (isPaused) lines.push(`<i>⏸ 已暂停，${fmtRelativeRemaining(s.pausedUntil)}后恢复 · /resume_${s.marketId}</i>`);
-    if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
+    { const nl = fmtNoteLine(s); if (nl) lines.push(nl); }
     await sendMessage(chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(s.marketId) });
   }
 
@@ -1186,13 +1281,7 @@ async function renderListView(chatId, page = 0, { onlyPaused = false, search = n
 // note / id substring.
 async function renderListCompact(chatId, search = null) {
   let subs = listSubscriptionsForChat(chatId);
-  if (search) {
-    const q = String(search).toLowerCase();
-    subs = subs.filter((s) =>
-      (s.title || '').toLowerCase().includes(q)
-      || (s.note || '').toLowerCase().includes(q)
-      || String(s.marketId).includes(q));
-  }
+  if (search) subs = filterSubsBySearch(subs, search);
   if (!subs.length) {
     await sendMessage(chatId, search ? `没有匹配 "${htmlEscape(search)}" 的订阅。` : '当前没有订阅。');
     return;
@@ -1217,6 +1306,157 @@ async function renderListCompact(chatId, search = null) {
 // /stats <id> [hours] — computes per-market activity stats from the
 // JSONL history. All four ad-hoc metrics the review asked for, in
 // one screen.
+async function runHistoryView(chatId, marketId, n = 10) {
+  const events = await readEvents({ chatId, marketId, limit: n });
+  if (!events.length) {
+    await sendMessage(chatId, `没有 <code>${htmlEscape(marketId)}</code> 的历史记录。`);
+    return;
+  }
+  const lines = [
+    `<b>📜 ${marketLink(events[0].title || `Market ${marketId}`, events[0].slug)}</b>`,
+    `<i>最近 ${events.length} 条变动（新→旧）· /export 拿完整文件</i>`,
+    '',
+  ];
+  for (const e of events) lines.push(fmtHistoryEntry(e));
+  await sendMessage(chatId, lines.join('\n'));
+}
+
+// Send a ForceReply prompt asking the user to reply with a URL /
+// marketId / slug. Reply text is parsed by handleMessage's reply
+// branch via takePendingPrompt → resolveAndDispatchPrompt. Greatly
+// reduces the "memorise marketId" friction — user can just paste
+// the Predict.fun URL and the bot handles the rest.
+async function promptCommandTarget(chatId, cmd, { args = {}, headline, hint, placeholder } = {}) {
+  const lines = [
+    headline,
+    '',
+    hint || '<b>📝 回复此条消息</b>，发送 URL / marketId / slug',
+    '<i>不用再输入命令；30 分钟内有效。</i>',
+    '',
+    '<b>💡 格式示例</b>',
+    '<code>https://predict.fun/zh-cn/market/foo</code>',
+    '<code>272779</code>',
+    '<code>btc-eom-2026</code>',
+  ];
+  const sent = await sendMessage(chatId, lines.filter(Boolean).join('\n'), {
+    replyMarkup: { force_reply: true, selective: true, input_field_placeholder: placeholder || 'URL/id/slug' },
+  });
+  putPendingPrompt(chatId, sent.message_id, cmd, args);
+  await saveState();
+}
+
+// Resolve the user's reply text to a single marketId, then dispatch
+// to the cmd handler with the saved args. Used by every URL-aware
+// reply prompt (/stats /history /probe /threshold /levels).
+async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
+  const trimmed = String(replyText ?? '').trim();
+  if (!trimmed) {
+    await sendMessage(chatId, '❌ 回复内容为空。');
+    return;
+  }
+  // First try: pure numeric marketId.
+  let marketId = extractMarketId(trimmed);
+  if (!marketId) {
+    // Else try URL / slug resolution.
+    try {
+      const r = await resolveUrlToMarkets(trimmed);
+      if (r.markets.length === 1) {
+        marketId = r.markets[0].id;
+      } else if (r.markets.length > 1) {
+        await sendMessage(chatId, [
+          `🔎 识别出 <b>${r.markets.length}</b> 个子市场，请直接发送某一个子市场的 id 或单页 URL。`,
+          `<i>（事件页含多个子市场无法定位单一目标）</i>`,
+        ].join('\n'));
+        return;
+      }
+    } catch (err) {
+      await sendMessage(chatId, `❌ 解析失败：${htmlEscape(err.message)}`);
+      return;
+    }
+  }
+  if (!marketId) {
+    await sendMessage(chatId, `❌ 无法识别 <code>${htmlEscape(trimmed.slice(0, 80))}</code> — 请回复 URL、marketId 或 slug。`);
+    return;
+  }
+  // Dispatch.
+  switch (cmd) {
+    case 'stats':
+      await runStats(chatId, marketId, args.hours ?? 24);
+      return;
+    case 'history':
+      await runHistoryView(chatId, marketId, args.n ?? 10);
+      return;
+    case 'probe':
+      await runProbe(chatId, marketId);
+      return;
+    case 'threshold': {
+      const sub = getSubscription(chatId, marketId);
+      if (!sub) {
+        await sendMessage(chatId, `❌ 没有订阅 <code>${marketId}</code>，先发 URL 订阅它。`);
+        return;
+      }
+      await sendMessage(chatId, thresholdHeader(sub), { replyMarkup: buildThresholdKeyboard(marketId, detectThresholdPreset(sub)) });
+      return;
+    }
+    case 'levels': {
+      const sub = getSubscription(chatId, marketId);
+      if (!sub) {
+        await sendMessage(chatId, `❌ 没有订阅 <code>${marketId}</code>，先发 URL 订阅它。`);
+        return;
+      }
+      await sendMessage(chatId, levelsHeader(sub), { replyMarkup: buildLevelsKeyboard(sub.marketId, sub.levels, sub.triggerMode) });
+      return;
+    }
+    case 'note': {
+      const sub = getSubscription(chatId, marketId);
+      if (!sub) {
+        await sendMessage(chatId, `❌ 没有订阅 <code>${marketId}</code>，先发 URL 订阅它。`);
+        return;
+      }
+      await promptForNote(chatId, marketId);
+      return;
+    }
+    case 'pause': {
+      const sub = getSubscription(chatId, marketId);
+      if (!sub) {
+        await sendMessage(chatId, `❌ 没有订阅 <code>${marketId}</code>。`);
+        return;
+      }
+      const durMs = parseDurationMs(args.duration) ?? 60 * 60 * 1000;
+      const untilMs = Date.now() + durMs;
+      setSubscriptionPause(chatId, marketId, untilMs);
+      await saveState();
+      await sendMessage(chatId, [
+        `⏸ 已暂停 <code>${marketId}</code>  ${htmlEscape(sub.title || '')}`,
+        `<i>${fmtRelativeRemaining(untilMs)}后自动恢复</i>`,
+      ].join('\n'));
+      return;
+    }
+    case 'stop': {
+      const sub = getSubscription(chatId, marketId);
+      if (!sub) {
+        await sendMessage(chatId, `❌ 没有订阅 <code>${marketId}</code>。`);
+        return;
+      }
+      // Confirmation flow — reuse the existing unsub:<id> callback
+      // path so the experience matches the button.
+      await sendMessage(chatId, [
+        `⚠️ <b>确认停止监控？</b>`,
+        `🏷 ${marketLink(sub.title || `Market ${marketId}`, sub.slug)}`,
+        `<code>id=${marketId}</code>`,
+      ].join('\n'), {
+        replyMarkup: { inline_keyboard: [[
+          { text: '✅ 确认停止', callback_data: `unsub_ok:${marketId}` },
+          { text: '↩️ 返回',     callback_data: 'noop' },
+        ]] },
+      });
+      return;
+    }
+    default:
+      await sendMessage(chatId, '❌ 未知命令分支。');
+  }
+}
+
 async function runStats(chatId, marketId, hours = 24) {
   const cutoff = Date.now() - hours * 3600 * 1000;
   // readEvents tail-limits to limit; use a generous cap so the
@@ -1303,7 +1543,7 @@ async function runProbe(chatId, marketId) {
   const text = [
     `<b>🔍 即时抓取</b>  <i>(${latency}ms)</i>`,
     `<b>${marketLink(title, sub?.slug)}</b>  <code>id=${marketId}</code>`,
-    sub?.note ? `📝 <i>${htmlEscape(sub.note)}</i>` : null,
+    fmtNoteLine(sub),
     '',
     fmtSpreadLine(snap),
     '',
@@ -1649,7 +1889,7 @@ async function handleCallback(cb) {
             `⚠️ <b>确认停止监控？</b>`,
             `🏷 ${marketLink(sub.title || `Market ${id}`, sub.slug)}`,
             `<code>id=${id}</code>`,
-            sub.note ? `📝 <i>${htmlEscape(sub.note)}</i>` : null,
+            fmtNoteLine(sub),
             ``,
             `<i>停止后历史记录保留；如需重新监控，再发一次同样的网址或 id。</i>`,
           ].filter(Boolean).join('\n'),
@@ -1698,7 +1938,7 @@ async function handleCallback(cb) {
         `<code>id=${sub.marketId}</code>`,
         `档位：${levels} · 触发：${mode}`,
       ];
-      if (sub.note) lines.push(`📝 <i>${htmlEscape(sub.note)}</i>`);
+      { const nl = fmtNoteLine(sub); if (nl) lines.push(nl); }
       try {
         await editMessageText(chatId, messageId, lines.join('\n'), subActionKeyboard(sub.marketId));
       } catch { /* ignore */ }
@@ -1908,6 +2148,7 @@ async function pollUpdates(signal) {
     gcPendingChoices();
     gcPendingNotes();
     gcPendingWatch();
+    gcPendingPrompts();
   }
 }
 
@@ -1930,6 +2171,7 @@ async function main() {
     { command: 'threshold', description: '改单市场灵敏度（低/平衡/高频）' },
     { command: 'pause',     description: '暂停推送（默认 1h）' },
     { command: 'resume',    description: '恢复推送' },
+    { command: 'quiet',     description: '勿扰时段，例 23:00-08:00' },
     { command: 'digest',    description: '定期摘要（防遗漏盘口）' },
     { command: 'status',    description: 'Bot 健康状态' },
     { command: 'export',    description: '导出 history.jsonl' },

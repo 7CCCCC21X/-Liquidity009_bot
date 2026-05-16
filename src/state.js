@@ -52,6 +52,7 @@ function emptyState() {
   return {
     subs: {},
     pendingChoices: {}, pendingNotes: {}, pendingWatch: {},
+    pendingPrompt: {},
     chatSettings: {},
     telegramOffset: 0,
   };
@@ -77,6 +78,7 @@ export async function loadState() {
     if (!_state.pendingChoices) _state.pendingChoices = {};
     if (!_state.pendingNotes) _state.pendingNotes = {};
     if (!_state.pendingWatch) _state.pendingWatch = {};
+    if (!_state.pendingPrompt) _state.pendingPrompt = {};
     if (!_state.chatSettings) _state.chatSettings = {};
   } catch (err) {
     if (err.code !== 'ENOENT') console.warn(new Date().toISOString(), '[state] load failed:', err.message);
@@ -197,11 +199,38 @@ export function pauseAllForChat(chatId, untilMs) {
   return n;
 }
 
+// Pull #tags out of the note text. "#主仓 #BTC 套利目标 0.45" →
+// { note: "套利目标 0.45", tags: ["主仓", "BTC"] }. Single source of
+// truth — user types one string; /list #tag filters on the parsed tag
+// list. Dedup case-sensitively (so "#BTC" and "#btc" stay separate;
+// tag matching at read time normalises case).
+export function parseNoteText(raw) {
+  if (!raw) return { note: '', tags: [] };
+  const tags = [];
+  const stripped = String(raw)
+    .replace(/(?:^|\s)#([^\s#]+)/g, (_, tag) => { tags.push(tag); return ' '; })
+    .replace(/\s+/g, ' ')
+    .trim();
+  const seen = new Set();
+  const unique = [];
+  for (const t of tags) {
+    if (!seen.has(t)) { seen.add(t); unique.push(t); }
+  }
+  return { note: stripped, tags: unique };
+}
+
 export function updateSubscriptionNote(chatId, marketId, note) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
   const trimmed = (note ?? '').toString().trim();
-  s.note = trimmed.length ? trimmed.slice(0, 200) : null;
+  if (!trimmed.length) {
+    s.note = null;
+    s.tags = [];
+    return s;
+  }
+  const { note: cleanNote, tags } = parseNoteText(trimmed);
+  s.note = cleanNote.length ? cleanNote.slice(0, 200) : null;
+  s.tags = tags.slice(0, 16); // cap to keep state file size predictable
   return s;
 }
 
@@ -330,6 +359,33 @@ export function takePendingWatch(chatId, promptMessageId) {
   return entry.expiresAt >= Date.now();
 }
 
+// Generic ForceReply target-prompt tracker. Used by commands that
+// need a marketId / URL / slug as their target (e.g. /stats /history
+// /probe /threshold /levels). When the user replies to the bot's
+// prompt the message handler reads cmd/args from here and dispatches
+// to the right handler with the resolved marketId.
+const PROMPT_TTL_MS = 30 * 60 * 1000;
+export function putPendingPrompt(chatId, promptMessageId, cmd, args = {}) {
+  if (!_state.pendingPrompt) _state.pendingPrompt = {};
+  _state.pendingPrompt[`${chatId}:${promptMessageId}`] = {
+    cmd, args, expiresAt: Date.now() + PROMPT_TTL_MS,
+  };
+}
+export function takePendingPrompt(chatId, promptMessageId) {
+  const k = `${chatId}:${promptMessageId}`;
+  const e = _state.pendingPrompt?.[k];
+  if (!e) return null;
+  delete _state.pendingPrompt[k];
+  if (e.expiresAt < Date.now()) return null;
+  return e;
+}
+export function gcPendingPrompts() {
+  const now = Date.now();
+  for (const [k, v] of Object.entries(_state.pendingPrompt ?? {})) {
+    if (!v?.expiresAt || v.expiresAt < now) delete _state.pendingPrompt[k];
+  }
+}
+
 export function gcPendingWatch() {
   const now = Date.now();
   for (const [k, v] of Object.entries(_state.pendingWatch)) {
@@ -362,6 +418,45 @@ export function setChatDigest(chatId, intervalMs) {
   }
   _state.chatSettings[k] = cur;
   return cur;
+}
+
+// Quiet hours (do-not-disturb). Stored as minutes-of-day (0..1439)
+// in the displayTz. Crossing-midnight windows allowed (start>end).
+// null in either field = disabled.
+export function setChatQuiet(chatId, startMin, endMin) {
+  if (!_state.chatSettings) _state.chatSettings = {};
+  const k = String(chatId);
+  if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
+  if (startMin == null || endMin == null) {
+    delete _state.chatSettings[k].quietStartMin;
+    delete _state.chatSettings[k].quietEndMin;
+  } else {
+    _state.chatSettings[k].quietStartMin = ((startMin % 1440) + 1440) % 1440;
+    _state.chatSettings[k].quietEndMin = ((endMin % 1440) + 1440) % 1440;
+  }
+  return _state.chatSettings[k];
+}
+
+export function isChatInQuietHours(chatId, ms = Date.now()) {
+  const s = _state.chatSettings?.[String(chatId)];
+  if (!s || s.quietStartMin == null || s.quietEndMin == null) return false;
+  const start = s.quietStartMin, end = s.quietEndMin;
+  if (start === end) return false;
+  // Current minute-of-day in the configured timezone.
+  try {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: config.displayTz,
+      hour: 'numeric', minute: 'numeric', hour12: false,
+    });
+    const parts = fmt.formatToParts(new Date(ms));
+    const h = Number(parts.find((p) => p.type === 'hour')?.value ?? 0);
+    const m = Number(parts.find((p) => p.type === 'minute')?.value ?? 0);
+    const cur = h * 60 + m;
+    if (start < end) return cur >= start && cur < end;
+    return cur >= start || cur < end; // crosses midnight
+  } catch {
+    return false;
+  }
 }
 
 export function markChatDigestSent(chatId, atMs = Date.now()) {

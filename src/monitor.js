@@ -4,7 +4,7 @@ import { sendMessage, htmlEscape } from './telegram.js';
 import {
   listAllSubscriptions, removeSubscription, saveState,
   setSubscriptionInitial,
-  getAllChatSettings, markChatDigestSent,
+  getAllChatSettings, markChatDigestSent, isChatInQuietHours,
   ALL_LEVELS, LEVEL_LABEL, subKey,
 } from './state.js';
 import { appendEvent } from './history.js';
@@ -520,7 +520,16 @@ async function pollOnce() {
       // Title link below for context.
       const lines = [`${alertHead.emoji} <b>${htmlEscape(alertHead.text)}</b>`];
       lines.push(`📊 ${titleLink}`);
-      if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
+      {
+        // Note + tags as a single "📝 #tag1 #tag2 note text" line
+        const tags = Array.isArray(s.tags) ? s.tags : [];
+        if (tags.length || s.note) {
+          const tagStr = tags.length ? tags.map((t) => `#${htmlEscape(t)}`).join(' ') : '';
+          const noteText = s.note ? htmlEscape(s.note) : '';
+          const inner = tagStr && noteText ? `${tagStr} ${noteText}` : (tagStr || noteText);
+          lines.push(`📝 <i>${inner}</i>`);
+        }
+      }
       // Skip the "本次变动" detail block when the headline already
       // says it (single-level change). Keep it for multi-level so
       // each row's delta is visible.
@@ -540,8 +549,13 @@ async function pollOnce() {
       lines.push('', `<code>id=${s.marketId}</code>`);
       const text = lines.join('\n');
       const replyMarkup = subActionKeyboard(s.marketId);
+      // Quiet hours: skip the Telegram send but still update baselines
+      // + write history so /digest /history /stats stay accurate.
+      const muted = isChatInQuietHours(s.chatId, now);
       try {
-        await sendMessage(s.chatId, text, { replyMarkup });
+        if (!muted) {
+          await sendMessage(s.chatId, text, { replyMarkup });
+        }
         lastNotify.set(k, now);
         lastBookPerSub.set(k, snap);
         // Persist a structured record of the change. Keep the payload
