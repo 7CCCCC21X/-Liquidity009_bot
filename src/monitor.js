@@ -35,6 +35,21 @@ export function marketLink(title, slug) {
   return url ? `<a href="${url}">${safeTitle}</a>` : safeTitle;
 }
 
+// Predict.fun event markets carry both `title` (the option label like
+// "Jannik Sinner") and `question` (the parent event question like
+// "Madrid Open 2026 winner"). The alert needs both so the option name
+// has context. Returns null when there's nothing extra to show.
+function questionSubtitle(sub) {
+  const q = (sub?.question || '').trim();
+  if (!q) return null;
+  const t = (sub?.title || '').trim();
+  if (!t) return null;
+  if (q === t) return null;
+  // Trim verbose question text to keep the alert tight.
+  const trimmed = q.length > 120 ? `${q.slice(0, 117)}…` : q;
+  return htmlEscape(trimmed);
+}
+
 // Seed the per-sub baseline with a snapshot taken at subscribe time.
 // Without this, the user gets a "🆕 初次抓取" alert on the next poll
 // tick — duplicating the orderbook the subscribe-success message
@@ -520,6 +535,10 @@ async function pollOnce() {
       // Title link below for context.
       const lines = [`${alertHead.emoji} <b>${htmlEscape(alertHead.text)}</b>`];
       lines.push(`📊 ${titleLink}`);
+      {
+        const qSub = questionSubtitle(s);
+        if (qSub) lines.push(`<i>${qSub}</i>`);
+      }
       {
         // Note + tags as a single "📝 #tag1 #tag2 note text" line
         const tags = Array.isArray(s.tags) ? s.tags : [];

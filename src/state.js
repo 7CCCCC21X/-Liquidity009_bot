@@ -141,6 +141,10 @@ export function addSubscription(sub) {
     // — slug drives the clickable URL in messages.
     slug: sub.slug ?? existing?.slug ?? null,
     conditionId: sub.conditionId ?? existing?.conditionId ?? null,
+    // Predict.fun event markets carry both `title` (option name like
+    // "Jannik Sinner") and `question` (event question like "Madrid Open
+    // 2026 winner"). Store both so the alert can show the full context.
+    question: sub.question ?? existing?.question ?? null,
     addedAt: existing?.addedAt ?? Date.now(),
   };
   // Apply per-chat default cooldown to new subs only — existing subs

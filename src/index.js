@@ -365,8 +365,17 @@ async function sendSubscribed(chatId, m, { wasExisting = false, askForNote = tru
   const lines = [
     `${headerEmoji} <b>${headerText}</b>`,
     `🏷 ${marketLink(titleText, linkSlug)}`,
-    `<code>id=${m.id}</code>`,
   ];
+  // Event question (parent title) shown when distinct from option label.
+  {
+    const q = (m.question || '').trim();
+    const t = (titleText || '').trim();
+    if (q && q !== t) {
+      const trimmed = q.length > 120 ? `${q.slice(0, 117)}…` : q;
+      lines.push(`<i>${htmlEscape(trimmed)}</i>`);
+    }
+  }
+  lines.push(`<code>id=${m.id}</code>`);
   { const nl = fmtNoteLine(sub); if (nl) lines.push(nl); }
   lines.push(`📐 档位：${levels.map((l) => LEVEL_LABEL[l]).join('/')} · 触发：${TRIGGER_LABEL[mode] ?? '价+量'}`);
   if (snap) {
@@ -570,6 +579,7 @@ async function commitPickedSubscriptions(chatId, messageId, matches, selectedIdx
       marketId: m.id,
       conditionId: m.conditionId,
       title: m.title || m.question || `Market ${m.id}`,
+      question: m.question ?? null,
       slug: m.slug,
     });
     await saveState();
@@ -593,6 +603,7 @@ async function commitPickedSubscriptions(chatId, messageId, matches, selectedIdx
         marketId: m.id,
         conditionId: m.conditionId,
         title: m.title || m.question || `Market ${m.id}`,
+        question: m.question ?? null,
         slug: m.slug,
       });
       const titleShort = (m.title || m.question || '').slice(0, 50);
@@ -697,6 +708,7 @@ async function handleUrl(chatId, text, { initialNote = null } = {}) {
       marketId: m.id,
       conditionId: m.conditionId,
       title: m.title || m.question || `Market ${m.id}`,
+      question: m.question ?? null,
       slug: m.slug,
       note: initialNote ?? undefined,
     });
@@ -1207,6 +1219,7 @@ async function handleMarketIdInput(chatId, marketId, { initialNote = null } = {}
     marketId: m.id,
     conditionId: m.conditionId,
     title: m.title || m.question || `Market ${m.id}`,
+    question: m.question ?? null,
     slug: m.slug,
     note: initialNote ?? undefined,
   });
@@ -1905,6 +1918,7 @@ async function applyBulkWatchInput(chatId, raw) {
           marketId: id,
           conditionId: market.conditionId ?? null,
           title: market.title || market.question || `Market ${id}`,
+          question: market.question ?? null,
           slug: null,
           note,
         });
@@ -1930,6 +1944,7 @@ async function applyBulkWatchInput(chatId, raw) {
           marketId: m.id,
           conditionId: m.conditionId,
           title: m.title || m.question || `Market ${m.id}`,
+          question: m.question ?? null,
           slug: m.slug,
           note,
         });
