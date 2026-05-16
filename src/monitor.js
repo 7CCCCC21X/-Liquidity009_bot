@@ -60,16 +60,27 @@ export function primeSubscriptionSnapshot(chatId, marketId, snap) {
   });
 }
 
-// Standard 4-button action row attached to every notification + every
-// /list card. The callback handlers for these live in src/index.js.
+// Standard action row attached to every notification + every /list
+// card. The callback handlers for these live in src/index.js.
+//
+// Two rows so the most-common "noise mitigation" actions sit next
+// to the per-sub editors without forcing a "更多" submenu. Quick-
+// mute is the highest-impact UX add — users getting spammed by a
+// hot market can mute it in one tap, no command typing.
 export function subActionKeyboard(marketId) {
   return {
-    inline_keyboard: [[
-      { text: '🔍 抓取', callback_data: `probe:${marketId}` },
-      { text: '📐 档位', callback_data: `lvl:${marketId}:open` },
-      { text: '📝 备注', callback_data: `note:${marketId}` },
-      { text: '🛑 停止', callback_data: `unsub:${marketId}` },
-    ]],
+    inline_keyboard: [
+      [
+        { text: '🔍 抓取', callback_data: `probe:${marketId}` },
+        { text: '📐 档位', callback_data: `lvl:${marketId}:open` },
+        { text: '📝 备注', callback_data: `note:${marketId}` },
+      ],
+      [
+        { text: '⏸ 30m', callback_data: `pause:${marketId}:30m` },
+        { text: '⏸ 2h',  callback_data: `pause:${marketId}:2h` },
+        { text: '🛑 停止', callback_data: `unsub:${marketId}` },
+      ],
+    ],
   };
 }
 
@@ -123,25 +134,41 @@ function getLevel(snap, key) {
 
 // mode: 'both' | 'price' | 'size'. Default 'both' means a change to
 // either price or size triggers; 'price' / 'size' mute the other.
-function levelDiff(prev, cur, mode = 'both') {
+// Resolve effective threshold values for a sub: per-sub override
+// overrides each field individually, env defaults fill the rest.
+// Exported so /threshold UI can preview the effective values.
+export function effectiveThresholds(sub) {
+  const t = sub?.thresholds ?? {};
+  return {
+    priceEpsilon: t.priceEpsilon ?? config.priceEpsilon,
+    sizeRelativeEpsilon: t.sizeRelativeEpsilon ?? config.sizeRelativeEpsilon,
+    sizeAbsoluteMin: t.sizeAbsoluteMin ?? config.sizeAbsoluteMin,
+    notifyCooldownMs: t.notifyCooldownMs ?? config.notifyCooldownMs,
+  };
+}
+
+function levelDiff(prev, cur, mode = 'both', th = null) {
   if (!prev && !cur) return false;
   if (!prev || !cur) return true;
+  const priceEpsilon = th?.priceEpsilon ?? config.priceEpsilon;
+  const sizeAbsoluteMin = th?.sizeAbsoluteMin ?? config.sizeAbsoluteMin;
+  const sizeRelativeEpsilon = th?.sizeRelativeEpsilon ?? config.sizeRelativeEpsilon;
   const checkPrice = mode !== 'size';
   const checkSize = mode !== 'price';
-  if (checkPrice && Math.abs(prev.price - cur.price) >= config.priceEpsilon) return true;
+  if (checkPrice && Math.abs(prev.price - cur.price) >= priceEpsilon) return true;
   if (checkSize) {
     const sizeDelta = Math.abs(prev.size - cur.size);
-    if (sizeDelta >= config.sizeAbsoluteMin) return true;
+    if (sizeDelta >= sizeAbsoluteMin) return true;
     const base = Math.max(prev.size, cur.size, 1);
-    if (sizeDelta / base >= config.sizeRelativeEpsilon) return true;
+    if (sizeDelta / base >= sizeRelativeEpsilon) return true;
   }
   return false;
 }
 
-function bookChanged(prev, cur, levels, mode = 'both') {
+function bookChanged(prev, cur, levels, mode = 'both', th = null) {
   if (!prev) return true;
   for (const k of levels) {
-    if (levelDiff(getLevel(prev, k), getLevel(cur, k), mode)) return true;
+    if (levelDiff(getLevel(prev, k), getLevel(cur, k), mode, th)) return true;
   }
   return false;
 }
@@ -228,13 +255,13 @@ export function fmtSpreadLine(snap) {
 // Compact change-list: one line per watched level whose change cleared
 // the threshold. Nothing emitted if no level fired (caller skips
 // section entirely). Plain text — caller wraps in <i>.
-export function fmtChangeLines(prev, snap, levels, mode = 'both') {
+export function fmtChangeLines(prev, snap, levels, mode = 'both', th = null) {
   if (!prev) return [];
   const out = [];
   for (const k of levels) {
     const p = getLevel(prev, k);
     const c = getLevel(snap, k);
-    if (!levelDiff(p, c, mode)) continue;
+    if (!levelDiff(p, c, mode, th)) continue;
     const label = LEVEL_LABEL[k] ?? k;
     const delta = fmtRowDelta(p, c, mode);
     if (delta) out.push(`  ${label}: ${delta}`);
@@ -283,13 +310,13 @@ export function fmtSinceInitialLines(initial, snap, levels, mode = 'both') {
 //   🔴  price down (single level or all moves down)
 //   🟡  size-only change, or 新挂/撤单 (no price direction)
 //   🔔  multi-level mixed up+down
-export function fmtAlertHeadline(prev, snap, levels, mode = 'both') {
+export function fmtAlertHeadline(prev, snap, levels, mode = 'both', th = null) {
   if (!prev) return { emoji: '🆕', text: '初次抓取' };
   const changes = [];
   for (const k of levels) {
     const p = getLevel(prev, k);
     const c = getLevel(snap, k);
-    if (!levelDiff(p, c, mode)) continue;
+    if (!levelDiff(p, c, mode, th)) continue;
     changes.push({ k, p, c });
   }
   if (changes.length === 0) return { emoji: '🔔', text: '深度变动' };
@@ -345,7 +372,7 @@ export function fmtAlertHeadline(prev, snap, levels, mode = 'both') {
 // Single-line headline (legacy) used for the persisted history record.
 // Same data as fmtAlertHeadline but in plain text form so old
 // /history viewers still see something useful.
-function fmtHeadline(prev, cur, levels, mode = 'both') {
+function fmtHeadline(prev, cur, levels, mode = 'both', th = null) {
   if (!prev) return '🆕 初次抓取';
   let nChanges = 0;
   let biggestPrice = 0;
@@ -353,7 +380,7 @@ function fmtHeadline(prev, cur, levels, mode = 'both') {
   for (const k of levels) {
     const p = getLevel(prev, k);
     const c = getLevel(cur, k);
-    if (!levelDiff(p, c, mode)) continue;
+    if (!levelDiff(p, c, mode, th)) continue;
     nChanges += 1;
     if (p && c) {
       const dp = Math.abs(c.price - p.price);
@@ -476,14 +503,15 @@ async function pollOnce() {
         lastBookPerSub.set(k, snap);
         continue;
       }
-      if (!bookChanged(prev, snap, levels, mode)) continue;
+      const th = effectiveThresholds(s);
+      if (!bookChanged(prev, snap, levels, mode, th)) continue;
       const lastSentAt = lastNotify.get(k) ?? 0;
-      if (prev && now - lastSentAt < config.notifyCooldownMs) continue;
-      const alertHead = fmtAlertHeadline(prev, snap, levels, mode);
+      if (prev && now - lastSentAt < th.notifyCooldownMs) continue;
+      const alertHead = fmtAlertHeadline(prev, snap, levels, mode, th);
       const headlineText = `${alertHead.emoji} ${alertHead.text}`;
       const body = fmtBook(prev, snap, levels);
       const spreadLine = fmtSpreadLine(snap);
-      const changeLines = fmtChangeLines(prev, snap, levels, mode);
+      const changeLines = fmtChangeLines(prev, snap, levels, mode, th);
       const sinceInitialLines = fmtSinceInitialLines(s.initial, snap, levels, mode);
       const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
       // Layout: high-contrast emoji+bold change FIRST so the chat

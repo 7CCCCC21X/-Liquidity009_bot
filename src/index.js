@@ -6,6 +6,7 @@ import {
   addSubscription, removeSubscription, listSubscriptionsForChat,
   getSubscription, updateSubscriptionLevels, updateSubscriptionNote,
   updateSubscriptionTriggerMode, setSubscriptionPause, pauseAllForChat,
+  setSubscriptionThresholds,
   putPendingChoice, peekPendingChoice, takePendingChoice, gcPendingChoices,
   putPendingNote, takePendingNote, gcPendingNotes,
   putPendingWatch, takePendingWatch, gcPendingWatch,
@@ -13,7 +14,7 @@ import {
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, sendDigestForChat } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, sendDigestForChat, effectiveThresholds } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -59,6 +60,8 @@ const HELP_DETAIL = [
   '/levels &lt;id&gt; — 自定义档位 + 触发模式（价+量 / 只看价 / 只看量）',
   '/note &lt;id&gt; — 弹输入框输入备注（或 /note &lt;id&gt; 文字 直接设；/note &lt;id&gt; - 清除）',
   '/digest [时长] — 定期摘要，例 <code>/digest 30m</code>；不带参数显示当前 + 立即来一份',
+  '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
+  '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
   '/export — 把整个 history.jsonl 发回给你',
   '/probe &lt;id&gt; — 立即抓一次订单簿（不等下次轮询）',
@@ -158,6 +161,80 @@ function fmtHistoryEntry(e) {
   return out.length === 1
     ? `${head}  ${out[0]}`
     : `${head}\n  ${out.join('\n  ')}`;
+}
+
+// Threshold presets — per-sub sensitivity profiles overriding the env
+// defaults. 'global' resets the sub to use env-only.
+const THRESHOLD_PRESETS = {
+  low: {
+    label: '🔕 低噪音',
+    priceEpsilon: 0.02, sizeAbsoluteMin: 500, sizeRelativeEpsilon: 0.30,
+    notifyCooldownMs: 5 * 60_000,
+  },
+  balanced: {
+    label: '⚖️ 平衡',
+    priceEpsilon: 0.005, sizeAbsoluteMin: 50, sizeRelativeEpsilon: 0.10,
+    notifyCooldownMs: 60_000,
+  },
+  high: {
+    label: '🔔 高频',
+    priceEpsilon: 0.001, sizeAbsoluteMin: 10, sizeRelativeEpsilon: 0.05,
+    notifyCooldownMs: 10_000,
+  },
+};
+
+function detectThresholdPreset(sub) {
+  const t = sub?.thresholds;
+  if (!t) return 'global';
+  for (const [name, p] of Object.entries(THRESHOLD_PRESETS)) {
+    if (t.priceEpsilon === p.priceEpsilon
+        && t.sizeAbsoluteMin === p.sizeAbsoluteMin
+        && t.sizeRelativeEpsilon === p.sizeRelativeEpsilon
+        && t.notifyCooldownMs === p.notifyCooldownMs) return name;
+  }
+  return 'custom';
+}
+
+function buildThresholdKeyboard(marketId, currentPreset) {
+  const mark = (key) => (currentPreset === key ? '🟢 ' : '');
+  return {
+    inline_keyboard: [
+      [
+        { text: mark('low') + THRESHOLD_PRESETS.low.label, callback_data: `thresh:${marketId}:low` },
+        { text: mark('balanced') + THRESHOLD_PRESETS.balanced.label, callback_data: `thresh:${marketId}:balanced` },
+        { text: mark('high') + THRESHOLD_PRESETS.high.label, callback_data: `thresh:${marketId}:high` },
+      ],
+      [
+        { text: (currentPreset === 'global' ? '🟢 ' : '') + '🌐 用全局默认', callback_data: `thresh:${marketId}:global` },
+      ],
+    ],
+  };
+}
+
+function thresholdHeader(sub) {
+  const eff = effectiveThresholds(sub);
+  const preset = detectThresholdPreset(sub);
+  const presetLabel = {
+    low: '🔕 低噪音',
+    balanced: '⚖️ 平衡',
+    high: '🔔 高频',
+    global: '🌐 全局默认',
+    custom: '⚙️ 自定义',
+  }[preset];
+  return [
+    `<b>🎚 灵敏度设置</b>`,
+    htmlEscape(sub.title || `Market ${sub.marketId}`),
+    `<code>id=${sub.marketId}</code>`,
+    '',
+    `当前预设：<b>${presetLabel}</b>`,
+    `<i>价 ≥ ${eff.priceEpsilon} · 量 ≥ ${eff.sizeAbsoluteMin} 张 / ${(eff.sizeRelativeEpsilon * 100).toFixed(0)}% · 冷却 ${Math.round(eff.notifyCooldownMs / 1000)}s</i>`,
+    '',
+    '<b>预设说明</b>',
+    '<code>🔕 低噪音</code>  价 0.02 · 量 500/30% · 冷却 5m  （热门市场只看大波动）',
+    '<code>⚖️ 平衡  </code>  价 0.005 · 量 50/10% · 冷却 1m  （默认）',
+    '<code>🔔 高频  </code>  价 0.001 · 量 10/5%  · 冷却 10s （小盘做市）',
+    '<code>🌐 全局  </code>  跟 Railway env 走（重置）',
+  ].join('\n');
 }
 
 function buildLevelsKeyboard(marketId, levels, triggerMode) {
@@ -594,6 +671,14 @@ async function handleCommand(chatId, text) {
     return true;
   }
   if (c === '/list') {
+    // /list compact → single-message overview (best when many subs)
+    // /list paused  → only paused subs
+    // /list <text>  → filter by title/note substring
+    // /list (default) → paginated cards
+    const filter = args[0];
+    if (filter === 'compact') return await renderListCompact(chatId, args.slice(1).join(' ')), true;
+    if (filter === 'paused') return await renderListView(chatId, 0, { onlyPaused: true }), true;
+    if (filter) return await renderListView(chatId, 0, { search: args.join(' ') }), true;
     await renderListView(chatId);
     return true;
   }
@@ -803,6 +888,35 @@ async function handleCommand(chatId, text) {
         ? `▶️ 已恢复 ${subs.length} 个暂停的订阅。`
         : '当前没有处于暂停状态的订阅。');
     }
+    return true;
+  }
+  if (c === '/threshold' || /^\/threshold_\d+$/.test(c)) {
+    let id = args[0];
+    if (/^\/threshold_\d+$/.test(c)) id = c.slice('/threshold_'.length);
+    if (!id) {
+      await sendMessage(chatId, '用法：/threshold &lt;marketId&gt;\n（点订阅卡片上的 📐 档位 → 也能调阈值）');
+      return true;
+    }
+    const sub = getSubscription(chatId, id);
+    if (!sub) {
+      await sendMessage(chatId, `❌ 没有订阅 <code>${htmlEscape(id)}</code>`);
+      return true;
+    }
+    const preset = detectThresholdPreset(sub);
+    await sendMessage(chatId, thresholdHeader(sub), {
+      replyMarkup: buildThresholdKeyboard(id, preset),
+    });
+    return true;
+  }
+  if (c === '/stats' || /^\/stats_\d+$/.test(c)) {
+    let id = args[0];
+    if (/^\/stats_\d+$/.test(c)) id = c.slice('/stats_'.length);
+    if (!id) {
+      await sendMessage(chatId, '用法：/stats &lt;marketId&gt; [小时数=24]');
+      return true;
+    }
+    const hours = Math.max(1, Math.min(24 * 30, Number(args[1] ?? args[0]) || 24));
+    await runStats(chatId, id, hours);
     return true;
   }
   if (c === '/digest') {
@@ -1017,10 +1131,20 @@ function listPageKeyboard(page, totalPages) {
 // Each sub becomes a separate message with its own 4-button action
 // row, plus a header/footer pair carrying the pagination controls.
 // Used by both the /list command and the list:<page> callback.
-async function renderListView(chatId, page = 0) {
-  const subs = listSubscriptionsForChat(chatId);
+async function renderListView(chatId, page = 0, { onlyPaused = false, search = null } = {}) {
+  let subs = listSubscriptionsForChat(chatId);
+  if (onlyPaused) subs = subs.filter((s) => s.pausedUntil && s.pausedUntil > Date.now());
+  if (search) {
+    const q = search.toLowerCase();
+    subs = subs.filter((s) =>
+      (s.title || '').toLowerCase().includes(q)
+      || (s.note || '').toLowerCase().includes(q)
+      || String(s.marketId).includes(q));
+  }
   if (!subs.length) {
-    await sendMessage(chatId, '当前没有订阅。直接发个 Predict.fun 网址或 marketId 就能开始监控；批量用 /watch。');
+    await sendMessage(chatId, onlyPaused
+      ? '当前没有处于暂停状态的订阅。'
+      : (search ? `没有匹配 "${htmlEscape(search)}" 的订阅。` : '当前没有订阅。直接发个 Predict.fun 网址或 marketId 就能开始监控；批量用 /watch。'));
     return;
   }
   const totalPages = Math.max(1, Math.ceil(subs.length / LIST_PAGE_SIZE));
@@ -1055,6 +1179,98 @@ async function renderListView(chatId, page = 0) {
     `<i>翻页或快捷操作：</i>`,
     { replyMarkup: listPageKeyboard(safePage, totalPages) },
   );
+}
+
+// Compact list view — single message, no per-sub cards. Best for
+// scanning many subs at once. Optional filter narrows to title /
+// note / id substring.
+async function renderListCompact(chatId, search = null) {
+  let subs = listSubscriptionsForChat(chatId);
+  if (search) {
+    const q = String(search).toLowerCase();
+    subs = subs.filter((s) =>
+      (s.title || '').toLowerCase().includes(q)
+      || (s.note || '').toLowerCase().includes(q)
+      || String(s.marketId).includes(q));
+  }
+  if (!subs.length) {
+    await sendMessage(chatId, search ? `没有匹配 "${htmlEscape(search)}" 的订阅。` : '当前没有订阅。');
+    return;
+  }
+  const now = Date.now();
+  const lines = [`<b>📋 紧凑视图</b>  <i>${subs.length} 个${search ? ` · 匹配 "${htmlEscape(search)}"` : ''}</i>`, ''];
+  for (const s of subs.slice(0, 50)) {
+    const isPaused = s.pausedUntil && s.pausedUntil > now;
+    const dot = isPaused ? '⏸' : '🟢';
+    const levels = s.levels?.length ? s.levels.map((l) => LEVEL_LABEL[l]).join('/') : '无';
+    const mode = TRIGGER_LABEL[s.triggerMode] ?? '价+量';
+    const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
+    const noteBit = s.note ? ` 📝 ${htmlEscape(s.note.slice(0, 16))}` : '';
+    lines.push(`${dot} ${titleLink}`);
+    lines.push(`  <code>${s.marketId}</code> · ${levels} · ${mode}${noteBit}`);
+  }
+  if (subs.length > 50) lines.push('', `<i>… 还有 ${subs.length - 50} 个，请用 /list 默认视图分页。</i>`);
+  lines.push('', `<i>/list 默认视图 · /list paused 仅看暂停 · /list 关键字 搜索</i>`);
+  await sendMessage(chatId, lines.join('\n'));
+}
+
+// /stats <id> [hours] — computes per-market activity stats from the
+// JSONL history. All four ad-hoc metrics the review asked for, in
+// one screen.
+async function runStats(chatId, marketId, hours = 24) {
+  const cutoff = Date.now() - hours * 3600 * 1000;
+  // readEvents tail-limits to limit; use a generous cap so the
+  // window math is honest. Old entries past 14-day retention just
+  // aren't there.
+  const events = await readEvents({ chatId, marketId, limit: 5000 });
+  const inWindow = events.filter((e) => e.ts >= cutoff);
+  if (!inWindow.length) {
+    await sendMessage(chatId, `<i>📊 最近 ${hours}h 没有 <code>${htmlEscape(marketId)}</code> 的触发记录。</i>`);
+    return;
+  }
+  let maxAbsDp = 0, maxAbsDpLabel = '';
+  let maxAbsDs = 0, maxAbsDsLabel = '';
+  let maxSpread = 0;
+  let lastSpread = null;
+  let triggers = inWindow.length;
+  for (const e of inWindow) {
+    const prevBid = e.prev?.bestBid, prevAsk = e.prev?.bestAsk;
+    const curBid = e.cur?.bestBid, curAsk = e.cur?.bestAsk;
+    if (prevBid && curBid) {
+      const dp = curBid.price - prevBid.price;
+      if (Math.abs(dp) > maxAbsDp) { maxAbsDp = Math.abs(dp); maxAbsDpLabel = `买1 ${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`; }
+      const ds = curBid.size - prevBid.size;
+      if (Math.abs(ds) > maxAbsDs) { maxAbsDs = Math.abs(ds); maxAbsDsLabel = `买1 量${ds > 0 ? '↑' : '↓'}${Math.abs(ds).toLocaleString('en-US', { maximumFractionDigits: 0 })}`; }
+    }
+    if (prevAsk && curAsk) {
+      const dp = curAsk.price - prevAsk.price;
+      if (Math.abs(dp) > maxAbsDp) { maxAbsDp = Math.abs(dp); maxAbsDpLabel = `卖1 ${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`; }
+      const ds = curAsk.size - prevAsk.size;
+      if (Math.abs(ds) > maxAbsDs) { maxAbsDs = Math.abs(ds); maxAbsDsLabel = `卖1 量${ds > 0 ? '↑' : '↓'}${Math.abs(ds).toLocaleString('en-US', { maximumFractionDigits: 0 })}`; }
+    }
+    if (curBid && curAsk) {
+      const sp = curAsk.price - curBid.price;
+      if (sp > maxSpread) maxSpread = sp;
+      lastSpread = sp;
+    }
+  }
+  const latest = inWindow[0]; // readEvents returns newest-first
+  const ago = fmtRelativeRemaining(Date.now() * 2 - latest.ts) || `${Math.round((Date.now() - latest.ts) / 60000)} 分钟`;
+  const sub = getSubscription(chatId, marketId);
+  const titleLink = marketLink(latest.title || sub?.title || `Market ${marketId}`, latest.slug || sub?.slug);
+  const lines = [
+    `<b>📊 ${titleLink}</b>  <i>最近 ${hours}h</i>`,
+    `<code>id=${marketId}</code>`,
+    '',
+    `📈 触发次数：<b>${triggers}</b>`,
+  ];
+  if (maxAbsDpLabel) lines.push(`🔺 最大单次 Δ价：<b>${maxAbsDpLabel}</b>`);
+  if (maxAbsDsLabel) lines.push(`📦 最大单次 Δ量：<b>${maxAbsDsLabel}</b>`);
+  if (maxSpread) lines.push(`↔️ 最大价差：<b>${maxSpread.toFixed(4)}</b>`);
+  if (lastSpread != null) lines.push(`🟢 最近价差：<b>${lastSpread.toFixed(4)}</b>`);
+  lines.push(`⏱ 最近触发：<i>${fmtClockTime(latest.ts)} ${config.displayTzLabel || ''}</i>`);
+  lines.push('', `<i>/history_${marketId} 查变动 · /threshold_${marketId} 调阈值 · /probe_${marketId} 立即抓</i>`);
+  await sendMessage(chatId, lines.join('\n'));
 }
 
 async function runProbe(chatId, marketId) {
@@ -1578,6 +1794,66 @@ async function handleCallback(cb) {
     return;
   }
 
+  // Threshold preset selector: thresh:<id>:<preset>
+  const threshMatch = data.match(/^thresh:(\d+):(.+)$/);
+  if (threshMatch) {
+    const id = threshMatch[1];
+    const preset = threshMatch[2];
+    const sub = getSubscription(chatId, id);
+    if (!sub) {
+      await answerCallbackQuery(cb.id, { text: '订阅不存在', showAlert: true });
+      return;
+    }
+    if (preset === 'global') {
+      setSubscriptionThresholds(chatId, id, null);
+    } else if (THRESHOLD_PRESETS[preset]) {
+      const { priceEpsilon, sizeAbsoluteMin, sizeRelativeEpsilon, notifyCooldownMs } = THRESHOLD_PRESETS[preset];
+      setSubscriptionThresholds(chatId, id, { priceEpsilon, sizeAbsoluteMin, sizeRelativeEpsilon, notifyCooldownMs });
+    } else {
+      await answerCallbackQuery(cb.id, { text: '未知预设' });
+      return;
+    }
+    await saveState();
+    const fresh = getSubscription(chatId, id);
+    await answerCallbackQuery(cb.id, { text: `已切换到 ${preset === 'global' ? '全局默认' : THRESHOLD_PRESETS[preset].label}` });
+    try {
+      await editMessageText(chatId, messageId, thresholdHeader(fresh), buildThresholdKeyboard(id, detectThresholdPreset(fresh)));
+    } catch { /* old msg */ }
+    return;
+  }
+
+  // Quick-mute from a notification or /list card: pause:<id>:<duration>.
+  // Reuses the existing setSubscriptionPause plumbing — same as
+  // /pause <id> <duration>, just one tap. The notification message
+  // itself isn't edited (the user might want the orderbook detail
+  // to stay visible); a new confirmation message lands with /resume
+  // shortcut.
+  const pauseClickMatch = data.match(/^pause:(\d+):(.+)$/);
+  if (pauseClickMatch) {
+    const id = pauseClickMatch[1];
+    const durRaw = pauseClickMatch[2];
+    const sub = getSubscription(chatId, id);
+    if (!sub) {
+      await answerCallbackQuery(cb.id, { text: '订阅不存在', showAlert: true });
+      return;
+    }
+    const ms = parseDurationMs(durRaw);
+    if (!ms) {
+      await answerCallbackQuery(cb.id, { text: '时长无效', showAlert: true });
+      return;
+    }
+    const untilMs = Date.now() + ms;
+    setSubscriptionPause(chatId, id, untilMs);
+    await saveState();
+    await answerCallbackQuery(cb.id, { text: `已静音 ${fmtRelativeRemaining(untilMs)}` });
+    await sendMessage(chatId, [
+      `⏸ 已静音 <code>${htmlEscape(id)}</code>  ${htmlEscape(sub.title || '')}`,
+      `<i>${fmtRelativeRemaining(untilMs)}后自动恢复</i>`,
+      `提前恢复：/resume_${id}`,
+    ].join('\n'));
+    return;
+  }
+
   const pickMatch = data.match(/^pick:([a-z0-9]+):(.+)$/);
   if (pickMatch) {
     const token = pickMatch[1];
@@ -1650,6 +1926,8 @@ async function main() {
     { command: 'note',      description: '加 / 改备注' },
     { command: 'probe',     description: '立即抓一次盘口' },
     { command: 'history',   description: '查看历史变动' },
+    { command: 'stats',     description: '市场统计（最大Δ、价差、触发次数）' },
+    { command: 'threshold', description: '改单市场灵敏度（低/平衡/高频）' },
     { command: 'pause',     description: '暂停推送（默认 1h）' },
     { command: 'resume',    description: '恢复推送' },
     { command: 'digest',    description: '定期摘要（防遗漏盘口）' },

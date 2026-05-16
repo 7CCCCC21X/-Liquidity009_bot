@@ -157,6 +157,27 @@ export function setSubscriptionInitial(chatId, marketId, snapshot) {
 // Per-sub pause window. untilMs=null clears the pause; otherwise stores
 // a UTC ms timestamp after which the sub auto-resumes (monitor.js does
 // the resume-check on every tick so no scheduler is needed).
+// Per-sub threshold override. Pass null to clear (revert to env
+// defaults). Persisted shape:
+//   sub.thresholds = { priceEpsilon, sizeRelativeEpsilon,
+//                      sizeAbsoluteMin, notifyCooldownMs }
+//   any field can be null/missing → fall back to env in monitor.js.
+export function setSubscriptionThresholds(chatId, marketId, thresholds) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  if (thresholds == null) {
+    delete s.thresholds;
+  } else {
+    s.thresholds = {
+      priceEpsilon: thresholds.priceEpsilon ?? null,
+      sizeRelativeEpsilon: thresholds.sizeRelativeEpsilon ?? null,
+      sizeAbsoluteMin: thresholds.sizeAbsoluteMin ?? null,
+      notifyCooldownMs: thresholds.notifyCooldownMs ?? null,
+    };
+  }
+  return s;
+}
+
 export function setSubscriptionPause(chatId, marketId, untilMs) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
