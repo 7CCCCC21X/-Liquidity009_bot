@@ -9,10 +9,11 @@ import {
   putPendingChoice, peekPendingChoice, takePendingChoice, gcPendingChoices,
   putPendingNote, takePendingNote, gcPendingNotes,
   putPendingWatch, takePendingWatch, gcPendingWatch,
+  getChatSettings, setChatDigest,
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, sendDigestForChat } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -56,7 +57,8 @@ const HELP_DETAIL = [
   '/watch — 批量订阅（回复消息粘贴多行 URL/id/slug）',
   '/list — 我的订阅（分页 + 操作按钮）',
   '/levels &lt;id&gt; — 自定义档位 + 触发模式（价+量 / 只看价 / 只看量）',
-  '/note &lt;id&gt; [备注] — 设置备注（不带文字 = 清除）',
+  '/note &lt;id&gt; — 弹输入框输入备注（或 /note &lt;id&gt; 文字 直接设；/note &lt;id&gt; - 清除）',
+  '/digest [时长] — 定期摘要，例 <code>/digest 30m</code>；不带参数显示当前 + 立即来一份',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
   '/export — 把整个 history.jsonl 发回给你',
   '/probe &lt;id&gt; — 立即抓一次订单簿（不等下次轮询）',
@@ -449,8 +451,11 @@ async function commitPickedSubscriptions(chatId, messageId, matches, selectedIdx
     await sendSubscribed(chatId, m, { wasExisting });
     return;
   }
-  // Batch path: subscribe each silently, then send one summary.
+  // Batch path: subscribe each silently, then prime baselines in
+  // parallel so the next poll doesn't fire N "🆕 初次抓取" alerts
+  // for the batch. Finally send one summary message.
   const lines = [];
+  const toPrime = [];
   let ok = 0;
   for (const idx of selectedIdx) {
     const m = matches[idx];
@@ -465,11 +470,23 @@ async function commitPickedSubscriptions(chatId, messageId, matches, selectedIdx
       const titleShort = (m.title || m.question || '').slice(0, 50);
       lines.push(`✓ <code>${m.id}</code> ${marketLink(titleShort, m.slug)}`);
       ok += 1;
+      if (m.conditionId) toPrime.push(m);
     } catch (err) {
       lines.push(`✗ <code>${m.id}</code> ${htmlEscape(err.message).slice(0, 60)}`);
     }
   }
   await saveState();
+  // Fetch each market's orderbook in parallel and prime baselines.
+  // Failures here are non-fatal — the next monitor tick will backfill
+  // sub.initial automatically via the existing fallback path.
+  const primed = await Promise.allSettled(toPrime.map(async (m) => {
+    const market = { id: m.id, conditionId: m.conditionId };
+    const snap = await getOrderbook(market);
+    primeSubscriptionSnapshot(chatId, m.id, snap);
+    return m.id;
+  }));
+  const primedCount = primed.filter((r) => r.status === 'fulfilled').length;
+  if (primedCount) await saveState();
   if (messageId) {
     try { await editMessageText(chatId, messageId, `✅ 已订阅 ${ok} 个市场（详见下条）`); } catch { /* */ }
   }
@@ -478,7 +495,9 @@ async function commitPickedSubscriptions(chatId, messageId, matches, selectedIdx
     '',
     ...lines,
     '',
-    `<i>下次轮询会自动设置「监控起点」基线，之后通知就能看到累计 Δ 了。</i>`,
+    primedCount === toPrime.length
+      ? `<i>已抓取 ${primedCount} 个市场的初始盘口作为「监控起点」，价格变动时会显示累计 Δ。</i>`
+      : `<i>${primedCount}/${toPrime.length} 个市场基线已建立；其余下次轮询自动补。</i>`,
     `/list 查看全部 · /watch 加更多`,
   ].join('\n'));
 }
@@ -716,22 +735,22 @@ async function handleCommand(chatId, text) {
   // /pause <id> [duration]          — pause one sub
   // duration formats: 30m, 2h, 1d, or bare minutes; default 1h
   if (c === '/pause' || /^\/pause_\d+$/.test(c)) {
-    let id, durRaw;
+    // Disambiguation rule: if the first arg is a bare number AND it
+    // matches an existing subscription's marketId, treat as
+    // /pause <id> [duration]. Otherwise it's /pause <duration>
+    // applied to all subs (bare numbers default to minutes via
+    // parseDurationMs). Without this check, "/pause 272779" gets
+    // misread as "pause everyone for 272779 minutes (~189 days)".
+    let id = null, durRaw = null;
     if (/^\/pause_\d+$/.test(c)) {
       id = c.slice('/pause_'.length);
       durRaw = args[0];
     } else if (args.length === 0) {
-      durRaw = null;
-    } else if (/^\d+$/.test(args[0]) && parseDurationMs(args[0]) == null) {
-      // Pure-numeric ID without duration unit (e.g. "/pause 272779")
-      id = args[0];
-      durRaw = args[1];
-    } else if (/^\d+$/.test(args[0]) && args.length >= 2) {
-      // "/pause 272779 2h"
+      // /pause → pause all for default 1h
+    } else if (/^\d+$/.test(args[0]) && getSubscription(chatId, args[0])) {
       id = args[0];
       durRaw = args[1];
     } else {
-      // "/pause 2h"  → all subs
       durRaw = args[0];
     }
     const durMs = parseDurationMs(durRaw) ?? 60 * 60 * 1000; // default 1h
@@ -784,6 +803,55 @@ async function handleCommand(chatId, text) {
         ? `▶️ 已恢复 ${subs.length} 个暂停的订阅。`
         : '当前没有处于暂停状态的订阅。');
     }
+    return true;
+  }
+  if (c === '/digest') {
+    // /digest                — show current setting + send one now
+    // /digest <duration>     — enable periodic digest (e.g. 30m, 2h)
+    // /digest off            — disable
+    const arg = args[0];
+    const settings = getChatSettings(chatId);
+    if (!arg) {
+      const cur = settings?.digestIntervalMs ?? 0;
+      const note = cur > 0
+        ? `当前：每 ${fmtRelativeRemaining(Date.now() + cur)} 推送一次摘要`
+        : `当前：未开启`;
+      await sendMessage(chatId, [
+        `<b>📋 定期摘要</b>`,
+        note,
+        '',
+        '<b>用法</b>',
+        '<code>/digest 30m</code> — 每 30 分钟一次',
+        '<code>/digest 2h</code>  — 每 2 小时一次',
+        '<code>/digest 1d</code>  — 每 24 小时一次',
+        '<code>/digest off</code> — 关闭',
+        '',
+        '<i>摘要会列出所有订阅的最新买1/卖1，避免长时间没消息时遗漏盘口。</i>',
+      ].join('\n'));
+      // Also fire one immediately if user just types /digest
+      if (cur > 0) {
+        await sendDigestForChat(chatId);
+      }
+      return true;
+    }
+    if (arg === 'off' || arg === '0') {
+      setChatDigest(chatId, 0);
+      await saveState();
+      await sendMessage(chatId, '✓ 已关闭定期摘要。');
+      return true;
+    }
+    const ms = parseDurationMs(arg);
+    if (!ms || ms < 60_000) {
+      await sendMessage(chatId, '❌ 请输入有效时长（最小 1m），如 <code>30m</code> / <code>2h</code> / <code>1d</code>。');
+      return true;
+    }
+    setChatDigest(chatId, ms);
+    await saveState();
+    await sendMessage(chatId, [
+      `✓ 已开启定期摘要：每 <b>${fmtRelativeRemaining(Date.now() + ms)}</b> 推送一次。`,
+      '',
+      '<i>取消：/digest off · 改频率：/digest 新时长 · 立即触发一次：再发 /digest 即可。</i>',
+    ].join('\n'));
     return true;
   }
   if (c === '/status') {
@@ -1584,6 +1652,7 @@ async function main() {
     { command: 'history',   description: '查看历史变动' },
     { command: 'pause',     description: '暂停推送（默认 1h）' },
     { command: 'resume',    description: '恢复推送' },
+    { command: 'digest',    description: '定期摘要（防遗漏盘口）' },
     { command: 'status',    description: 'Bot 健康状态' },
     { command: 'export',    description: '导出 history.jsonl' },
     { command: 'speedtest', description: '测抓取延迟' },

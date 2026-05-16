@@ -49,7 +49,12 @@ export function normalizeLevels(levels) {
 }
 
 function emptyState() {
-  return { subs: {}, pendingChoices: {}, pendingNotes: {}, pendingWatch: {}, telegramOffset: 0 };
+  return {
+    subs: {},
+    pendingChoices: {}, pendingNotes: {}, pendingWatch: {},
+    chatSettings: {},
+    telegramOffset: 0,
+  };
 }
 
 let _state = null;
@@ -72,6 +77,7 @@ export async function loadState() {
     if (!_state.pendingChoices) _state.pendingChoices = {};
     if (!_state.pendingNotes) _state.pendingNotes = {};
     if (!_state.pendingWatch) _state.pendingWatch = {};
+    if (!_state.chatSettings) _state.chatSettings = {};
   } catch (err) {
     if (err.code !== 'ENOENT') console.warn(new Date().toISOString(), '[state] load failed:', err.message);
     _state = emptyState();
@@ -308,4 +314,38 @@ export function gcPendingWatch() {
   for (const [k, v] of Object.entries(_state.pendingWatch)) {
     if (!v?.expiresAt || v.expiresAt < now) delete _state.pendingWatch[k];
   }
+}
+
+// Per-chat preferences. Today: digest interval. Stored as
+// chatSettings[chatId] = { digestIntervalMs, digestLastSentAt }.
+// Empty / missing chatSettings → digest disabled.
+export function getChatSettings(chatId) {
+  return _state.chatSettings?.[String(chatId)] ?? null;
+}
+
+export function getAllChatSettings() {
+  return _state.chatSettings ?? {};
+}
+
+export function setChatDigest(chatId, intervalMs) {
+  if (!_state.chatSettings) _state.chatSettings = {};
+  const k = String(chatId);
+  const cur = _state.chatSettings[k] ?? {};
+  if (intervalMs > 0) {
+    cur.digestIntervalMs = intervalMs;
+    // Reset the clock so the FIRST digest fires intervalMs from now,
+    // not immediately on the next tick (which would feel jumpy).
+    cur.digestLastSentAt = Date.now();
+  } else {
+    cur.digestIntervalMs = 0;
+  }
+  _state.chatSettings[k] = cur;
+  return cur;
+}
+
+export function markChatDigestSent(chatId, atMs = Date.now()) {
+  if (!_state.chatSettings) _state.chatSettings = {};
+  const k = String(chatId);
+  if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
+  _state.chatSettings[k].digestLastSentAt = atMs;
 }

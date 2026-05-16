@@ -42,10 +42,12 @@ export function slugifyWithYear(s) {
 // else returns false; callers must refuse to fetch. extractSlugFromUrl
 // will still successfully parse non-predict URLs (so users get a
 // useful "not a Predict.fun URL" error instead of a silent failure).
+// Strictly HTTPS — http:// is rejected (prevents downgrades and
+// mixed-content style misuses on the bot's outbound fetches).
 export function isAllowedPredictHost(input) {
   try {
     const u = new URL(String(input));
-    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    if (u.protocol !== 'https:') return false;
     return u.hostname === 'predict.fun' || u.hostname.endsWith('.predict.fun');
   } catch {
     return false;

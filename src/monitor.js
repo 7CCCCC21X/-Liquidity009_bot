@@ -4,6 +4,7 @@ import { sendMessage, htmlEscape } from './telegram.js';
 import {
   listAllSubscriptions, removeSubscription, saveState,
   setSubscriptionInitial,
+  getAllChatSettings, markChatDigestSent,
   ALL_LEVELS, LEVEL_LABEL, subKey,
 } from './state.js';
 import { appendEvent } from './history.js';
@@ -545,13 +546,85 @@ async function pollOnce() {
       }
     }
   }
+  // Digests: per-chat periodic summary. Runs after the change-alert
+  // loop so it uses the freshest lastBookPerSub snapshots.
+  try {
+    if (await maybeSendDigests()) needsSave = true;
+  } catch (err) {
+    console.warn('[monitor] maybeSendDigests failed:', err.message);
+  }
   // Flush any state mutations done above (initial-baseline backfill,
-  // pause clears, etc) in a single save so we don't write per-tick.
+  // pause clears, digest timestamps, etc) in a single save so we
+  // don't write per-tick.
   if (needsSave) {
     try { await saveState(); } catch (err) {
       console.warn('[monitor] saveState failed:', err.message);
     }
   }
+}
+
+// Periodic digest: one message per chat that lists every subscription
+// with its latest top-of-book + paused / unpaused status. Helps the
+// user spot anything they might have missed during quiet markets.
+// Uses lastBookPerSub (already populated by pollOnce) — no extra
+// fetch. Caller is responsible for marking digestLastSentAt.
+export async function sendDigestForChat(chatId) {
+  const all = listAllSubscriptions();
+  const subs = all.filter((s) => String(s.chatId) === String(chatId));
+  if (!subs.length) {
+    await sendMessage(chatId, '<i>📋 摘要：当前没有订阅。</i>');
+    return;
+  }
+  const now = Date.now();
+  const lines = [`<b>📋 当前订阅摘要</b>  <i>${subs.length} 个</i>`];
+  const tzLabel = config.displayTzLabel ? ` ${config.displayTzLabel}` : '';
+  lines.push(`<i>${fmtClockTime(now)}${tzLabel}</i>`);
+  lines.push('');
+  for (const s of subs.slice(0, 30)) {
+    const isPaused = s.pausedUntil && s.pausedUntil > now;
+    const snap = lastBookPerSub.get(subKey(s.chatId, s.marketId));
+    const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
+    let body;
+    if (isPaused) {
+      body = `<i>⏸ 暂停中</i>`;
+    } else if (snap?.bestBid && snap?.bestAsk) {
+      const bb = snap.bestBid.price.toFixed(4);
+      const ba = snap.bestAsk.price.toFixed(4);
+      const spread = (snap.bestAsk.price - snap.bestBid.price).toFixed(4);
+      body = `买1 ${bb} / 卖1 ${ba} · 价差 ${spread}`;
+    } else {
+      body = `<i>(暂无盘口数据)</i>`;
+    }
+    const dot = isPaused ? '⏸' : '🟢';
+    lines.push(`${dot} ${titleLink}`);
+    lines.push(`  <code>${s.marketId}</code> · ${body}`);
+  }
+  if (subs.length > 30) lines.push('', `<i>… 还有 ${subs.length - 30} 个，请 /list 查看全部。</i>`);
+  lines.push('', `<i>改频率 /digest · 历史变动 /history &lt;id&gt;</i>`);
+  await sendMessage(chatId, lines.join('\n'));
+}
+
+// Called from pollOnce. Walks every chat with a non-zero digest
+// interval and fires the digest if it's due. Marks digestLastSentAt
+// to bump the next-due moment forward.
+async function maybeSendDigests() {
+  const all = getAllChatSettings();
+  const now = Date.now();
+  let touched = false;
+  for (const [chatId, settings] of Object.entries(all)) {
+    const interval = settings?.digestIntervalMs ?? 0;
+    if (interval <= 0) continue;
+    const last = settings.digestLastSentAt ?? 0;
+    if (now - last < interval) continue;
+    try {
+      await sendDigestForChat(chatId);
+      markChatDigestSent(chatId, now);
+      touched = true;
+    } catch (err) {
+      console.warn('[digest] failed for', chatId, err.message);
+    }
+  }
+  return touched;
 }
 
 let _running = false;
