@@ -1042,9 +1042,12 @@ async function handleCommand(chatId, text) {
         '',
         '<i>摘要会列出所有订阅的最新买1/卖1，避免长时间没消息时遗漏盘口。</i>',
       ].join('\n'));
-      // Also fire one immediately if user just types /digest
+      // Also fire one immediately if user just types /digest. The
+      // sendDigestForChat mutates each sub's digestBaseline, so we
+      // need to persist after.
       if (cur > 0) {
         await sendDigestForChat(chatId);
+        await saveState();
       }
       return true;
     }

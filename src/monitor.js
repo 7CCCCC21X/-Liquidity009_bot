@@ -3,7 +3,7 @@ import { getOrderbook, getMarketById } from './predict.js';
 import { sendMessage, htmlEscape } from './telegram.js';
 import {
   listAllSubscriptions, removeSubscription, saveState,
-  setSubscriptionInitial,
+  setSubscriptionInitial, setSubscriptionDigestBaseline,
   getAllChatSettings, markChatDigestSent, isChatInQuietHours,
   ALL_LEVELS, LEVEL_LABEL, subKey,
 } from './state.js';
@@ -605,11 +605,14 @@ async function pollOnce() {
   }
 }
 
-// Periodic digest: one message per chat that lists every subscription
-// with its latest top-of-book + paused / unpaused status. Helps the
-// user spot anything they might have missed during quiet markets.
-// Uses lastBookPerSub (already populated by pollOnce) — no extra
-// fetch. Caller is responsible for marking digestLastSentAt.
+// Periodic digest: one message per chat focused on what CHANGED since
+// the last digest. Sorts changed markets by biggest |Δ| first, shows
+// per-side direction + delta, and collapses unchanged subs into a
+// single tail line so the user can scan in seconds.
+//
+// Baseline is sub.digestBaseline (set after every send). First-time
+// digest shows everything as 🆕 with current prices and seeds the
+// baseline for the next round.
 export async function sendDigestForChat(chatId) {
   const all = listAllSubscriptions();
   const subs = all.filter((s) => String(s.chatId) === String(chatId));
@@ -618,32 +621,103 @@ export async function sendDigestForChat(chatId) {
     return;
   }
   const now = Date.now();
-  const lines = [`<b>📋 当前订阅摘要</b>  <i>${subs.length} 个</i>`];
-  const tzLabel = config.displayTzLabel ? ` ${config.displayTzLabel}` : '';
-  lines.push(`<i>${fmtClockTime(now)}${tzLabel}</i>`);
-  lines.push('');
-  for (const s of subs.slice(0, 30)) {
-    const isPaused = s.pausedUntil && s.pausedUntil > now;
+  const entries = subs.map((s) => {
     const snap = lastBookPerSub.get(subKey(s.chatId, s.marketId));
-    const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
-    let body;
-    if (isPaused) {
-      body = `<i>⏸ 暂停中</i>`;
-    } else if (snap?.bestBid && snap?.bestAsk) {
-      const bb = snap.bestBid.price.toFixed(4);
-      const ba = snap.bestAsk.price.toFixed(4);
-      const spread = (snap.bestAsk.price - snap.bestBid.price).toFixed(4);
-      body = `买1 ${bb} / 卖1 ${ba} · 价差 ${spread}`;
-    } else {
-      body = `<i>(暂无盘口数据)</i>`;
-    }
-    const dot = isPaused ? '⏸' : '🟢';
-    lines.push(`${dot} ${titleLink}`);
-    lines.push(`  <code>${s.marketId}</code> · ${body}`);
+    const baseline = s.digestBaseline ?? null;
+    const isPaused = s.pausedUntil && s.pausedUntil > now;
+    return { sub: s, snap, baseline, isPaused };
+  });
+
+  // Bucket. Paused / no-data fall through to "unchanged" so the
+  // header counts make sense — user explicitly muted them, no point
+  // surfacing in the "changes" list.
+  const changed = [];
+  const fresh = []; // baseline absent → first digest, show as 🆕
+  const unchanged = [];
+  for (const e of entries) {
+    if (e.isPaused || !e.snap?.bestBid || !e.snap?.bestAsk) { unchanged.push(e); continue; }
+    if (!e.baseline?.bestBid || !e.baseline?.bestAsk) { fresh.push(e); continue; }
+    const dBid = e.snap.bestBid.price - e.baseline.bestBid.price;
+    const dAsk = e.snap.bestAsk.price - e.baseline.bestAsk.price;
+    if (Math.abs(dBid) < 1e-9 && Math.abs(dAsk) < 1e-9) { unchanged.push(e); continue; }
+    e._biggest = Math.max(Math.abs(dBid), Math.abs(dAsk));
+    e._dBid = dBid; e._dAsk = dAsk;
+    changed.push(e);
   }
-  if (subs.length > 30) lines.push('', `<i>… 还有 ${subs.length - 30} 个，请 /list 查看全部。</i>`);
-  lines.push('', `<i>改频率 /digest · 历史变动 /history &lt;id&gt;</i>`);
+  // Sort by biggest absolute price move first.
+  changed.sort((a, b) => (b._biggest ?? 0) - (a._biggest ?? 0));
+
+  const tzLabel = config.displayTzLabel ? ` ${config.displayTzLabel}` : '';
+  const lines = [`<b>📋 订阅摘要</b>  <i>${fmtClockTime(now)}${tzLabel} · vs 上次摘要</i>`];
+  const totals = [];
+  if (changed.length) totals.push(`<b>${changed.length}</b> 有变化`);
+  if (fresh.length) totals.push(`<b>${fresh.length}</b> 首次`);
+  if (unchanged.length) totals.push(`<b>${unchanged.length}</b> 无变化`);
+  lines.push(`<i>${totals.join(' · ')}</i>`);
+  lines.push('');
+
+  const fmtDelta = (dp) => Math.abs(dp) < 1e-9 ? '' : ` (${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)})`;
+  const dot = (dBid, dAsk) => {
+    // Pick dominant direction by |delta|, color by sign.
+    const dom = Math.abs(dBid) >= Math.abs(dAsk) ? dBid : dAsk;
+    if (dom > 1e-9) return '🟢';
+    if (dom < -1e-9) return '🔴';
+    return '🔔';
+  };
+
+  // Show changed first — up to 20.
+  for (const e of changed.slice(0, 20)) {
+    const { sub, snap } = e;
+    const titleLink = marketLink(sub.title || `Market ${sub.marketId}`, sub.slug);
+    const bb = snap.bestBid.price.toFixed(4);
+    const ba = snap.bestAsk.price.toFixed(4);
+    lines.push(`${dot(e._dBid, e._dAsk)} ${titleLink}`);
+    lines.push(`  <code>${sub.marketId}</code> · 买1 ${bb}${fmtDelta(e._dBid)} / 卖1 ${ba}${fmtDelta(e._dAsk)}`);
+  }
+  if (changed.length > 20) {
+    lines.push('', `<i>… 还有 ${changed.length - 20} 个有变化（按变化大小排序，可 /list 查看全部）</i>`);
+  }
+
+  // 🆕 first-time entries (e.g. brand-new subs since last digest).
+  if (fresh.length) {
+    if (changed.length) lines.push('');
+    for (const e of fresh.slice(0, 10)) {
+      const titleLink = marketLink(e.sub.title || `Market ${e.sub.marketId}`, e.sub.slug);
+      const bb = e.snap.bestBid.price.toFixed(4);
+      const ba = e.snap.bestAsk.price.toFixed(4);
+      lines.push(`🆕 ${titleLink}`);
+      lines.push(`  <code>${e.sub.marketId}</code> · 买1 ${bb} / 卖1 ${ba}`);
+    }
+    if (fresh.length > 10) lines.push(`<i>… 另 ${fresh.length - 10} 个首次</i>`);
+  }
+
+  // Unchanged collapsed to one short line so the user knows they're
+  // still being tracked, not silently dropped.
+  if (unchanged.length) {
+    const pausedCount = unchanged.filter((e) => e.isPaused).length;
+    const names = unchanged
+      .slice(0, 8)
+      .map((e) => htmlEscape((e.sub.title || `#${e.sub.marketId}`).slice(0, 14)))
+      .join(' · ');
+    const extra = unchanged.length > 8 ? ` 等 ${unchanged.length} 个` : '';
+    const pausedBit = pausedCount ? ` (含 ${pausedCount} 暂停)` : '';
+    lines.push('', `<i>· 无变化${pausedBit}：${names}${extra}</i>`);
+  }
+
+  lines.push('', `<i>改频率 /digest · 历史 /history &lt;id&gt; · 统计 /stats &lt;id&gt;</i>`);
+
   await sendMessage(chatId, lines.join('\n'));
+
+  // Update baseline for every sub that has a snapshot now — including
+  // unchanged (so the baseline stays "the last time we summarised").
+  for (const e of entries) {
+    if (!e.snap?.bestBid || !e.snap?.bestAsk) continue;
+    setSubscriptionDigestBaseline(e.sub.chatId, e.sub.marketId, {
+      bestBid: e.snap.bestBid,
+      bestAsk: e.snap.bestAsk,
+      atMs: now,
+    });
+  }
 }
 
 // Called from pollOnce. Walks every chat with a non-zero digest

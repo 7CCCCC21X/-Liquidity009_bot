@@ -161,6 +161,17 @@ export function updateSubscriptionTriggerMode(chatId, marketId, mode) {
   return s;
 }
 
+// Per-sub baseline snapshot used by /digest for the "vs 上次摘要"
+// comparison. Reset on every digest send so each digest reflects
+// changes within its own window (not since subscribe time, which is
+// what sub.initial is for).
+export function setSubscriptionDigestBaseline(chatId, marketId, snapshot) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  s.digestBaseline = snapshot;
+  return s;
+}
+
 // Snapshot of the orderbook at subscribe time, persisted so the
 // notification can show "vs 监控起点" cumulative deltas across restarts.
 // Stored on the sub itself so it travels with /list, /export, etc.
