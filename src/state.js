@@ -26,33 +26,36 @@ export const LEVEL_LABEL = {
 export const TRIGGER_MODES = ['both', 'price', 'size'];
 export const TRIGGER_LABEL = { both: '价+量', price: '只看价', size: '只看量' };
 
-export function normalizeTriggerMode(mode) {
+export function normalizeTriggerMode(mode, chatOverride = null) {
   if (typeof mode === 'string') {
     const m = mode.toLowerCase();
     if (TRIGGER_MODES.includes(m)) return m;
   }
-  // Fall back to env-configured default (e.g. 'price'); guard against a
-  // typo in DEFAULT_TRIGGER_MODE by checking the allowed set.
-  const def = String(config.defaultTriggerMode ?? 'both').toLowerCase();
-  return TRIGGER_MODES.includes(def) ? def : 'both';
+  // Precedence: chat-level default → env default → 'both'. /settings
+  // lets users set chatOverride per chat without touching env.
+  const candidate = String(chatOverride ?? config.defaultTriggerMode ?? 'both').toLowerCase();
+  return TRIGGER_MODES.includes(candidate) ? candidate : 'both';
 }
 
-export function normalizeLevels(levels) {
+export function normalizeLevels(levels, chatOverride = null) {
   if (Array.isArray(levels)) {
     const set = new Set(levels.filter((l) => ALL_LEVELS.includes(l)));
     return ALL_LEVELS.filter((l) => set.has(l));
   }
-  // Fall back to env-configured DEFAULT_LEVELS; ALL_LEVELS if env
-  // produced an empty / invalid list.
-  const def = (config.defaultLevels ?? []).filter((l) => ALL_LEVELS.includes(l));
-  return def.length ? ALL_LEVELS.filter((l) => def.includes(l)) : [...ALL_LEVELS];
+  // Precedence: chat-level default → env DEFAULT_LEVELS → ALL_LEVELS.
+  const chatDef = Array.isArray(chatOverride) && chatOverride.length
+    ? chatOverride.filter((l) => ALL_LEVELS.includes(l))
+    : [];
+  if (chatDef.length) return ALL_LEVELS.filter((l) => chatDef.includes(l));
+  const envDef = (config.defaultLevels ?? []).filter((l) => ALL_LEVELS.includes(l));
+  return envDef.length ? ALL_LEVELS.filter((l) => envDef.includes(l)) : [...ALL_LEVELS];
 }
 
 function emptyState() {
   return {
     subs: {},
     pendingChoices: {}, pendingNotes: {}, pendingWatch: {},
-    pendingPrompt: {},
+    pendingPrompt: {}, pendingBulkRetry: {},
     chatSettings: {},
     telegramOffset: 0,
   };
@@ -79,6 +82,7 @@ export async function loadState() {
     if (!_state.pendingNotes) _state.pendingNotes = {};
     if (!_state.pendingWatch) _state.pendingWatch = {};
     if (!_state.pendingPrompt) _state.pendingPrompt = {};
+    if (!_state.pendingBulkRetry) _state.pendingBulkRetry = {};
     if (!_state.chatSettings) _state.chatSettings = {};
   } catch (err) {
     if (err.code !== 'ENOENT') console.warn(new Date().toISOString(), '[state] load failed:', err.message);
@@ -125,17 +129,28 @@ export function subKey(chatId, marketId) {
 export function addSubscription(sub) {
   const k = subKey(sub.chatId, sub.marketId);
   const existing = _state.subs[k];
+  // Pull chat-level defaults so a new sub follows whatever the user
+  // set via /settings; existing subs keep their own saved values.
+  const cs = _state.chatSettings?.[String(sub.chatId)] ?? {};
   _state.subs[k] = {
     ...sub,
-    levels: normalizeLevels(sub.levels ?? existing?.levels),
+    levels: normalizeLevels(sub.levels ?? existing?.levels, cs.defaultLevels ?? null),
     note: sub.note ?? existing?.note ?? null,
-    triggerMode: normalizeTriggerMode(sub.triggerMode ?? existing?.triggerMode),
+    triggerMode: normalizeTriggerMode(sub.triggerMode ?? existing?.triggerMode, cs.defaultTriggerMode ?? null),
     // Preserve slug if a re-add (e.g. via marketId) doesn't carry one
     // — slug drives the clickable URL in messages.
     slug: sub.slug ?? existing?.slug ?? null,
     conditionId: sub.conditionId ?? existing?.conditionId ?? null,
     addedAt: existing?.addedAt ?? Date.now(),
   };
+  // Apply per-chat default cooldown to new subs only — existing subs
+  // keep whatever they had (incl. /threshold per-sub override).
+  if (!existing && cs.defaultCooldownMs != null && cs.defaultCooldownMs > 0) {
+    _state.subs[k].thresholds = {
+      ..._state.subs[k].thresholds,
+      notifyCooldownMs: cs.defaultCooldownMs,
+    };
+  }
   return k;
 }
 
@@ -418,6 +433,71 @@ export function setChatDigest(chatId, intervalMs) {
   }
   _state.chatSettings[k] = cur;
   return cur;
+}
+
+// Chat-level defaults that override env DEFAULT_* on new subs only.
+// Existing subs keep whatever was saved at their creation time.
+export function setChatDefaultLevels(chatId, levels) {
+  if (!_state.chatSettings) _state.chatSettings = {};
+  const k = String(chatId);
+  if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
+  if (!levels || !levels.length) {
+    delete _state.chatSettings[k].defaultLevels;
+  } else {
+    _state.chatSettings[k].defaultLevels = levels.filter((l) => ALL_LEVELS.includes(l));
+  }
+  return _state.chatSettings[k];
+}
+
+export function setChatDefaultTriggerMode(chatId, mode) {
+  if (!_state.chatSettings) _state.chatSettings = {};
+  const k = String(chatId);
+  if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
+  if (mode == null) {
+    delete _state.chatSettings[k].defaultTriggerMode;
+  } else {
+    const m = String(mode).toLowerCase();
+    if (TRIGGER_MODES.includes(m)) _state.chatSettings[k].defaultTriggerMode = m;
+  }
+  return _state.chatSettings[k];
+}
+
+export function setChatDefaultCooldown(chatId, ms) {
+  if (!_state.chatSettings) _state.chatSettings = {};
+  const k = String(chatId);
+  if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
+  if (ms == null || ms <= 0) {
+    delete _state.chatSettings[k].defaultCooldownMs;
+  } else {
+    _state.chatSettings[k].defaultCooldownMs = ms;
+  }
+  return _state.chatSettings[k];
+}
+
+// Bulk-retry token: caches the failed lines of a /watch batch so the
+// "🔁 重试失败项" button on the result message can re-run them
+// without the user re-typing.
+const BULK_RETRY_TTL = 30 * 60 * 1000;
+export function putPendingBulkRetry(chatId, token, lines) {
+  if (!_state.pendingBulkRetry) _state.pendingBulkRetry = {};
+  _state.pendingBulkRetry[`${chatId}:${token}`] = {
+    lines: Array.from(lines),
+    expiresAt: Date.now() + BULK_RETRY_TTL,
+  };
+}
+export function takePendingBulkRetry(chatId, token) {
+  const k = `${chatId}:${token}`;
+  const e = _state.pendingBulkRetry?.[k];
+  if (!e) return null;
+  delete _state.pendingBulkRetry[k];
+  if (e.expiresAt < Date.now()) return null;
+  return e.lines;
+}
+export function gcPendingBulkRetry() {
+  const now = Date.now();
+  for (const [k, v] of Object.entries(_state.pendingBulkRetry ?? {})) {
+    if (!v?.expiresAt || v.expiresAt < now) delete _state.pendingBulkRetry[k];
+  }
 }
 
 // Quiet hours (do-not-disturb). Stored as minutes-of-day (0..1439)

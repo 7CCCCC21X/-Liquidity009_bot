@@ -12,6 +12,8 @@ import {
   putPendingWatch, takePendingWatch, gcPendingWatch,
   putPendingPrompt, takePendingPrompt, gcPendingPrompts,
   getChatSettings, setChatDigest, setChatQuiet, isChatInQuietHours,
+  setChatDefaultLevels, setChatDefaultTriggerMode, setChatDefaultCooldown,
+  putPendingBulkRetry, takePendingBulkRetry, gcPendingBulkRetry,
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
@@ -62,6 +64,7 @@ const HELP_DETAIL = [
   '/note &lt;id&gt; — 弹输入框输入备注（或 /note &lt;id&gt; 文字 直接设；/note &lt;id&gt; - 清除）',
   '/digest [时长] — 定期摘要，例 <code>/digest 30m</code>；不带参数显示当前 + 立即来一份',
   '/quiet &lt;HH:MM-HH:MM&gt; — 勿扰时段（例 23:00-08:00），勿扰期间只写历史不推送',
+  '/settings — 聊天设置面板（默认档位 / 默认触发 / 默认冷却 / 摘要 / 勿扰）',
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
   '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
@@ -970,6 +973,10 @@ async function handleCommand(chatId, text) {
     await runStats(chatId, id, hours);
     return true;
   }
+  if (c === '/settings') {
+    await renderSettingsPanel(chatId);
+    return true;
+  }
   if (c === '/quiet') {
     const arg = args[0];
     const settings = getChatSettings(chatId);
@@ -1306,6 +1313,176 @@ async function renderListCompact(chatId, search = null) {
 // /stats <id> [hours] — computes per-market activity stats from the
 // JSONL history. All four ad-hoc metrics the review asked for, in
 // one screen.
+// ───────────────── /settings panel ─────────────────
+// Everything per-chat that's configurable. Buttons open ForceReply
+// sub-flows via the generic pendingPrompt mechanism — pasting a
+// duration / HH:MM / levels list completes the action; bare cycle
+// buttons toggle inline (default trigger mode).
+
+function settingsHeaderText(chatId) {
+  const cs = getChatSettings(chatId) ?? {};
+  const labelMap = LEVEL_LABEL;
+  const defaultLevels = cs.defaultLevels?.length
+    ? cs.defaultLevels.map((l) => labelMap[l] ?? l).join('/')
+    : `(env: ${(config.defaultLevels ?? []).map((l) => labelMap[l] ?? l).join('/')})`;
+  const defaultMode = cs.defaultTriggerMode
+    ? (TRIGGER_LABEL[cs.defaultTriggerMode] ?? cs.defaultTriggerMode)
+    : `(env: ${TRIGGER_LABEL[config.defaultTriggerMode] ?? config.defaultTriggerMode ?? 'both'})`;
+  const defaultCooldown = cs.defaultCooldownMs
+    ? `${Math.round(cs.defaultCooldownMs / 1000)}s`
+    : `(env: ${Math.round(config.notifyCooldownMs / 1000)}s)`;
+  const digest = cs.digestIntervalMs
+    ? `每 ${fmtRelativeRemaining(Date.now() + cs.digestIntervalMs)}`
+    : '未开启';
+  const quiet = (cs.quietStartMin != null && cs.quietEndMin != null)
+    ? `${fmtMinOfDay(cs.quietStartMin)}-${fmtMinOfDay(cs.quietEndMin)}`
+    : '未设置';
+  return [
+    '<b>⚙️ 聊天设置</b>',
+    '',
+    `📐 新订阅默认档位：<b>${defaultLevels}</b>`,
+    `🔔 新订阅默认触发：<b>${defaultMode}</b>`,
+    `⏱ 新订阅默认冷却：<b>${defaultCooldown}</b>`,
+    `📋 定期摘要：<b>${digest}</b>`,
+    `🌙 勿扰时段：<b>${quiet}</b> <i>(${config.displayTzLabel || config.displayTz})</i>`,
+    `🕐 显示时区：<i>${config.displayTzLabel || config.displayTz} · env</i>`,
+    '',
+    '<i>已存在的订阅不受默认值影响；用 /levels /threshold 改单个。</i>',
+  ].join('\n');
+}
+
+function buildSettingsKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '📐 默认档位',  callback_data: 'setings:levels' },
+        { text: '🔔 默认触发',  callback_data: 'setings:trigger' },
+      ],
+      [
+        { text: '⏱ 默认冷却',  callback_data: 'setings:cooldown' },
+        { text: '📋 摘要频率',  callback_data: 'setings:digest' },
+      ],
+      [
+        { text: '🌙 勿扰时段',  callback_data: 'setings:quiet' },
+        { text: '↻ 全部重置',  callback_data: 'setings:reset' },
+      ],
+    ],
+  };
+}
+
+async function renderSettingsPanel(chatId) {
+  await sendMessage(chatId, settingsHeaderText(chatId), { replyMarkup: buildSettingsKeyboard() });
+}
+
+// Sub-flows for each setting button. Each one either toggles inline
+// (default trigger cycles through both/price/size) or opens a
+// ForceReply via pendingPrompt with a setings:* cmd value.
+async function handleSettingsCallback(chatId, messageId, callbackId, action) {
+  if (action === 'reset') {
+    setChatDefaultLevels(chatId, null);
+    setChatDefaultTriggerMode(chatId, null);
+    setChatDefaultCooldown(chatId, null);
+    setChatDigest(chatId, 0);
+    setChatQuiet(chatId, null, null);
+    await saveState();
+    await answerCallbackQuery(callbackId, { text: '已重置全部聊天设置' });
+    try { await editMessageText(chatId, messageId, settingsHeaderText(chatId), buildSettingsKeyboard()); } catch {}
+    return;
+  }
+  if (action === 'trigger') {
+    // Cycle: <unset> → both → price → size → <unset>
+    const cs = getChatSettings(chatId) ?? {};
+    const cur = cs.defaultTriggerMode ?? null;
+    const order = [null, 'both', 'price', 'size'];
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    setChatDefaultTriggerMode(chatId, next);
+    await saveState();
+    await answerCallbackQuery(callbackId, { text: next ? `默认触发: ${TRIGGER_LABEL[next]}` : '已清除（用 env）' });
+    try { await editMessageText(chatId, messageId, settingsHeaderText(chatId), buildSettingsKeyboard()); } catch {}
+    return;
+  }
+  // Everything else uses ForceReply.
+  const prompts = {
+    levels:   { headline: '<b>📐 设置默认档位</b>', hint: '回复要监控的档位，逗号分隔。可选: <code>bid1,bid2,bid3,ask1,ask2,ask3</code>。\n回复 <code>-</code> 清除（用 env 默认）。', placeholder: 'bid1,ask1' },
+    cooldown: { headline: '<b>⏱ 设置默认冷却</b>', hint: '回复一个时长（<code>30s</code> / <code>1m</code> / <code>5m</code>）；<code>-</code> 清除（用 env）。', placeholder: '30s / 1m / 5m' },
+    digest:   { headline: '<b>📋 摘要频率</b>',     hint: '回复时长（<code>30m</code> / <code>2h</code> / <code>1d</code>）；<code>off</code> 关闭。', placeholder: '30m / 2h / off' },
+    quiet:    { headline: '<b>🌙 勿扰时段</b>',     hint: '回复格式 <code>HH:MM-HH:MM</code>（例 <code>23:00-08:00</code>）；<code>off</code> 关闭。', placeholder: '23:00-08:00' },
+  };
+  const p = prompts[action];
+  if (!p) {
+    await answerCallbackQuery(callbackId);
+    return;
+  }
+  await answerCallbackQuery(callbackId);
+  const sent = await sendMessage(chatId, `${p.headline}\n\n📝 <b>回复此条消息</b>${p.hint ? ' ' + p.hint : ''}\n<i>30 分钟内有效。</i>`, {
+    replyMarkup: { force_reply: true, selective: true, input_field_placeholder: p.placeholder ?? '' },
+  });
+  putPendingPrompt(chatId, sent.message_id, `setings:${action}`);
+  await saveState();
+}
+
+// resolveAndDispatchPrompt also handles setings:* cmds by parsing
+// the reply text and calling the appropriate setter, then
+// re-rendering the panel.
+async function applySettingsReply(chatId, cmd, replyText) {
+  const action = cmd.slice('setings:'.length);
+  const text = String(replyText ?? '').trim();
+  if (action === 'levels') {
+    if (text === '-' || text === '——') {
+      setChatDefaultLevels(chatId, null);
+    } else {
+      const parts = text.split(/[,\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+      const valid = parts.filter((p) => ALL_LEVELS.includes(p));
+      if (!valid.length) {
+        await sendMessage(chatId, `❌ 无法识别档位。可选: <code>bid1,bid2,bid3,ask1,ask2,ask3</code>`);
+        return;
+      }
+      setChatDefaultLevels(chatId, valid);
+    }
+  } else if (action === 'cooldown') {
+    if (text === '-' || text === '——' || text === 'off') {
+      setChatDefaultCooldown(chatId, null);
+    } else {
+      const ms = parseDurationMs(text);
+      if (!ms || ms < 1000) {
+        await sendMessage(chatId, `❌ 无法识别时长。例：<code>30s</code> / <code>1m</code> / <code>5m</code>`);
+        return;
+      }
+      setChatDefaultCooldown(chatId, ms);
+    }
+  } else if (action === 'digest') {
+    if (text === 'off' || text === '0' || text === '-') {
+      setChatDigest(chatId, 0);
+    } else {
+      const ms = parseDurationMs(text);
+      if (!ms || ms < 60_000) {
+        await sendMessage(chatId, `❌ 最小 1 分钟。例：<code>30m</code> / <code>2h</code> / <code>1d</code>`);
+        return;
+      }
+      setChatDigest(chatId, ms);
+    }
+  } else if (action === 'quiet') {
+    if (text === 'off' || text === '-') {
+      setChatQuiet(chatId, null, null);
+    } else {
+      const m = text.match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/);
+      if (!m) {
+        await sendMessage(chatId, '❌ 格式应为 <code>HH:MM-HH:MM</code>（例 <code>23:00-08:00</code>）');
+        return;
+      }
+      const sh = Number(m[1]), sm = Number(m[2]), eh = Number(m[3]), em = Number(m[4]);
+      if (sh > 23 || sm > 59 || eh > 23 || em > 59) {
+        await sendMessage(chatId, '❌ 小时 0-23、分钟 0-59');
+        return;
+      }
+      setChatQuiet(chatId, sh * 60 + sm, eh * 60 + em);
+    }
+  }
+  await saveState();
+  await sendMessage(chatId, '✓ 已保存。');
+  await renderSettingsPanel(chatId);
+}
+
 async function runHistoryView(chatId, marketId, n = 10) {
   const events = await readEvents({ chatId, marketId, limit: n });
   if (!events.length) {
@@ -1349,6 +1526,12 @@ async function promptCommandTarget(chatId, cmd, { args = {}, headline, hint, pla
 // to the cmd handler with the saved args. Used by every URL-aware
 // reply prompt (/stats /history /probe /threshold /levels).
 async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
+  // Settings sub-flows don't need a market resolution — the reply IS
+  // the value (duration / levels list / HH:MM range).
+  if (cmd.startsWith('setings:')) {
+    await applySettingsReply(chatId, cmd, replyText);
+    return;
+  }
   const trimmed = String(replyText ?? '').trim();
   if (!trimmed) {
     await sendMessage(chatId, '❌ 回复内容为空。');
@@ -1699,6 +1882,8 @@ async function applyBulkWatchInput(chatId, raw) {
   }
 
   const results = [];
+  const failedLines = []; // raw lines for "🔁 重试失败项" button
+  const eventPickers = []; // { target, matches } — sent as pickers below
   for (const line of lines) {
     const { target, note } = parseWatchLine(line);
     const noteSuffix = note ? `  📝 ${htmlEscape(note)}` : '';
@@ -1707,7 +1892,11 @@ async function applyBulkWatchInput(chatId, raw) {
     if (id) {
       try {
         const market = await getMarketById(id);
-        if (!market) { results.push(`✗ <code>${htmlEscape(id)}</code> 市场不存在`); continue; }
+        if (!market) {
+          results.push(`✗ <code>${htmlEscape(id)}</code> 市场不存在`);
+          failedLines.push(line);
+          continue;
+        }
         addSubscription({
           chatId,
           marketId: id,
@@ -1719,6 +1908,7 @@ async function applyBulkWatchInput(chatId, raw) {
         results.push(`✓ <code>${id}</code> ${htmlEscape((market.title ?? '').slice(0, 50))}${noteSuffix}`);
       } catch (err) {
         results.push(`✗ <code>${htmlEscape(id)}</code> ${htmlEscape(err.message).slice(0, 60)}`);
+        failedLines.push(line);
       }
       continue;
     }
@@ -1727,6 +1917,7 @@ async function applyBulkWatchInput(chatId, raw) {
       const r = await resolveUrlToMarkets(target);
       if (!r.markets.length) {
         results.push(`✗ <code>${htmlEscape(target).slice(0, 50)}</code> 找不到`);
+        failedLines.push(line);
         continue;
       }
       if (r.markets.length === 1) {
@@ -1741,19 +1932,48 @@ async function applyBulkWatchInput(chatId, raw) {
         });
         results.push(`✓ <code>${m.id}</code> ${htmlEscape((m.title ?? '').slice(0, 50))}${noteSuffix}`);
       } else {
-        results.push(`⚠ <code>${htmlEscape(target).slice(0, 40)}</code> 是事件页（${r.markets.length} 个子市场，请单独发送以选择）`);
+        results.push(`📍 <code>${htmlEscape(target).slice(0, 40)}</code> 事件页（${r.markets.length} 个子市场，已弹选择器 ↓）`);
+        eventPickers.push({ target, matches: r.markets });
       }
     } catch (err) {
       results.push(`✗ <code>${htmlEscape(target).slice(0, 40)}</code> ${htmlEscape(err.message).slice(0, 60)}`);
+      failedLines.push(line);
     }
   }
   await saveState();
   const ok = results.filter((r) => r.startsWith('✓')).length;
+  // Build retry button only if there are recoverable failures.
+  const summaryButtons = [];
+  if (failedLines.length) {
+    const retryToken = shortToken();
+    putPendingBulkRetry(chatId, retryToken, failedLines);
+    await saveState();
+    summaryButtons.push([{
+      text: `🔁 重试失败项 (${failedLines.length})`,
+      callback_data: `retry:${retryToken}`,
+    }]);
+  }
   await sendMessage(chatId, [
     `<b>📥 批量订阅完成</b>  ✓${ok} / ${results.length}`,
     '',
     ...results,
-  ].join('\n'));
+  ].join('\n'), summaryButtons.length ? { replyMarkup: { inline_keyboard: summaryButtons } } : undefined);
+
+  // Pre-emptively send a picker for every event-page line so the user
+  // doesn't have to re-paste those URLs individually. Each picker is
+  // a separate message with the standard multi-select keyboard.
+  for (const ep of eventPickers) {
+    const token = shortToken();
+    putPendingChoice(chatId, token, ep.matches, []);
+    await saveState();
+    const existingIds = existingMatchIds(chatId, ep.matches);
+    await sendMessage(chatId, [
+      `<b>📍 ${htmlEscape(ep.target.slice(0, 60))}</b>`,
+      buildChoiceHeaderText(ep.matches, 0, existingIds.size),
+    ].join('\n'), {
+      replyMarkup: buildChoiceKeyboard(token, ep.matches, [], existingIds),
+    });
+  }
 }
 
 async function applyNoteInput(chatId, marketId, raw) {
@@ -2026,6 +2246,26 @@ async function handleCallback(cb) {
     return;
   }
 
+  const settingsMatch = data.match(/^setings:(.+)$/);
+  if (settingsMatch) {
+    await handleSettingsCallback(chatId, messageId, cb.id, settingsMatch[1]);
+    return;
+  }
+
+  // Retry button on a batch-subscribe result message.
+  const retryMatch = data.match(/^retry:([a-z0-9]+)$/);
+  if (retryMatch) {
+    const lines = takePendingBulkRetry(chatId, retryMatch[1]);
+    if (!lines || !lines.length) {
+      await answerCallbackQuery(cb.id, { text: '重试列表已过期', showAlert: true });
+      return;
+    }
+    await saveState();
+    await answerCallbackQuery(cb.id, { text: `重试 ${lines.length} 项…` });
+    await applyBulkWatchInput(chatId, lines.join('\n'));
+    return;
+  }
+
   const probeMatch = data.match(/^probe:(\d+)$/);
   if (probeMatch) {
     const id = probeMatch[1];
@@ -2149,6 +2389,7 @@ async function pollUpdates(signal) {
     gcPendingNotes();
     gcPendingWatch();
     gcPendingPrompts();
+    gcPendingBulkRetry();
   }
 }
 
@@ -2173,6 +2414,7 @@ async function main() {
     { command: 'resume',    description: '恢复推送' },
     { command: 'quiet',     description: '勿扰时段，例 23:00-08:00' },
     { command: 'digest',    description: '定期摘要（防遗漏盘口）' },
+    { command: 'settings',  description: '聊天设置面板（默认档位/触发/摘要/勿扰…）' },
     { command: 'status',    description: 'Bot 健康状态' },
     { command: 'export',    description: '导出 history.jsonl' },
     { command: 'speedtest', description: '测抓取延迟' },
