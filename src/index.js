@@ -73,6 +73,7 @@ const HELP_DETAIL = [
   '/speedtest [N] — 测延迟（默认 5 次），给出推荐的最快 POLL_INTERVAL_MS',
   '/stop &lt;id&gt; — 取消订阅（弹确认）',
   '/stopall — 取消全部订阅（弹确认）',
+  '/resetthresholds — 把所有订阅的阈值改回全局默认（弹确认）',
   '',
   '<b>📐 通知里的标记</b>',
   '👁 = 监控中的档位 · ↑/↓ = 价格或量的变化方向',
@@ -1103,6 +1104,37 @@ async function handleCommand(chatId, text) {
     await sendMessage(chatId, lines.join('\n'));
     return true;
   }
+  if (c === '/resetthresholds') {
+    const subs = listSubscriptionsForChat(chatId);
+    const overridden = subs.filter((s) => s.thresholds && Object.keys(s.thresholds).length > 0);
+    if (!subs.length) {
+      await sendMessage(chatId, '当前没有订阅。');
+      return true;
+    }
+    if (!overridden.length) {
+      await sendMessage(chatId, [
+        `<b>所有 ${subs.length} 个订阅已经在用全局默认</b>`,
+        ``,
+        `<i>价 ≥ ${config.priceEpsilon} · 量 ≥ ${config.sizeAbsoluteMin} 张 / ${(config.sizeRelativeEpsilon * 100).toFixed(0)}% · 冷却 ${Math.round(config.notifyCooldownMs / 1000)}s</i>`,
+      ].join('\n'));
+      return true;
+    }
+    await sendMessage(chatId, [
+      `⚠️ <b>把 ${overridden.length}/${subs.length} 个订阅的阈值改回全局默认？</b>`,
+      ``,
+      `将清除每条订阅自己保存的 priceEpsilon / sizeAbsoluteMin / sizeRelativeEpsilon / notifyCooldownMs 覆盖，统一回到：`,
+      `<i>价 ≥ ${config.priceEpsilon} · 量 ≥ ${config.sizeAbsoluteMin} 张 / ${(config.sizeRelativeEpsilon * 100).toFixed(0)}% · 冷却 ${Math.round(config.notifyCooldownMs / 1000)}s</i>`,
+    ].join('\n'), {
+      replyMarkup: {
+        inline_keyboard: [[
+          { text: '✅ 全部重置', callback_data: 'resetth_ok' },
+          { text: '↩️ 返回', callback_data: 'resetth_no' },
+        ]],
+      },
+    });
+    return true;
+  }
+
   if (c === '/stopall') {
     const subs = listSubscriptionsForChat(chatId);
     if (!subs.length) {
@@ -2264,6 +2296,39 @@ async function handleCallback(cb) {
     return;
   }
 
+  if (data === 'resetth_ok') {
+    const subs = listSubscriptionsForChat(chatId);
+    let cleared = 0;
+    for (const s of subs) {
+      if (s.thresholds && Object.keys(s.thresholds).length > 0) {
+        setSubscriptionThresholds(chatId, s.marketId, null);
+        cleared += 1;
+      }
+    }
+    if (cleared) await saveState();
+    await answerCallbackQuery(cb.id, { text: `已重置 ${cleared}` });
+    if (messageId) {
+      try {
+        await editMessageText(chatId, messageId, [
+          `✅ <b>已重置 ${cleared} 个订阅的阈值</b>`,
+          ``,
+          `<i>统一使用全局默认：价 ≥ ${config.priceEpsilon} · 量 ≥ ${config.sizeAbsoluteMin} 张 / ${(config.sizeRelativeEpsilon * 100).toFixed(0)}% · 冷却 ${Math.round(config.notifyCooldownMs / 1000)}s</i>`,
+        ].join('\n'));
+      } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  if (data === 'resetth_no') {
+    await answerCallbackQuery(cb.id, { text: '已取消' });
+    if (messageId) {
+      try {
+        await editMessageText(chatId, messageId, '↩️ 已返回，阈值未变。');
+      } catch { /* ignore */ }
+    }
+    return;
+  }
+
   const settingsMatch = data.match(/^setings:(.+)$/);
   if (settingsMatch) {
     await handleSettingsCallback(chatId, messageId, cb.id, settingsMatch[1]);
@@ -2438,6 +2503,7 @@ async function main() {
     { command: 'speedtest', description: '测抓取延迟' },
     { command: 'stop',      description: '取消单个订阅' },
     { command: 'stopall',   description: '取消全部订阅' },
+    { command: 'resetthresholds', description: '把所有订阅阈值改回全局默认' },
   ]).catch((e) => console.warn('[bot] setMyCommands failed:', e.message));
 
   // Once-per-startup history compaction (also throttled to ≤1×/24h
