@@ -2513,10 +2513,6 @@ async function main() {
   await setMyCommands([
     { command: 'start',     description: '主页 · 开始监控' },
     { command: 'list',      description: '我的订阅（分页 + 操作按钮）' },
-    { command: 'threshold', description: '改单市场灵敏度（低/平衡/高频）' },
-    { command: 'pause',     description: '暂停推送（默认 1h）' },
-    { command: 'resume',    description: '恢复推送' },
-    { command: 'quiet',     description: '勿扰时段，例 23:00-08:00' },
     { command: 'digest',    description: '定期摘要（防遗漏盘口）' },
     { command: 'digestlog', description: '查看历史摘要（睡醒补看）' },
     { command: 'settings',  description: '聊天设置面板（默认档位/触发/摘要/勿扰…）' },
