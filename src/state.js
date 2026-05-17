@@ -186,6 +186,17 @@ export function setSubscriptionInitial(chatId, marketId, snapshot) {
   return s;
 }
 
+// Snapshot of the orderbook at the last time we sent an alert for
+// this sub. Persisted so a redeploy/restart doesn't wipe the in-memory
+// `lastBookPerSub` baseline and dump a fake "🆕 初次抓取" alert for
+// every existing sub on the first post-restart poll.
+export function setSubscriptionLastSnap(chatId, marketId, snapshot) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  s.lastSnap = snapshot;
+  return s;
+}
+
 // Per-sub pause window. untilMs=null clears the pause; otherwise stores
 // a UTC ms timestamp after which the sub auto-resumes (monitor.js does
 // the resume-check on every tick so no scheduler is needed).

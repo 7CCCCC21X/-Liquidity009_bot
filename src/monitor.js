@@ -4,6 +4,7 @@ import { sendMessage, htmlEscape } from './telegram.js';
 import {
   listAllSubscriptions, removeSubscription, saveState,
   setSubscriptionInitial, setSubscriptionDigestBaseline,
+  setSubscriptionLastSnap,
   getAllChatSettings, markChatDigestSent, isChatInQuietHours,
   ALL_LEVELS, LEVEL_LABEL, subKey,
 } from './state.js';
@@ -76,6 +77,15 @@ export function primeSubscriptionSnapshot(chatId, marketId, snap) {
   lastNotify.set(k, Date.now());
   // Resubscribe path: drop any stale excursion buffered for this key.
   pendingExcursion.delete(k);
+  // Persist so a redeploy right after subscribe doesn't re-alert.
+  // sendSubscribed awaits a saveState() after this call.
+  setSubscriptionLastSnap(chatId, marketId, {
+    bestBid: snap.bestBid,
+    bestAsk: snap.bestAsk,
+    bids: snap.bids,
+    asks: snap.asks,
+    atMs: snap.updatedAtMs ?? Date.now(),
+  });
   setSubscriptionInitial(chatId, marketId, {
     bestBid: snap.bestBid,
     bestAsk: snap.bestAsk,
@@ -501,7 +511,18 @@ async function pollOnce() {
       const levels = s.levels?.length ? s.levels : ALL_LEVELS;
       const mode = s.triggerMode || 'both';
       const k = subKey(s.chatId, s.marketId);
-      const prev = lastBookPerSub.get(k);
+      // Hydrate the in-memory baseline from the persisted last-alert
+      // snapshot on the first poll after a restart. Without this every
+      // sub fires "🆕 初次抓取" right after a redeploy because the
+      // in-memory Map starts empty. We also cache the hydrated value
+      // back into lastBookPerSub so subsequent polls in the same
+      // process don't keep going to the (slower, allocating) object
+      // path.
+      let prev = lastBookPerSub.get(k);
+      if (!prev && s.lastSnap) {
+        prev = s.lastSnap;
+        lastBookPerSub.set(k, prev);
+      }
       // Backfill the "vs 监控起点" baseline for subs created before
       // this feature shipped. Set once per sub on the first poll
       // after upgrade; saveState lazily after the loop.
@@ -514,6 +535,23 @@ async function pollOnce() {
           atMs: Date.now(),
         });
         needsSave = true;
+      }
+      // Still no baseline — legacy sub from before lastSnap shipped,
+      // or a prime that failed at subscribe time. Silently establish
+      // it now instead of firing "🆕 初次抓取" for every existing
+      // sub on the first deploy of this feature.
+      if (!prev) {
+        lastBookPerSub.set(k, snap);
+        lastNotify.set(k, now);
+        setSubscriptionLastSnap(s.chatId, s.marketId, {
+          bestBid: snap.bestBid,
+          bestAsk: snap.bestAsk,
+          bids: snap.bids,
+          asks: snap.asks,
+          atMs: snap.updatedAtMs ?? now,
+        });
+        needsSave = true;
+        continue;
       }
       // Skip paused subs; reset baseline so resume doesn't dump a
       // stale diff. Auto-clear when the timer is up — handled by
@@ -620,6 +658,18 @@ async function pollOnce() {
         }
         lastNotify.set(k, now);
         lastBookPerSub.set(k, snap);
+        // Persist a trimmed copy of the same snapshot so a redeploy
+        // can hydrate this sub's baseline without dumping a 🆕 flood.
+        // Saved with bestBid/bestAsk + top-3 levels — same shape the
+        // bookChanged check reads.
+        setSubscriptionLastSnap(s.chatId, s.marketId, {
+          bestBid: snap.bestBid,
+          bestAsk: snap.bestAsk,
+          bids: snap.bids,
+          asks: snap.asks,
+          atMs: snap.updatedAtMs ?? now,
+        });
+        needsSave = true;
         // Excursion has been delivered (or muted but counted). Safe to
         // clear; a fresh window starts now.
         pendingExcursion.delete(k);
