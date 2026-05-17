@@ -14,6 +14,7 @@
     "diagnose": "node --env-file=.env scripts/diagnose.js",
     "prune-history": "node --env-file=.env scripts/prune-history.js",
     "backfill-question": "node --env-file=.env scripts/backfill-question.js",
+    "reset-thresholds": "node --env-file=.env scripts/reset-thresholds.js",
     "check": "node --check src/*.js scripts/*.js"
   }
 }
