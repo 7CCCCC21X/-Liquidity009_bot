@@ -771,7 +771,19 @@ export async function sendDigestForChat(chatId) {
 
   lines.push('', `<i>改频率 /digest · 历史 /history &lt;id&gt; · 统计 /stats &lt;id&gt;</i>`);
 
-  await sendMessage(chatId, lines.join('\n'));
+  const text = lines.join('\n');
+  await sendMessage(chatId, text);
+
+  // Persist the rendered digest so /digestlog can replay past summaries
+  // (e.g. user wakes up and wants to see what was sent overnight).
+  // Stored alongside per-event records in history.jsonl with type='digest';
+  // /history filters by missing type, so this doesn't pollute that view.
+  await appendEvent({
+    type: 'digest',
+    chatId,
+    text,
+    totals: { changed: changed.length, fresh: fresh.length, unchanged: unchanged.length },
+  });
 
   // Update baseline for every sub that has a snapshot now — including
   // unchanged (so the baseline stays "the last time we summarised").

@@ -1,6 +1,6 @@
 import { config, requireConfig } from './config.js';
 import { getUpdates, sendMessage, editMessageText, sendDocument, answerCallbackQuery, setMyCommands, getMe, htmlEscape } from './telegram.js';
-import { readEvents, readWholeFile, fileStats, maybePrune } from './history.js';
+import { readEvents, readDigests, readWholeFile, fileStats, maybePrune } from './history.js';
 import {
   loadState, saveState, getState,
   addSubscription, removeSubscription, listSubscriptionsForChat,
@@ -63,6 +63,7 @@ const HELP_DETAIL = [
   '/levels &lt;id&gt; — 自定义档位 + 触发模式（价+量 / 只看价 / 只看量）',
   '/note &lt;id&gt; — 弹输入框输入备注（或 /note &lt;id&gt; 文字 直接设；/note &lt;id&gt; - 清除）',
   '/digest [时长] — 定期摘要，例 <code>/digest 30m</code>；不带参数显示当前 + 立即来一份',
+  '/digestlog [N=5] — 回看最近 N 份历史摘要（睡醒补看）',
   '/quiet &lt;HH:MM-HH:MM&gt; — 勿扰时段（例 23:00-08:00），勿扰期间只写历史不推送',
   '/settings — 聊天设置面板（默认档位 / 默认触发 / 默认冷却 / 摘要 / 勿扰）',
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
@@ -1082,6 +1083,32 @@ async function handleCommand(chatId, text) {
       '',
       '<i>取消：/digest off · 改频率：/digest 新时长 · 立即触发一次：再发 /digest 即可。</i>',
     ].join('\n'));
+    return true;
+  }
+  if (c === '/digestlog') {
+    // Replay the last N digests so the user can catch up after sleep /
+    // travel without manually scrolling chat history. Default 5; cap
+    // at 20 to avoid spamming the chat with a huge wall of messages.
+    const n = Math.max(1, Math.min(20, parseInt(args[0], 10) || 5));
+    const digests = await readDigests({ chatId, limit: n });
+    if (!digests.length) {
+      await sendMessage(chatId, [
+        '<i>📭 还没有任何摘要记录。</i>',
+        '',
+        '<i>开启定期摘要：<code>/digest 30m</code></i>',
+      ].join('\n'));
+      return true;
+    }
+    await sendMessage(chatId, `<i>📚 最近 ${digests.length} 份摘要（旧→新）：</i>`);
+    // readDigests returns newest→oldest; flip to chronological so the
+    // newest one lands at the bottom (where the chat auto-scrolls).
+    for (const d of digests.slice().reverse()) {
+      try {
+        await sendMessage(chatId, d.text);
+      } catch (err) {
+        console.warn('[digestlog] send failed:', err.message);
+      }
+    }
     return true;
   }
   if (c === '/status') {
@@ -2485,18 +2512,13 @@ async function main() {
   // /start now serves the same welcome screen.
   await setMyCommands([
     { command: 'start',     description: '主页 · 开始监控' },
-    { command: 'watch',     description: '批量订阅（粘贴多行 URL/id/slug）' },
     { command: 'list',      description: '我的订阅（分页 + 操作按钮）' },
-    { command: 'levels',    description: '改档位 + 触发模式' },
-    { command: 'note',      description: '加 / 改备注' },
-    { command: 'probe',     description: '立即抓一次盘口' },
-    { command: 'history',   description: '查看历史变动' },
-    { command: 'stats',     description: '市场统计（最大Δ、价差、触发次数）' },
     { command: 'threshold', description: '改单市场灵敏度（低/平衡/高频）' },
     { command: 'pause',     description: '暂停推送（默认 1h）' },
     { command: 'resume',    description: '恢复推送' },
     { command: 'quiet',     description: '勿扰时段，例 23:00-08:00' },
     { command: 'digest',    description: '定期摘要（防遗漏盘口）' },
+    { command: 'digestlog', description: '查看历史摘要（睡醒补看）' },
     { command: 'settings',  description: '聊天设置面板（默认档位/触发/摘要/勿扰…）' },
     { command: 'status',    description: 'Bot 健康状态' },
     { command: 'export',    description: '导出 history.jsonl' },

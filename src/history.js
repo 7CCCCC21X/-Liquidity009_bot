@@ -37,6 +37,32 @@ export async function appendEvent(evt) {
   return _appendQueue.catch(() => {});
 }
 
+// Same backwards scan as readEvents, but filters to type='digest'.
+// Used by /digestlog so the user can replay summaries they missed
+// (overnight, while travelling, etc.). Returns newest-first.
+export async function readDigests({ chatId, limit = 10 } = {}) {
+  if (!config.historyEnabled) return [];
+  let raw;
+  try {
+    raw = await fs.readFile(config.historyFile, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
+  }
+  const lines = raw.split('\n');
+  const out = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+    const line = lines[i];
+    if (!line) continue;
+    let evt;
+    try { evt = JSON.parse(line); } catch { continue; }
+    if (evt.type !== 'digest') continue;
+    if (chatId != null && String(evt.chatId) !== String(chatId)) continue;
+    out.push(evt);
+  }
+  return out;
+}
+
 // Tail the file for the last N events matching a filter. Reads the
 // whole file then walks backwards — fine for the 14-day default; if
 // the file ever gets huge consider an indexed format. limit is a hard
