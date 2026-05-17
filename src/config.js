@@ -69,9 +69,13 @@ export const config = {
   graphqlTimeoutMs: envNum('GRAPHQL_TIMEOUT_MS', 30_000),
   orderbookTimeoutMs: envNum('ORDERBOOK_TIMEOUT_MS', 10_000),
 
-  priceEpsilon: envNum('PRICE_EPSILON', 0.005),
-  sizeRelativeEpsilon: envNum('SIZE_RELATIVE_EPSILON', 0.10),
-  sizeAbsoluteMin: envNum('SIZE_ABSOLUTE_MIN', 50),
+  // Predict.fun prices live on a 0–1 scale rendered as cents (44¢ =
+  // 0.44 internally), so the smallest visible tick is 0.001. Default
+  // priceEpsilon=0.001 means any single-cent-tenth move (e.g. 44.0 →
+  // 44.1) clears the gate.
+  priceEpsilon: envNum('PRICE_EPSILON', 0.001),
+  sizeRelativeEpsilon: envNum('SIZE_RELATIVE_EPSILON', 0.05),
+  sizeAbsoluteMin: envNum('SIZE_ABSOLUTE_MIN', 10),
   notifyCooldownMs: envNum('NOTIFY_COOLDOWN_SEC', 60) * 1000,
 
   // Defaults applied to NEW subscriptions when the user doesn't pick

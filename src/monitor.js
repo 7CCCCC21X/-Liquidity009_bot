@@ -14,6 +14,14 @@ import { appendEvent } from './history.js';
 // state). Per-sub last notify time enforces NOTIFY_COOLDOWN_SEC.
 const lastBookPerSub = new Map();
 const lastNotify = new Map();
+// Excursion buffer: during cooldown, if the book briefly moves away
+// from prev and then snaps back, the standard A→B→A pattern leaves
+// `bookChanged(prev=A, cur=A)` = false once cooldown lifts, so the B
+// excursion is silently lost. We stash the most-recent over-threshold
+// deviation here while cooldown is active; on the first poll after
+// cooldown, the buffer is preferred over the (possibly reverted)
+// current snap so the user still hears about the move.
+const pendingExcursion = new Map();
 
 // Build a Predict.fun market URL, optionally with the configured
 // referral code. Returns null when slug is missing — caller falls
@@ -66,6 +74,8 @@ export function primeSubscriptionSnapshot(chatId, marketId, snap) {
   // we didn't send an in-band alert. Stops a cooldown=1s subscription
   // from being woken up by the very next poll.
   lastNotify.set(k, Date.now());
+  // Resubscribe path: drop any stale excursion buffered for this key.
+  pendingExcursion.delete(k);
   setSubscriptionInitial(chatId, marketId, {
     bestBid: snap.bestBid,
     bestAsk: snap.bestAsk,
@@ -510,30 +520,63 @@ async function pollOnce() {
       // index.js periodically since we can't write state from here.
       if (s.pausedUntil && now < s.pausedUntil) {
         lastBookPerSub.set(k, snap);
+        pendingExcursion.delete(k);
         continue;
       }
       // Empty levels = monitoring nothing (user toggled all off). Snapshot
       // the book so re-enabling levels later doesn't dump a stale diff.
       if (!s.levels?.length) {
         lastBookPerSub.set(k, snap);
+        pendingExcursion.delete(k);
         continue;
       }
       const th = effectiveThresholds(s);
-      if (!bookChanged(prev, snap, levels, mode, th)) continue;
+      const curChanged = bookChanged(prev, snap, levels, mode, th);
       const lastSentAt = lastNotify.get(k) ?? 0;
-      if (prev && now - lastSentAt < th.notifyCooldownMs) continue;
-      const alertHead = fmtAlertHeadline(prev, snap, levels, mode, th);
+      const inCooldown = prev && now - lastSentAt < th.notifyCooldownMs;
+
+      // Inside the cooldown window: stash the latest over-threshold
+      // deviation from prev so an A→B→A bounce can still be reported
+      // after the window lifts. Overwriting (instead of "keep peak")
+      // is intentional — the most recent excursion is the one most
+      // likely to still be relevant when the user sees it.
+      if (inCooldown) {
+        if (curChanged) pendingExcursion.set(k, snap);
+        continue;
+      }
+
+      // Cooldown clear. Choose the snap to alert against:
+      //   1. current snap if it differs from prev (normal case)
+      //   2. buffered excursion if the book reverted during cooldown
+      //      and we'd otherwise drop the entire A→B→A move
+      let alertSnap = snap;
+      let isRebound = false;
+      if (!curChanged) {
+        const buffered = pendingExcursion.get(k);
+        if (buffered && bookChanged(prev, buffered, levels, mode, th)) {
+          alertSnap = buffered;
+          isRebound = true;
+        } else {
+          pendingExcursion.delete(k);
+          continue;
+        }
+      }
+      const alertHead = fmtAlertHeadline(prev, alertSnap, levels, mode, th);
       const headlineText = `${alertHead.emoji} ${alertHead.text}`;
-      const body = fmtBook(prev, snap, levels);
-      const spreadLine = fmtSpreadLine(snap);
-      const changeLines = fmtChangeLines(prev, snap, levels, mode, th);
-      const sinceInitialLines = fmtSinceInitialLines(s.initial, snap, levels, mode);
+      const body = fmtBook(prev, alertSnap, levels);
+      const spreadLine = fmtSpreadLine(alertSnap);
+      const changeLines = fmtChangeLines(prev, alertSnap, levels, mode, th);
+      const sinceInitialLines = fmtSinceInitialLines(s.initial, alertSnap, levels, mode);
       const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
       // Layout: high-contrast emoji+bold change FIRST so the chat
       // visually pops vs subscribe-success (✅) and probe (🔍), and
       // the iOS/Android notification banner shows the actionable bit.
       // Title link below for context.
       const lines = [`${alertHead.emoji} <b>${htmlEscape(alertHead.text)}</b>`];
+      // Rebound marker: the excursion happened during cooldown and
+      // has since reverted; the snapshot below shows the moment of
+      // peak deviation, not the current book state.
+      if (isRebound) lines.push('<i>🔄 已回弹（冷却期内的瞬时偏离，当前已恢复）</i>');
       lines.push(`📊 ${titleLink}`);
       {
         const qSub = questionSubtitle(s);
@@ -577,6 +620,9 @@ async function pollOnce() {
         }
         lastNotify.set(k, now);
         lastBookPerSub.set(k, snap);
+        // Excursion has been delivered (or muted but counted). Safe to
+        // clear; a fresh window starts now.
+        pendingExcursion.delete(k);
         // Persist a structured record of the change. Keep the payload
         // small — top of book + summary is enough to reconstruct what
         // moved when reading later. prev=null on first poll.
@@ -594,9 +640,9 @@ async function pollOnce() {
             bestBid: prev.bestBid, bestAsk: prev.bestAsk,
             bids: prev.bids, asks: prev.asks,
           } : null,
-          cur: { bestBid: snap.bestBid, bestAsk: snap.bestAsk, bids: snap.bids, asks: snap.asks },
+          cur: { bestBid: alertSnap.bestBid, bestAsk: alertSnap.bestAsk, bids: alertSnap.bids, asks: alertSnap.asks },
           slug: s.slug || null,
-          updatedAtMs: snap.updatedAtMs,
+          updatedAtMs: alertSnap.updatedAtMs,
         });
       } catch (err) {
         console.warn('[monitor] send failed', s.chatId, err.message);
