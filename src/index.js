@@ -63,7 +63,7 @@ const HELP_DETAIL = [
   '/levels &lt;id&gt; — 自定义档位 + 触发模式（价+量 / 只看价 / 只看量）',
   '/note &lt;id&gt; — 弹输入框输入备注（或 /note &lt;id&gt; 文字 直接设；/note &lt;id&gt; - 清除）',
   '/digest [时长] — 定期摘要，例 <code>/digest 30m</code>；不带参数显示当前 + 立即来一份',
-  '/digestlog [N=5] — 回看最近 N 份历史摘要（睡醒补看）',
+  '/digestlog — 回看历史摘要（弹卡片选时间窗 / 自定义时长）',
   '/quiet &lt;HH:MM-HH:MM&gt; — 勿扰时段（例 23:00-08:00），勿扰期间只写历史不推送',
   '/settings — 聊天设置面板（默认档位 / 默认触发 / 默认冷却 / 摘要 / 勿扰）',
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
@@ -1086,29 +1086,26 @@ async function handleCommand(chatId, text) {
     return true;
   }
   if (c === '/digestlog') {
-    // Replay the last N digests so the user can catch up after sleep /
-    // travel without manually scrolling chat history. Default 5; cap
-    // at 20 to avoid spamming the chat with a huge wall of messages.
-    const n = Math.max(1, Math.min(20, parseInt(args[0], 10) || 5));
-    const digests = await readDigests({ chatId, limit: n });
-    if (!digests.length) {
-      await sendMessage(chatId, [
-        '<i>📭 还没有任何摘要记录。</i>',
-        '',
-        '<i>开启定期摘要：<code>/digest 30m</code></i>',
-      ].join('\n'));
+    // Back-compat: bare number still works as a count cap. With no
+    // args, surface the picker card so the user can choose a time
+    // window without remembering syntax.
+    if (args.length === 0) {
+      await sendDigestLogPicker(chatId);
       return true;
     }
-    await sendMessage(chatId, `<i>📚 最近 ${digests.length} 份摘要（旧→新）：</i>`);
-    // readDigests returns newest→oldest; flip to chronological so the
-    // newest one lands at the bottom (where the chat auto-scrolls).
-    for (const d of digests.slice().reverse()) {
-      try {
-        await sendMessage(chatId, d.text);
-      } catch (err) {
-        console.warn('[digestlog] send failed:', err.message);
-      }
+    const arg = args[0];
+    const asNum = parseInt(arg, 10);
+    if (Number.isFinite(asNum) && /^\d+$/.test(arg)) {
+      await runDigestLog(chatId, { count: Math.max(1, Math.min(50, asNum)) });
+      return true;
     }
+    // Else parse as a duration (e.g. /digestlog 3h)
+    const ms = parseDurationMs(arg);
+    if (!ms) {
+      await sendMessage(chatId, '❌ 用法：<code>/digestlog</code>（弹卡片选）· <code>/digestlog 10</code>（最近 10 份）· <code>/digestlog 6h</code>（最近 6 小时）');
+      return true;
+    }
+    await runDigestLog(chatId, { sinceMs: Date.now() - ms, windowLabel: arg });
     return true;
   }
   if (c === '/status') {
@@ -1558,6 +1555,73 @@ async function applySettingsReply(chatId, cmd, replyText) {
   await renderSettingsPanel(chatId);
 }
 
+// /digestlog picker card. Time-window presets plus a "custom" button
+// that opens a ForceReply (handled via the existing pendingPrompt
+// mechanism, cmd='digestlog'). Each preset button maps to a sinceMs
+// cutoff and dispatches runDigestLog directly.
+async function sendDigestLogPicker(chatId) {
+  await sendMessage(chatId, [
+    '<b>📚 查看历史摘要</b>',
+    '',
+    '<i>选一个时间窗口，发回这段时间内已发出过的摘要。</i>',
+  ].join('\n'), {
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '最近 1h', callback_data: 'dlog:1h' },
+          { text: '最近 6h', callback_data: 'dlog:6h' },
+          { text: '最近 12h', callback_data: 'dlog:12h' },
+        ],
+        [
+          { text: '最近 24h', callback_data: 'dlog:24h' },
+          { text: '最近 3 天', callback_data: 'dlog:3d' },
+          { text: '最近 7 天', callback_data: 'dlog:7d' },
+        ],
+        [
+          { text: '🕒 自定义时长…', callback_data: 'dlog:custom' },
+          { text: '🔢 最近 N 份…', callback_data: 'dlog:countN' },
+        ],
+      ],
+    },
+  });
+}
+
+// Render the digests for a chat. Pass either { sinceMs, windowLabel }
+// for a time window or { count } for a recent-N. Caps the reply at 20
+// messages to avoid hammering Telegram's rate limit.
+async function runDigestLog(chatId, { sinceMs, windowLabel, count } = {}) {
+  const HARD_CAP = 20;
+  const opts = { chatId, limit: HARD_CAP };
+  if (sinceMs) opts.sinceMs = sinceMs;
+  if (count) opts.limit = Math.min(HARD_CAP, count);
+  const digests = await readDigests(opts);
+  if (!digests.length) {
+    const label = sinceMs ? `最近 ${windowLabel ?? ''}` : (count ? `最近 ${count} 份` : '');
+    await sendMessage(chatId, [
+      `<i>📭 ${label}没有摘要记录。</i>`,
+      '',
+      '<i>开启定期摘要：<code>/digest 30m</code></i>',
+    ].join('\n'));
+    return;
+  }
+  const headerLabel = sinceMs
+    ? `最近 ${windowLabel ?? ''} 内 ${digests.length} 份`
+    : `最近 ${digests.length} 份`;
+  await sendMessage(chatId, `<i>📚 ${headerLabel}摘要（旧→新）：</i>`);
+  // readDigests returns newest→oldest; flip to chronological so the
+  // newest one lands at the bottom (where the chat auto-scrolls).
+  for (const d of digests.slice().reverse()) {
+    try {
+      await sendMessage(chatId, d.text);
+    } catch (err) {
+      console.warn('[digestlog] send failed:', err.message);
+    }
+  }
+  if (digests.length >= HARD_CAP) {
+    await sendMessage(chatId, `<i>… 已截断到最近 ${HARD_CAP} 份。需要更多可发 <code>/digestlog 时长</code>（如 <code>/digestlog 3d</code>）+ 调小摘要频率。</i>`);
+  }
+}
+
 async function runHistoryView(chatId, marketId, n = 10) {
   const events = await readEvents({ chatId, marketId, limit: n });
   if (!events.length) {
@@ -1605,6 +1669,28 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
   // the value (duration / levels list / HH:MM range).
   if (cmd.startsWith('setings:')) {
     await applySettingsReply(chatId, cmd, replyText);
+    return;
+  }
+  // /digestlog 自定义 sub-flow: the reply is a duration ("3h") or a
+  // bare integer ("10"); no market resolution needed.
+  if (cmd === 'digestlog') {
+    const t = String(replyText ?? '').trim();
+    if (args.kind === 'count') {
+      const n = parseInt(t, 10);
+      if (!Number.isFinite(n) || n < 1 || n > 50) {
+        await sendMessage(chatId, '❌ 请回复 1–50 的整数。');
+        return;
+      }
+      await runDigestLog(chatId, { count: n });
+      return;
+    }
+    // default: duration
+    const ms = parseDurationMs(t);
+    if (!ms) {
+      await sendMessage(chatId, '❌ 请回复有效时长，例 <code>3h</code> / <code>30m</code> / <code>2d</code>。');
+      return;
+    }
+    await runDigestLog(chatId, { sinceMs: Date.now() - ms, windowLabel: t });
     return;
   }
   const trimmed = String(replyText ?? '').trim();
@@ -2353,6 +2439,46 @@ async function handleCallback(cb) {
         await editMessageText(chatId, messageId, '↩️ 已返回，阈值未变。');
       } catch { /* ignore */ }
     }
+    return;
+  }
+
+  const dlogMatch = data.match(/^dlog:(.+)$/);
+  if (dlogMatch) {
+    const choice = dlogMatch[1];
+    if (choice === 'custom') {
+      await answerCallbackQuery(cb.id);
+      const sent = await sendMessage(chatId, [
+        '<b>🕒 自定义时长</b>',
+        '',
+        '📝 <b>回复此条消息</b>，发一个时长（例 <code>3h</code> / <code>30m</code> / <code>2d</code>）',
+        '<i>30 分钟内有效。</i>',
+      ].join('\n'), {
+        replyMarkup: { force_reply: true, selective: true, input_field_placeholder: '3h / 30m / 2d' },
+      });
+      putPendingPrompt(chatId, sent.message_id, 'digestlog', { kind: 'duration' });
+      return;
+    }
+    if (choice === 'countN') {
+      await answerCallbackQuery(cb.id);
+      const sent = await sendMessage(chatId, [
+        '<b>🔢 最近 N 份</b>',
+        '',
+        '📝 <b>回复此条消息</b>，发一个数字（1–50，例 <code>10</code>）',
+        '<i>30 分钟内有效。</i>',
+      ].join('\n'), {
+        replyMarkup: { force_reply: true, selective: true, input_field_placeholder: '10' },
+      });
+      putPendingPrompt(chatId, sent.message_id, 'digestlog', { kind: 'count' });
+      return;
+    }
+    // Preset duration buttons (1h / 6h / 12h / 24h / 3d / 7d)
+    const ms = parseDurationMs(choice);
+    if (!ms) {
+      await answerCallbackQuery(cb.id, { text: '未知选项', showAlert: true });
+      return;
+    }
+    await answerCallbackQuery(cb.id, { text: `加载最近 ${choice}…` });
+    await runDigestLog(chatId, { sinceMs: Date.now() - ms, windowLabel: choice });
     return;
   }
 

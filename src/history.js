@@ -40,7 +40,9 @@ export async function appendEvent(evt) {
 // Same backwards scan as readEvents, but filters to type='digest'.
 // Used by /digestlog so the user can replay summaries they missed
 // (overnight, while travelling, etc.). Returns newest-first.
-export async function readDigests({ chatId, limit = 10 } = {}) {
+// `sinceMs` (optional) bounds the scan to digests at or after that
+// timestamp; `limit` is always honoured as a hard cap.
+export async function readDigests({ chatId, limit = 10, sinceMs = 0 } = {}) {
   if (!config.historyEnabled) return [];
   let raw;
   try {
@@ -58,6 +60,7 @@ export async function readDigests({ chatId, limit = 10 } = {}) {
     try { evt = JSON.parse(line); } catch { continue; }
     if (evt.type !== 'digest') continue;
     if (chatId != null && String(evt.chatId) !== String(chatId)) continue;
+    if (sinceMs && evt.ts < sinceMs) break; // walking backwards in time
     out.push(evt);
   }
   return out;
