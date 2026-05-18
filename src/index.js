@@ -1681,19 +1681,26 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
   }
   rows.sort((a, b) => b.mag - a.mag);
   const moved = rows.filter((r) => r.mag >= 1e-9);
-  const flat = rows.filter((r) => r.mag < 1e-9);
+  const flatCount = rows.length - moved.length;
   const digestsBit = totalDigests
     ? (digestsWithData < totalDigests
         ? ` · ${digestsWithData}/${totalDigests} 份摘要有数据`
         : ` · 含 ${totalDigests} 份摘要`)
     : '';
   const lines = [
-    `<b>📊 ${windowLabel} 内有变动的市场（去重后）</b>`,
-    `<i>${rows.length} 个市场${digestsBit} · 每个市场只显示 1 次：窗口起点 → 终点 + 净变化</i>`,
+    `<b>📊 ${windowLabel} 内有变动的市场（去重后 ${moved.length} 个）</b>`,
+    `<i>共 ${rows.length} 个订阅市场${digestsBit} · 点市场名进 Predict.fun</i>`,
     '',
   ];
   if (digestsWithData < 2 && moved.length === 0) {
-    lines.push(`<i>⚠️ 这段时间只有 ${digestsWithData} 份带详细数据的摘要，无法计算窗口变化。等再多积累几份摘要后重试。</i>`, '');
+    lines.push(`<i>⚠️ 这段时间只有 ${digestsWithData} 份带详细数据的摘要，无法计算窗口变化。等再多积累几份摘要后重试。</i>`);
+    await sendMessage(chatId, lines.join('\n'));
+    return;
+  }
+  if (moved.length === 0) {
+    lines.push(`<i>✅ 全部 ${rows.length} 个市场都没有净变化。</i>`);
+    await sendMessage(chatId, lines.join('\n'));
+    return;
   }
   const dot = (dBid, dAsk) => {
     const dom = Math.abs(dBid) >= Math.abs(dAsk) ? dBid : dAsk;
@@ -1710,10 +1717,8 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
   if (moved.length > 30) {
     lines.push('', `<i>… 还有 ${moved.length - 30} 个有变化（按净 Δ 大小排序）</i>`);
   }
-  if (flat.length) {
-    const names = flat.slice(0, 12).map((r) => htmlEscape((r.title || `#${r.id}`).slice(0, 14))).join(' · ');
-    const extra = flat.length > 12 ? ` 等 ${flat.length} 个` : '';
-    lines.push('', `<i>· 净变化 0：${names}${extra}</i>`);
+  if (flatCount) {
+    lines.push('', `<i>· 另 ${flatCount} 个市场无变化（已隐藏）</i>`);
   }
   await sendMessage(chatId, lines.join('\n'));
 }
