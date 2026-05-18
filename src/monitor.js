@@ -6,6 +6,7 @@ import {
   setSubscriptionInitial, setSubscriptionDigestBaseline,
   setSubscriptionLastSnap,
   getAllChatSettings, markChatDigestSent, isChatInQuietHours,
+  isChatDigestOnly,
   ALL_LEVELS, LEVEL_LABEL, subKey,
 } from './state.js';
 import { appendEvent } from './history.js';
@@ -660,9 +661,12 @@ async function pollOnce() {
       lines.push('', `<code>id=${s.marketId}</code>`);
       const text = lines.join('\n');
       const replyMarkup = subActionKeyboard(s.marketId);
-      // Quiet hours: skip the Telegram send but still update baselines
-      // + write history so /digest /history /stats stay accurate.
-      const muted = isChatInQuietHours(s.chatId, now);
+      // Quiet hours OR digest-only mode: skip the Telegram send but
+      // still update baselines + write history so /digest /history
+      // /stats / /digestlog stay accurate. digest-only is the user-
+      // opted-in version of "I only want the periodic summary, not
+      // per-poll alerts".
+      const muted = isChatInQuietHours(s.chatId, now) || isChatDigestOnly(s.chatId);
       try {
         if (!muted) {
           await sendMessage(s.chatId, text, { replyMarkup });

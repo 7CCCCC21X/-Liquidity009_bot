@@ -12,6 +12,7 @@ import {
   putPendingWatch, takePendingWatch, gcPendingWatch,
   putPendingPrompt, takePendingPrompt, gcPendingPrompts,
   getChatSettings, setChatDigest, setChatQuiet, isChatInQuietHours,
+  setChatDigestOnly, isChatDigestOnly,
   setChatDefaultLevels, setChatDefaultTriggerMode, setChatDefaultCooldown,
   putPendingBulkRetry, takePendingBulkRetry, gcPendingBulkRetry,
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
@@ -1413,6 +1414,7 @@ function settingsHeaderText(chatId) {
   const quiet = (cs.quietStartMin != null && cs.quietEndMin != null)
     ? `${fmtMinOfDay(cs.quietStartMin)}-${fmtMinOfDay(cs.quietEndMin)}`
     : '未设置';
+  const digestOnly = isChatDigestOnly(chatId) ? '✅ 开（即时提醒已静音，只发摘要）' : '⬜ 关';
   return [
     '<b>⚙️ 聊天设置</b>',
     '',
@@ -1420,6 +1422,7 @@ function settingsHeaderText(chatId) {
     `🔔 新订阅默认触发：<b>${defaultMode}</b>`,
     `⏱ 新订阅默认冷却：<b>${defaultCooldown}</b>`,
     `📋 定期摘要：<b>${digest}</b>`,
+    `📨 只发摘要：<b>${digestOnly}</b>`,
     `🌙 勿扰时段：<b>${quiet}</b> <i>(${config.displayTzLabel || config.displayTz})</i>`,
     `🕐 显示时区：<i>${config.displayTzLabel || config.displayTz} · env</i>`,
     '',
@@ -1427,7 +1430,8 @@ function settingsHeaderText(chatId) {
   ].join('\n');
 }
 
-function buildSettingsKeyboard() {
+function buildSettingsKeyboard(chatId) {
+  const digestOnly = isChatDigestOnly(chatId);
   return {
     inline_keyboard: [
       [
@@ -1440,6 +1444,9 @@ function buildSettingsKeyboard() {
       ],
       [
         { text: '🌙 勿扰时段',  callback_data: 'setings:quiet' },
+        { text: `📨 只发摘要 ${digestOnly ? '✅' : '⬜'}`, callback_data: 'setings:digestonly' },
+      ],
+      [
         { text: '↻ 全部重置',  callback_data: 'setings:reset' },
       ],
     ],
@@ -1447,7 +1454,7 @@ function buildSettingsKeyboard() {
 }
 
 async function renderSettingsPanel(chatId) {
-  await sendMessage(chatId, settingsHeaderText(chatId), { replyMarkup: buildSettingsKeyboard() });
+  await sendMessage(chatId, settingsHeaderText(chatId), { replyMarkup: buildSettingsKeyboard(chatId) });
 }
 
 // Sub-flows for each setting button. Each one either toggles inline
@@ -1460,9 +1467,10 @@ async function handleSettingsCallback(chatId, messageId, callbackId, action) {
     setChatDefaultCooldown(chatId, null);
     setChatDigest(chatId, 0);
     setChatQuiet(chatId, null, null);
+    setChatDigestOnly(chatId, false);
     await saveState();
     await answerCallbackQuery(callbackId, { text: '已重置全部聊天设置' });
-    try { await editMessageText(chatId, messageId, settingsHeaderText(chatId), buildSettingsKeyboard()); } catch {}
+    try { await editMessageText(chatId, messageId, settingsHeaderText(chatId), buildSettingsKeyboard(chatId)); } catch {}
     return;
   }
   if (action === 'trigger') {
@@ -1474,7 +1482,18 @@ async function handleSettingsCallback(chatId, messageId, callbackId, action) {
     setChatDefaultTriggerMode(chatId, next);
     await saveState();
     await answerCallbackQuery(callbackId, { text: next ? `默认触发: ${TRIGGER_LABEL[next]}` : '已清除（用 env）' });
-    try { await editMessageText(chatId, messageId, settingsHeaderText(chatId), buildSettingsKeyboard()); } catch {}
+    try { await editMessageText(chatId, messageId, settingsHeaderText(chatId), buildSettingsKeyboard(chatId)); } catch {}
+    return;
+  }
+  if (action === 'digestonly') {
+    // Inline toggle: flip the flag, save, re-render the panel.
+    const newVal = !isChatDigestOnly(chatId);
+    setChatDigestOnly(chatId, newVal);
+    await saveState();
+    await answerCallbackQuery(callbackId, {
+      text: newVal ? '已开启：只发摘要，不发即时提醒' : '已关闭：恢复即时提醒',
+    });
+    try { await editMessageText(chatId, messageId, settingsHeaderText(chatId), buildSettingsKeyboard(chatId)); } catch {}
     return;
   }
   // Everything else uses ForceReply.

@@ -543,6 +543,24 @@ export function setChatQuiet(chatId, startMin, endMin) {
   return _state.chatSettings[k];
 }
 
+// Digest-only mode: when true, individual per-tick alerts for this
+// chat are silently swallowed (still written to history, still update
+// baselines), but the periodic /digest message and any /digestlog
+// query still fire normally. Use case: high-volume watcher who only
+// wants the rolled-up summary, not per-poll pings.
+export function setChatDigestOnly(chatId, on) {
+  if (!_state.chatSettings) _state.chatSettings = {};
+  const k = String(chatId);
+  if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
+  if (on) _state.chatSettings[k].digestOnly = true;
+  else delete _state.chatSettings[k].digestOnly;
+  return _state.chatSettings[k];
+}
+
+export function isChatDigestOnly(chatId) {
+  return !!_state.chatSettings?.[String(chatId)]?.digestOnly;
+}
+
 export function isChatInQuietHours(chatId, ms = Date.now()) {
   const s = _state.chatSettings?.[String(chatId)];
   if (!s || s.quietStartMin == null || s.quietEndMin == null) return false;
