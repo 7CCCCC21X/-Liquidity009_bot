@@ -828,11 +828,23 @@ export async function sendDigestForChat(chatId) {
   // (e.g. user wakes up and wants to see what was sent overnight).
   // Stored alongside per-event records in history.jsonl with type='digest';
   // /history filters by missing type, so this doesn't pollute that view.
+  // `entries` is the structured per-market snapshot at digest time —
+  // used by /digestlog's aggregate summary to compute net deltas
+  // across the chosen window without parsing the rendered HTML.
   await appendEvent({
     type: 'digest',
     chatId,
     text,
     totals: { changed: changed.length, fresh: fresh.length, unchanged: unchanged.length },
+    entries: entries
+      .filter((e) => e.snap?.bestBid && e.snap?.bestAsk)
+      .map((e) => ({
+        marketId: e.sub.marketId,
+        title: e.sub.title || null,
+        slug: e.sub.slug || null,
+        bestBid: e.snap.bestBid.price,
+        bestAsk: e.snap.bestAsk.price,
+      })),
   });
 
   // Update baseline for every sub that has a snapshot now — including

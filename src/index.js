@@ -1610,7 +1610,8 @@ async function runDigestLog(chatId, { sinceMs, windowLabel, count } = {}) {
   await sendMessage(chatId, `<i>📚 ${headerLabel}摘要（旧→新）：</i>`);
   // readDigests returns newest→oldest; flip to chronological so the
   // newest one lands at the bottom (where the chat auto-scrolls).
-  for (const d of digests.slice().reverse()) {
+  const chrono = digests.slice().reverse();
+  for (const d of chrono) {
     try {
       await sendMessage(chatId, d.text);
     } catch (err) {
@@ -1620,6 +1621,65 @@ async function runDigestLog(chatId, { sinceMs, windowLabel, count } = {}) {
   if (digests.length >= HARD_CAP) {
     await sendMessage(chatId, `<i>… 已截断到最近 ${HARD_CAP} 份。需要更多可发 <code>/digestlog 时长</code>（如 <code>/digestlog 3d</code>）+ 调小摘要频率。</i>`);
   }
+  // Aggregate summary: net change per unique market across the entire
+  // window. Removes the per-digest repetition so the user sees one
+  // line per market with start → end + Δ, sorted by biggest move.
+  await sendAggregateSummary(chatId, chrono, { windowLabel: windowLabel ?? `${digests.length} 份` });
+}
+
+// Walk every digest in chronological order, take the FIRST observation
+// of each marketId as the window start and the LAST as the window end,
+// then emit one ranked summary message. Markets that didn't move appear
+// collapsed at the tail so the user can still see they were tracked.
+async function sendAggregateSummary(chatId, chronoDigests, { windowLabel } = {}) {
+  const startById = new Map();
+  const endById = new Map();
+  for (const d of chronoDigests) {
+    const entries = Array.isArray(d.entries) ? d.entries : [];
+    for (const e of entries) {
+      if (e.bestBid == null || e.bestAsk == null) continue;
+      const id = String(e.marketId);
+      if (!startById.has(id)) startById.set(id, { ...e, ts: d.ts });
+      endById.set(id, { ...e, ts: d.ts });
+    }
+  }
+  if (!startById.size) return;
+  const rows = [];
+  for (const [id, start] of startById) {
+    const end = endById.get(id);
+    const dBid = end.bestBid - start.bestBid;
+    const dAsk = end.bestAsk - start.bestAsk;
+    rows.push({ id, title: end.title || start.title, slug: end.slug || start.slug, start, end, dBid, dAsk, mag: Math.max(Math.abs(dBid), Math.abs(dAsk)) });
+  }
+  rows.sort((a, b) => b.mag - a.mag);
+  const moved = rows.filter((r) => r.mag >= 1e-9);
+  const flat = rows.filter((r) => r.mag < 1e-9);
+  const lines = [
+    `<b>📊 汇总（${windowLabel}，去重后 ${rows.length} 个市场）</b>`,
+    `<i>每个市场只显示 1 次：窗口起点 → 终点 + 净变化</i>`,
+    '',
+  ];
+  const dot = (dBid, dAsk) => {
+    const dom = Math.abs(dBid) >= Math.abs(dAsk) ? dBid : dAsk;
+    if (dom > 1e-9) return '🟢';
+    if (dom < -1e-9) return '🔴';
+    return '🔔';
+  };
+  const fmtDelta = (dp) => Math.abs(dp) < 1e-9 ? '0' : `${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`;
+  for (const r of moved.slice(0, 30)) {
+    const titleLink = marketLink(r.title || `Market ${r.id}`, r.slug);
+    lines.push(`${dot(r.dBid, r.dAsk)} ${titleLink}`);
+    lines.push(`  <code>${r.id}</code> · 买1 ${r.start.bestBid.toFixed(4)}→${r.end.bestBid.toFixed(4)} (${fmtDelta(r.dBid)}) / 卖1 ${r.start.bestAsk.toFixed(4)}→${r.end.bestAsk.toFixed(4)} (${fmtDelta(r.dAsk)})`);
+  }
+  if (moved.length > 30) {
+    lines.push('', `<i>… 还有 ${moved.length - 30} 个有变化（按净 Δ 大小排序）</i>`);
+  }
+  if (flat.length) {
+    const names = flat.slice(0, 12).map((r) => htmlEscape((r.title || `#${r.id}`).slice(0, 14))).join(' · ');
+    const extra = flat.length > 12 ? ` 等 ${flat.length} 个` : '';
+    lines.push('', `<i>· 净变化 0：${names}${extra}</i>`);
+  }
+  await sendMessage(chatId, lines.join('\n'));
 }
 
 async function runHistoryView(chatId, marketId, n = 10) {
