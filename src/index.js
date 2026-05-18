@@ -63,7 +63,7 @@ const HELP_DETAIL = [
   '/levels &lt;id&gt; — 自定义档位 + 触发模式（价+量 / 只看价 / 只看量）',
   '/note &lt;id&gt; — 弹输入框输入备注（或 /note &lt;id&gt; 文字 直接设；/note &lt;id&gt; - 清除）',
   '/digest [时长] — 定期摘要，例 <code>/digest 30m</code>；不带参数显示当前 + 立即来一份',
-  '/digestlog — 回看历史摘要（弹卡片选时间窗 / 自定义时长）',
+  '/digestlog — 回看时间窗内有变动的市场（去重后汇总；加 <code>full</code> 看每份摘要原文）',
   '/quiet &lt;HH:MM-HH:MM&gt; — 勿扰时段（例 23:00-08:00），勿扰期间只写历史不推送',
   '/settings — 聊天设置面板（默认档位 / 默认触发 / 默认冷却 / 摘要 / 勿扰）',
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
@@ -1093,19 +1093,23 @@ async function handleCommand(chatId, text) {
       await sendDigestLogPicker(chatId);
       return true;
     }
-    const arg = args[0];
+    // Optional 'full' suffix re-enables per-digest replay before the
+    // aggregate (default is aggregate-only since the user just wants
+    // "what moved in this window").
+    const full = args.includes('full');
+    const tArgs = args.filter((a) => a !== 'full');
+    const arg = tArgs[0];
     const asNum = parseInt(arg, 10);
     if (Number.isFinite(asNum) && /^\d+$/.test(arg)) {
-      await runDigestLog(chatId, { count: Math.max(1, Math.min(50, asNum)) });
+      await runDigestLog(chatId, { count: Math.max(1, Math.min(500, asNum)), full });
       return true;
     }
-    // Else parse as a duration (e.g. /digestlog 3h)
     const ms = parseDurationMs(arg);
     if (!ms) {
-      await sendMessage(chatId, '❌ 用法：<code>/digestlog</code>（弹卡片选）· <code>/digestlog 10</code>（最近 10 份）· <code>/digestlog 6h</code>（最近 6 小时）');
+      await sendMessage(chatId, '❌ 用法：<code>/digestlog</code>（弹卡片选）· <code>/digestlog 6h</code>（汇总 6 小时变动）· 加 <code>full</code> 同时回放每一份摘要');
       return true;
     }
-    await runDigestLog(chatId, { sinceMs: Date.now() - ms, windowLabel: arg });
+    await runDigestLog(chatId, { sinceMs: Date.now() - ms, windowLabel: arg, full });
     return true;
   }
   if (c === '/status') {
@@ -1563,7 +1567,8 @@ async function sendDigestLogPicker(chatId) {
   await sendMessage(chatId, [
     '<b>📚 查看历史摘要</b>',
     '',
-    '<i>选一个时间窗口，发回这段时间内已发出过的摘要。</i>',
+    '<i>选时间窗口 → 发回这段时间内<b>有变动的市场（去重）</b>，每个市场只显示 1 次。</i>',
+    '<i>需要看每一份摘要原文，加 <code>full</code>，例 <code>/digestlog 6h full</code>。</i>',
   ].join('\n'), {
     replyMarkup: {
       inline_keyboard: [
@@ -1586,14 +1591,18 @@ async function sendDigestLogPicker(chatId) {
   });
 }
 
-// Render the digests for a chat. Pass either { sinceMs, windowLabel }
-// for a time window or { count } for a recent-N. Caps the reply at 20
-// messages to avoid hammering Telegram's rate limit.
-async function runDigestLog(chatId, { sinceMs, windowLabel, count } = {}) {
-  const HARD_CAP = 20;
-  const opts = { chatId, limit: HARD_CAP };
+// Default flow: scan digests in the chosen window, send ONE summary
+// message that lists each market once with its net Δ over the window.
+// `full: true` additionally replays every individual digest first
+// (legacy behaviour, kept for users who want the time-ordered view).
+async function runDigestLog(chatId, { sinceMs, windowLabel, count, full = false } = {}) {
+  // Aggregate scans more digests than we'd ever replay since the cap
+  // there was about Telegram message throughput, not data volume.
+  const SCAN_LIMIT = 500;
+  const REPLAY_CAP = 20;
+  const opts = { chatId, limit: SCAN_LIMIT };
   if (sinceMs) opts.sinceMs = sinceMs;
-  if (count) opts.limit = Math.min(HARD_CAP, count);
+  if (count) opts.limit = Math.min(SCAN_LIMIT, count);
   const digests = await readDigests(opts);
   if (!digests.length) {
     const label = sinceMs ? `最近 ${windowLabel ?? ''}` : (count ? `最近 ${count} 份` : '');
@@ -1604,27 +1613,32 @@ async function runDigestLog(chatId, { sinceMs, windowLabel, count } = {}) {
     ].join('\n'));
     return;
   }
-  const headerLabel = sinceMs
-    ? `最近 ${windowLabel ?? ''} 内 ${digests.length} 份`
-    : `最近 ${digests.length} 份`;
-  await sendMessage(chatId, `<i>📚 ${headerLabel}摘要（旧→新）：</i>`);
   // readDigests returns newest→oldest; flip to chronological so the
-  // newest one lands at the bottom (where the chat auto-scrolls).
+  // aggregate's first-observation walk matches calendar order.
   const chrono = digests.slice().reverse();
-  for (const d of chrono) {
-    try {
-      await sendMessage(chatId, d.text);
-    } catch (err) {
-      console.warn('[digestlog] send failed:', err.message);
+  if (full) {
+    const headerLabel = sinceMs
+      ? `最近 ${windowLabel ?? ''} 内 ${digests.length} 份`
+      : `最近 ${digests.length} 份`;
+    await sendMessage(chatId, `<i>📚 ${headerLabel}摘要（旧→新）：</i>`);
+    const toReplay = chrono.slice(-REPLAY_CAP);
+    for (const d of toReplay) {
+      try {
+        await sendMessage(chatId, d.text);
+      } catch (err) {
+        console.warn('[digestlog] send failed:', err.message);
+      }
+    }
+    if (chrono.length > REPLAY_CAP) {
+      await sendMessage(chatId, `<i>… 已截断到最近 ${REPLAY_CAP} 份回放（共 ${chrono.length} 份在窗口内，汇总仍按全部计算）</i>`);
     }
   }
-  if (digests.length >= HARD_CAP) {
-    await sendMessage(chatId, `<i>… 已截断到最近 ${HARD_CAP} 份。需要更多可发 <code>/digestlog 时长</code>（如 <code>/digestlog 3d</code>）+ 调小摘要频率。</i>`);
-  }
-  // Aggregate summary: net change per unique market across the entire
-  // window. Removes the per-digest repetition so the user sees one
-  // line per market with start → end + Δ, sorted by biggest move.
-  await sendAggregateSummary(chatId, chrono, { windowLabel: windowLabel ?? `${digests.length} 份` });
+  // Always send the dedup aggregate — this is the "what moved over
+  // the window" view the user actually came here for.
+  await sendAggregateSummary(chatId, chrono, {
+    windowLabel: windowLabel ?? (count ? `${digests.length} 份` : `${digests.length} 份摘要`),
+    totalDigests: chrono.length,
+  });
 }
 
 // Walk every digest in chronological order, take the FIRST observation
@@ -1637,7 +1651,7 @@ async function runDigestLog(chatId, { sinceMs, windowLabel, count } = {}) {
 // available, since that's one extra data point further back in time
 // than the digest's own snap. Otherwise falls back to the earliest
 // digest's snap. This lets single-digest windows still report Δ.
-async function sendAggregateSummary(chatId, chronoDigests, { windowLabel } = {}) {
+async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalDigests } = {}) {
   const startById = new Map();
   const endById = new Map();
   for (const d of chronoDigests) {
@@ -1666,9 +1680,10 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel } = {})
   rows.sort((a, b) => b.mag - a.mag);
   const moved = rows.filter((r) => r.mag >= 1e-9);
   const flat = rows.filter((r) => r.mag < 1e-9);
+  const digestsBit = totalDigests ? ` · 含 ${totalDigests} 份摘要` : '';
   const lines = [
-    `<b>📊 汇总（${windowLabel}，去重后 ${rows.length} 个市场）</b>`,
-    `<i>每个市场只显示 1 次：窗口起点 → 终点 + 净变化</i>`,
+    `<b>📊 ${windowLabel} 内有变动的市场（去重后）</b>`,
+    `<i>${rows.length} 个市场${digestsBit} · 每个市场只显示 1 次：窗口起点 → 终点 + 净变化</i>`,
     '',
   ];
   const dot = (dBid, dAsk) => {
