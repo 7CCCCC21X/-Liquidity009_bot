@@ -1654,8 +1654,10 @@ async function runDigestLog(chatId, { sinceMs, windowLabel, count, full = false 
 async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalDigests } = {}) {
   const startById = new Map();
   const endById = new Map();
+  let digestsWithData = 0;
   for (const d of chronoDigests) {
     const entries = Array.isArray(d.entries) ? d.entries : [];
+    if (entries.length) digestsWithData += 1;
     for (const e of entries) {
       if (e.bestBid == null || e.bestAsk == null) continue;
       const id = String(e.marketId);
@@ -1680,12 +1682,19 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
   rows.sort((a, b) => b.mag - a.mag);
   const moved = rows.filter((r) => r.mag >= 1e-9);
   const flat = rows.filter((r) => r.mag < 1e-9);
-  const digestsBit = totalDigests ? ` · 含 ${totalDigests} 份摘要` : '';
+  const digestsBit = totalDigests
+    ? (digestsWithData < totalDigests
+        ? ` · ${digestsWithData}/${totalDigests} 份摘要有数据`
+        : ` · 含 ${totalDigests} 份摘要`)
+    : '';
   const lines = [
     `<b>📊 ${windowLabel} 内有变动的市场（去重后）</b>`,
     `<i>${rows.length} 个市场${digestsBit} · 每个市场只显示 1 次：窗口起点 → 终点 + 净变化</i>`,
     '',
   ];
+  if (digestsWithData < 2 && moved.length === 0) {
+    lines.push(`<i>⚠️ 这段时间只有 ${digestsWithData} 份带详细数据的摘要，无法计算窗口变化。等再多积累几份摘要后重试。</i>`, '');
+  }
   const dot = (dBid, dAsk) => {
     const dom = Math.abs(dBid) >= Math.abs(dAsk) ? dBid : dAsk;
     if (dom > 1e-9) return '🟢';

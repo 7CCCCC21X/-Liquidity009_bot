@@ -15,6 +15,12 @@ import { appendEvent } from './history.js';
 // state). Per-sub last notify time enforces NOTIFY_COOLDOWN_SEC.
 const lastBookPerSub = new Map();
 const lastNotify = new Map();
+// Per-sub freshest snapshot from any successful poll, regardless of
+// whether an alert fired. `lastBookPerSub` only moves on alerts so
+// digests would otherwise see stale data for slow-drifting markets;
+// this map gives the digest renderer + aggregate the actual current
+// orderbook at digest time.
+const latestSnapPerSub = new Map();
 // Excursion buffer: during cooldown, if the book briefly moves away
 // from prev and then snaps back, the standard A→B→A pattern leaves
 // `bookChanged(prev=A, cur=A)` = false once cooldown lifts, so the B
@@ -511,6 +517,11 @@ async function pollOnce() {
       const levels = s.levels?.length ? s.levels : ALL_LEVELS;
       const mode = s.triggerMode || 'both';
       const k = subKey(s.chatId, s.marketId);
+      // Always cache the freshest snap, regardless of whether an alert
+      // is going to fire below. Digests / aggregates read from this so
+      // slow-drifting markets that never cross the alert threshold
+      // still report accurate prices in summaries.
+      latestSnapPerSub.set(k, snap);
       // Hydrate the in-memory baseline from the persisted last-alert
       // snapshot on the first poll after a restart. Without this every
       // sub fires "🆕 初次抓取" right after a redeploy because the
@@ -737,7 +748,15 @@ export async function sendDigestForChat(chatId) {
   }
   const now = Date.now();
   const entries = subs.map((s) => {
-    const snap = lastBookPerSub.get(subKey(s.chatId, s.marketId));
+    // Prefer the freshest poll snap so non-alerting markets still
+    // report current prices in the digest. Fall back to the last-alert
+    // snap (and finally the persisted s.lastSnap) so a brand-new
+    // process that hasn't polled this sub yet doesn't blank-line it.
+    const key = subKey(s.chatId, s.marketId);
+    const snap = latestSnapPerSub.get(key)
+      ?? lastBookPerSub.get(key)
+      ?? s.lastSnap
+      ?? null;
     const baseline = s.digestBaseline ?? null;
     const isPaused = s.pausedUntil && s.pausedUntil > now;
     return { sub: s, snap, baseline, isPaused };
