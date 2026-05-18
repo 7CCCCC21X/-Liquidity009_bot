@@ -65,6 +65,7 @@ const HELP_DETAIL = [
   '/note &lt;id&gt; — 弹输入框输入备注（或 /note &lt;id&gt; 文字 直接设；/note &lt;id&gt; - 清除）',
   '/digest [时长] — 定期摘要，例 <code>/digest 30m</code>；不带参数显示当前 + 立即来一份',
   '/digestlog — 回看时间窗内有变动的市场（去重后汇总；加 <code>full</code> 看每份摘要原文）',
+  '/digestonly [on|off] — 只发摘要，静音即时提醒（不带参数 = 切换）',
   '/quiet &lt;HH:MM-HH:MM&gt; — 勿扰时段（例 23:00-08:00），勿扰期间只写历史不推送',
   '/settings — 聊天设置面板（默认档位 / 默认触发 / 默认冷却 / 摘要 / 勿扰）',
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
@@ -1111,6 +1112,32 @@ async function handleCommand(chatId, text) {
       return true;
     }
     await runDigestLog(chatId, { sinceMs: Date.now() - ms, windowLabel: arg, full });
+    return true;
+  }
+  if (c === '/digestonly') {
+    // Toggle, or set explicitly with /digestonly on|off.
+    const arg = (args[0] ?? '').toLowerCase();
+    const cur = isChatDigestOnly(chatId);
+    let next;
+    if (arg === 'on' || arg === '开' || arg === '1') next = true;
+    else if (arg === 'off' || arg === '关' || arg === '0') next = false;
+    else next = !cur;
+    setChatDigestOnly(chatId, next);
+    await saveState();
+    const digestSet = !!(getChatSettings(chatId)?.digestIntervalMs);
+    const warn = next && !digestSet
+      ? '\n\n<i>⚠️ 还没设定期摘要频率，开了之后就什么都不会推送。先发 <code>/digest 30m</code> 之类设一下。</i>'
+      : '';
+    await sendMessage(chatId, [
+      next
+        ? '📨 <b>只发摘要 = 开</b>'
+        : '🔔 <b>只发摘要 = 关</b>',
+      '',
+      next
+        ? '即时提醒全部静音；只有 <code>/digest</code> 的定期摘要会推送。所有历史 / 统计仍照常记录。'
+        : '已恢复正常即时提醒。',
+      warn,
+    ].join('\n'));
     return true;
   }
   if (c === '/status') {
@@ -2761,6 +2788,7 @@ async function main() {
     { command: 'list',      description: '我的订阅（分页 + 操作按钮）' },
     { command: 'digest',    description: '定期摘要（防遗漏盘口）' },
     { command: 'digestlog', description: '查看历史摘要（睡醒补看）' },
+    { command: 'digestonly', description: '只发摘要 · 静音即时提醒（开关）' },
     { command: 'settings',  description: '聊天设置面板（默认档位/触发/摘要/勿扰…）' },
     { command: 'status',    description: 'Bot 健康状态' },
     { command: 'export',    description: '导出 history.jsonl' },
