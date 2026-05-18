@@ -1631,6 +1631,12 @@ async function runDigestLog(chatId, { sinceMs, windowLabel, count } = {}) {
 // of each marketId as the window start and the LAST as the window end,
 // then emit one ranked summary message. Markets that didn't move appear
 // collapsed at the tail so the user can still see they were tracked.
+//
+// The "start" anchor prefers the EARLIEST digest's prevBestBid/Ask
+// (i.e. the digest-baseline that digest was comparing against) when
+// available, since that's one extra data point further back in time
+// than the digest's own snap. Otherwise falls back to the earliest
+// digest's snap. This lets single-digest windows still report Δ.
 async function sendAggregateSummary(chatId, chronoDigests, { windowLabel } = {}) {
   const startById = new Map();
   const endById = new Map();
@@ -1639,7 +1645,13 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel } = {})
     for (const e of entries) {
       if (e.bestBid == null || e.bestAsk == null) continue;
       const id = String(e.marketId);
-      if (!startById.has(id)) startById.set(id, { ...e, ts: d.ts });
+      if (!startById.has(id)) {
+        // Prefer the prev-baseline as the window-start anchor when the
+        // digest carried it (added 2026-05-18); else use the snap.
+        const startBid = e.prevBestBid != null ? e.prevBestBid : e.bestBid;
+        const startAsk = e.prevBestAsk != null ? e.prevBestAsk : e.bestAsk;
+        startById.set(id, { ...e, bestBid: startBid, bestAsk: startAsk, ts: d.ts });
+      }
       endById.set(id, { ...e, ts: d.ts });
     }
   }

@@ -842,8 +842,14 @@ export async function sendDigestForChat(chatId) {
         marketId: e.sub.marketId,
         title: e.sub.title || null,
         slug: e.sub.slug || null,
+        // Snap at digest time (the "now" value shown in the rendered text).
         bestBid: e.snap.bestBid.price,
         bestAsk: e.snap.bestAsk.price,
+        // Previous-digest baseline (the "vs 上次摘要" anchor). Persisted
+        // so /digestlog's aggregate has two data points per digest, not
+        // just one — single-digest windows can still report Δ ≠ 0.
+        prevBestBid: e.baseline?.bestBid?.price ?? null,
+        prevBestAsk: e.baseline?.bestAsk?.price ?? null,
       })),
   });
 
