@@ -799,30 +799,106 @@ export async function sendDigestForChat(chatId) {
     return '🔔';
   };
 
-  // Show changed first — up to 20.
-  for (const e of changed.slice(0, 20)) {
-    const { sub, snap } = e;
-    const titleLink = marketLink(sub.title || `Market ${sub.marketId}`, sub.slug);
-    const bb = snap.bestBid.price.toFixed(4);
-    const ba = snap.bestAsk.price.toFixed(4);
-    lines.push(`${dot(e._dBid, e._dAsk)} ${titleLink}`);
-    lines.push(`  <code>${sub.marketId}</code> · 买1 ${bb}${fmtDelta(e._dBid)} / 卖1 ${ba}${fmtDelta(e._dAsk)}`);
+  // Group entries by their parent event question so multiple options
+  // of the same event (e.g. "$50M / $100M / $200M ..." under one
+  // token-launch question) render under a single header instead of
+  // spamming N flat blocks. Subs without a question, or the only
+  // sub under their question, render as standalone rows.
+  const buildBlocks = (arr) => {
+    const byQ = new Map();
+    for (const e of arr) {
+      const q = (e.sub.question || '').trim();
+      const key = q || `__solo:${e.sub.marketId}`;
+      if (!byQ.has(key)) byQ.set(key, { question: q, items: [] });
+      byQ.get(key).items.push(e);
+    }
+    const out = [];
+    for (const { question, items } of byQ.values()) {
+      items.sort((a, b) => (b._biggest ?? 0) - (a._biggest ?? 0));
+      out.push({
+        question,
+        items,
+        biggest: items[0]._biggest ?? 0,
+        isGroup: items.length > 1 && !!question,
+      });
+    }
+    out.sort((a, b) => b.biggest - a.biggest);
+    return out;
+  };
+
+  const CAP_DETAIL = 25; // max option/single rows we'll render
+  let detailCount = 0;
+  let dropped = 0;
+
+  // Show changed first.
+  const changedBlocks = buildBlocks(changed);
+  for (const b of changedBlocks) {
+    if (detailCount >= CAP_DETAIL) { dropped += b.items.length; continue; }
+    if (b.isGroup) {
+      const qText = b.question.length > 80 ? b.question.slice(0, 77) + '…' : b.question;
+      lines.push(`<b>📂 ${htmlEscape(qText)}</b>`);
+      const room = CAP_DETAIL - detailCount;
+      const showItems = b.items.slice(0, room);
+      for (const e of showItems) {
+        const { sub, snap } = e;
+        const titleLink = marketLink(sub.title || `#${sub.marketId}`, sub.slug);
+        const bb = snap.bestBid.price.toFixed(4);
+        const ba = snap.bestAsk.price.toFixed(4);
+        lines.push(`  ${dot(e._dBid, e._dAsk)} ${titleLink} <code>${sub.marketId}</code> · 买1 ${bb}${fmtDelta(e._dBid)} / 卖1 ${ba}${fmtDelta(e._dAsk)}`);
+        detailCount += 1;
+      }
+      const hidden = b.items.length - showItems.length;
+      if (hidden > 0) { lines.push(`  <i>… 另 ${hidden} 个选项</i>`); dropped += hidden; }
+    } else {
+      const e = b.items[0];
+      const { sub, snap } = e;
+      const titleLink = marketLink(sub.title || `Market ${sub.marketId}`, sub.slug);
+      const bb = snap.bestBid.price.toFixed(4);
+      const ba = snap.bestAsk.price.toFixed(4);
+      lines.push(`${dot(e._dBid, e._dAsk)} ${titleLink}`);
+      lines.push(`  <code>${sub.marketId}</code> · 买1 ${bb}${fmtDelta(e._dBid)} / 卖1 ${ba}${fmtDelta(e._dAsk)}`);
+      detailCount += 1;
+    }
   }
-  if (changed.length > 20) {
-    lines.push('', `<i>… 还有 ${changed.length - 20} 个有变化（按变化大小排序，可 /list 查看全部）</i>`);
+  if (dropped > 0) {
+    lines.push('', `<i>… 还有 ${dropped} 个有变化（按变化大小排序，/list 查看全部）</i>`);
   }
 
   // 🆕 first-time entries (e.g. brand-new subs since last digest).
   if (fresh.length) {
     if (changed.length) lines.push('');
-    for (const e of fresh.slice(0, 10)) {
-      const titleLink = marketLink(e.sub.title || `Market ${e.sub.marketId}`, e.sub.slug);
-      const bb = e.snap.bestBid.price.toFixed(4);
-      const ba = e.snap.bestAsk.price.toFixed(4);
-      lines.push(`🆕 ${titleLink}`);
-      lines.push(`  <code>${e.sub.marketId}</code> · 买1 ${bb} / 卖1 ${ba}`);
+    const freshBlocks = buildBlocks(fresh);
+    let freshDetail = 0;
+    let freshDropped = 0;
+    const FRESH_CAP = 12;
+    for (const b of freshBlocks) {
+      if (freshDetail >= FRESH_CAP) { freshDropped += b.items.length; continue; }
+      if (b.isGroup) {
+        const qText = b.question.length > 80 ? b.question.slice(0, 77) + '…' : b.question;
+        lines.push(`<b>📂 ${htmlEscape(qText)}</b>  <i>🆕 首次</i>`);
+        const room = FRESH_CAP - freshDetail;
+        const showItems = b.items.slice(0, room);
+        for (const e of showItems) {
+          const { sub, snap } = e;
+          const titleLink = marketLink(sub.title || `#${sub.marketId}`, sub.slug);
+          const bb = snap.bestBid.price.toFixed(4);
+          const ba = snap.bestAsk.price.toFixed(4);
+          lines.push(`  🆕 ${titleLink} <code>${sub.marketId}</code> · 买1 ${bb} / 卖1 ${ba}`);
+          freshDetail += 1;
+        }
+        const hidden = b.items.length - showItems.length;
+        if (hidden > 0) { lines.push(`  <i>… 另 ${hidden} 个选项</i>`); freshDropped += hidden; }
+      } else {
+        const e = b.items[0];
+        const titleLink = marketLink(e.sub.title || `Market ${e.sub.marketId}`, e.sub.slug);
+        const bb = e.snap.bestBid.price.toFixed(4);
+        const ba = e.snap.bestAsk.price.toFixed(4);
+        lines.push(`🆕 ${titleLink}`);
+        lines.push(`  <code>${e.sub.marketId}</code> · 买1 ${bb} / 卖1 ${ba}`);
+        freshDetail += 1;
+      }
     }
-    if (fresh.length > 10) lines.push(`<i>… 另 ${fresh.length - 10} 个首次</i>`);
+    if (freshDropped > 0) lines.push(`<i>… 另 ${freshDropped} 个首次</i>`);
   }
 
   // Unchanged collapsed to one short line so the user knows they're
