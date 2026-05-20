@@ -74,7 +74,7 @@ const HELP_DETAIL = [
   '/export — 把整个 history.jsonl 发回给你',
   '/probe &lt;id&gt; — 立即抓一次订单簿（不等下次轮询）',
   '/speedtest [N] — 测延迟（默认 5 次），给出推荐的最快 POLL_INTERVAL_MS',
-  '/stop &lt;id&gt; — 取消订阅（弹确认）',
+  '/stop [id] — 取消订阅（不带 id 时回复网址，弹出确认/选项）',
   '/stopall — 取消全部订阅（弹确认）',
   '/resetthresholds — 把所有订阅的阈值改回全局默认（弹确认）',
   '',
@@ -872,7 +872,14 @@ async function handleCommand(chatId, text) {
     let id = args[0];
     if (!id && /^\/stop_\d+$/.test(c)) id = c.slice('/stop_'.length);
     if (!id) {
-      await sendMessage(chatId, '用法：/stop &lt;marketId&gt;');
+      // No id → reply-with-URL flow, mirroring the wallet bot UX:
+      // reply to the prompt with a market URL/id/slug and the bot
+      // resolves it, then shows cancel buttons.
+      await promptCommandTarget(chatId, 'stop', {
+        headline: '🛑 <b>取消订阅</b>',
+        hint: '<b>📝 回复此条消息</b>，发送要取消的市场 URL / marketId / slug；解析后会弹出确认按钮。',
+        placeholder: 'URL/id/slug',
+      });
       return true;
     }
     const ok = removeSubscription(chatId, id);
@@ -1840,6 +1847,60 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
     await runDigestLog(chatId, { sinceMs: Date.now() - ms, windowLabel: t });
     return;
   }
+  // /stop reply-flow: a URL may map to several subscribed sub-markets
+  // (event page). Resolve to the full set, keep only the ones this
+  // chat actually subscribes, and show a cancel button per market
+  // plus a "取消全部" when there's more than one. Numeric ids fall
+  // through to the single-market confirm in the switch below.
+  if (cmd === 'stop') {
+    const t = String(replyText ?? '').trim();
+    const numeric = extractMarketId(t);
+    if (!numeric) {
+      let markets = [];
+      try {
+        const r = await resolveUrlToMarkets(t);
+        markets = r.markets ?? [];
+      } catch (err) {
+        await sendMessage(chatId, `❌ 解析失败：${htmlEscape(err.message)}`);
+        return;
+      }
+      const subscribed = markets.filter((m) => getSubscription(chatId, m.id));
+      if (markets.length && !subscribed.length) {
+        await sendMessage(chatId, `<i>这个链接对应的 ${markets.length} 个市场你都没有订阅。</i>`);
+        return;
+      }
+      if (subscribed.length > 1) {
+        const rows = subscribed.slice(0, 20).map((m) => {
+          const sub = getSubscription(chatId, m.id);
+          const label = (sub?.title || m.title || m.question || `#${m.id}`).slice(0, 40);
+          return [{ text: `🛑 ${label}`, callback_data: `unsub_ok:${m.id}` }];
+        });
+        rows.push([{ text: `🛑 全部取消（${subscribed.length} 个）`, callback_data: `unsuball:${subscribed.map((m) => m.id).join(',')}` }]);
+        rows.push([{ text: '↩️ 返回', callback_data: 'noop' }]);
+        await sendMessage(chatId, [
+          `🛑 <b>这个事件里你订阅了 ${subscribed.length} 个市场</b>`,
+          '<i>点对应市场取消，或「全部取消」。</i>',
+        ].join('\n'), { replyMarkup: { inline_keyboard: rows } });
+        return;
+      }
+      if (subscribed.length === 1) {
+        const m = subscribed[0];
+        const sub = getSubscription(chatId, m.id);
+        await sendMessage(chatId, [
+          `⚠️ <b>确认停止监控？</b>`,
+          `🏷 ${marketLink(sub.title || `Market ${m.id}`, sub.slug)}`,
+          `<code>id=${m.id}</code>`,
+        ].join('\n'), {
+          replyMarkup: { inline_keyboard: [[
+            { text: '✅ 确认停止', callback_data: `unsub_ok:${m.id}` },
+            { text: '↩️ 返回',     callback_data: 'noop' },
+          ]] },
+        });
+        return;
+      }
+      // markets.length === 0 → fall through to the generic "无法识别"
+    }
+  }
   const trimmed = String(replyText ?? '').trim();
   if (!trimmed) {
     await sendMessage(chatId, '❌ 回复内容为空。');
@@ -2435,6 +2496,22 @@ async function handleCallback(cb) {
     return;
   }
 
+  // Bulk stop from the event-page reply flow — comma-separated ids.
+  const unsubAll = data.match(/^unsuball:([\d,]+)$/);
+  if (unsubAll) {
+    const ids = unsubAll[1].split(',').filter(Boolean);
+    let removed = 0;
+    for (const id of ids) if (removeSubscription(chatId, id)) removed += 1;
+    if (removed) await saveState();
+    await answerCallbackQuery(cb.id, { text: `已停止 ${removed}` });
+    if (messageId) {
+      try {
+        await editMessageText(chatId, messageId, `🛑 已停止监控该事件下的 ${removed} 个市场`);
+      } catch { /* ignore */ }
+    }
+    return;
+  }
+
   // Confirmed stop — actually remove the subscription.
   const unsubOk = data.match(/^unsub_ok:(\d+)$/);
   if (unsubOk) {
@@ -2793,7 +2870,7 @@ async function main() {
     { command: 'status',    description: 'Bot 健康状态' },
     { command: 'export',    description: '导出 history.jsonl' },
     { command: 'speedtest', description: '测抓取延迟' },
-    { command: 'stop',      description: '取消单个订阅' },
+    { command: 'stop',      description: '取消订阅（回复网址，弹确认/选项）' },
     { command: 'stopall',   description: '取消全部订阅' },
     { command: 'resetthresholds', description: '把所有订阅阈值改回全局默认' },
   ]).catch((e) => console.warn('[bot] setMyCommands failed:', e.message));
