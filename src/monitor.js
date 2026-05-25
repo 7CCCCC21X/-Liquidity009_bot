@@ -63,7 +63,7 @@ export function marketLink(title, slug) {
 // boundaries) and join with "…": "Concrete FDV above … one day after
 // launch?". Falls back to the first question if there's no useful
 // shared structure.
-function deriveEventTitle(questions) {
+export function deriveEventTitle(questions) {
   const qs = questions.filter(Boolean);
   if (!qs.length) return '';
   if (qs.length === 1) return qs[0];
@@ -1009,6 +1009,9 @@ export async function sendDigestForChat(chatId) {
         marketId: e.sub.marketId,
         title: e.sub.title || null,
         slug: e.sub.slug || null,
+        // Per-option question — lets /digestlog's aggregate derive the
+        // shared event header (deriveEventTitle) when grouping by slug.
+        question: e.sub.question || null,
         // Snap at digest time (the "now" value shown in the rendered text).
         bestBid: e.snap.bestBid.price,
         bestAsk: e.snap.bestAsk.price,

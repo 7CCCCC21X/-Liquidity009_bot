@@ -18,7 +18,7 @@ import {
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, sendDigestForChat, effectiveThresholds } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, sendDigestForChat, effectiveThresholds, deriveEventTitle } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -1773,7 +1773,7 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
     const end = endById.get(id);
     const dBid = end.bestBid - start.bestBid;
     const dAsk = end.bestAsk - start.bestAsk;
-    rows.push({ id, title: end.title || start.title, slug: end.slug || start.slug, start, end, dBid, dAsk, mag: Math.max(Math.abs(dBid), Math.abs(dAsk)) });
+    rows.push({ id, title: end.title || start.title, slug: end.slug || start.slug, question: end.question || start.question || null, start, end, dBid, dAsk, mag: Math.max(Math.abs(dBid), Math.abs(dAsk)) });
   }
   rows.sort((a, b) => b.mag - a.mag);
   const moved = rows.filter((r) => r.mag >= 1e-9);
@@ -1805,18 +1805,51 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
     return '🔔';
   };
   const fmtDelta = (dp) => Math.abs(dp) < 1e-9 ? '0' : `${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`;
-  // Show every mover. sendMessage auto-splits into multiple Telegram
-  // messages (3800-char chunks with tag rebalancing), so there's no
-  // need to truncate — a 200-cap only guards against a pathological
-  // thousands-of-subs case.
-  const MOVE_CAP = 200;
-  for (const r of moved.slice(0, MOVE_CAP)) {
-    const titleLink = marketLink(r.title || `Market ${r.id}`, r.slug);
-    lines.push(`${dot(r.dBid, r.dAsk)} ${titleLink}`);
-    lines.push(`  <code>${r.id}</code> · 买1 ${r.start.bestBid.toFixed(4)}→${r.end.bestBid.toFixed(4)} (${fmtDelta(r.dBid)}) / 卖1 ${r.start.bestAsk.toFixed(4)}→${r.end.bestAsk.toFixed(4)} (${fmtDelta(r.dAsk)})`);
+  // Group movers by shared event slug (same key the periodic digest
+  // uses) so options of one event collapse under a 📂 header derived
+  // from their questions. Singletons render flat.
+  const bySlug = new Map();
+  for (const r of moved) {
+    const key = (r.slug || '').trim() || `__solo:${r.id}`;
+    if (!bySlug.has(key)) bySlug.set(key, { slug: (r.slug || '').trim(), items: [] });
+    bySlug.get(key).items.push(r);
   }
-  if (moved.length > MOVE_CAP) {
-    lines.push('', `<i>… 还有 ${moved.length - MOVE_CAP} 个有变化（已达 ${MOVE_CAP} 上限，按净 Δ 大小排序）</i>`);
+  const blocks = [];
+  for (const { slug, items } of bySlug.values()) {
+    items.sort((a, b) => b.mag - a.mag);
+    const isGroup = items.length > 1 && !!slug;
+    blocks.push({
+      isGroup,
+      header: isGroup ? deriveEventTitle(items.map((r) => r.question || '')) : '',
+      items,
+      biggest: items[0].mag,
+    });
+  }
+  blocks.sort((a, b) => b.biggest - a.biggest);
+  // sendMessage auto-splits; cap is only a pathological-case guard.
+  const MOVE_CAP = 300;
+  let shown = 0;
+  for (const b of blocks) {
+    if (shown >= MOVE_CAP) break;
+    if (b.isGroup) {
+      const h = b.header && b.header.length > 80 ? b.header.slice(0, 77) + '…' : b.header;
+      lines.push(`<b>📂 ${htmlEscape(h || '（同事件）')}</b>`);
+      for (const r of b.items) {
+        if (shown >= MOVE_CAP) break;
+        const titleLink = marketLink(r.title || `#${r.id}`, r.slug);
+        lines.push(`  ${dot(r.dBid, r.dAsk)} ${titleLink} <code>${r.id}</code> · 买1 ${r.start.bestBid.toFixed(4)}→${r.end.bestBid.toFixed(4)} (${fmtDelta(r.dBid)}) / 卖1 ${r.start.bestAsk.toFixed(4)}→${r.end.bestAsk.toFixed(4)} (${fmtDelta(r.dAsk)})`);
+        shown += 1;
+      }
+    } else {
+      const r = b.items[0];
+      const titleLink = marketLink(r.title || `Market ${r.id}`, r.slug);
+      lines.push(`${dot(r.dBid, r.dAsk)} ${titleLink}`);
+      lines.push(`  <code>${r.id}</code> · 买1 ${r.start.bestBid.toFixed(4)}→${r.end.bestBid.toFixed(4)} (${fmtDelta(r.dBid)}) / 卖1 ${r.start.bestAsk.toFixed(4)}→${r.end.bestAsk.toFixed(4)} (${fmtDelta(r.dAsk)})`);
+      shown += 1;
+    }
+  }
+  if (moved.length > shown) {
+    lines.push('', `<i>… 还有 ${moved.length - shown} 个有变化（已达 ${MOVE_CAP} 上限）</i>`);
   }
   if (flatCount) {
     lines.push('', `<i>· 另 ${flatCount} 个市场无变化（已隐藏）</i>`);
