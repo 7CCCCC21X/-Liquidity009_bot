@@ -55,6 +55,45 @@ export function marketLink(title, slug) {
   return url ? `<a href="${url}">${safeTitle}</a>` : safeTitle;
 }
 
+// Derive a shared event title from a group of per-option questions.
+// On Predict.fun the `question` embeds the option amount, e.g.
+//   "Concrete FDV above $200M one day after launch?"
+//   "Concrete FDV above $50M one day after launch?"
+// so we take the longest common prefix + suffix (trimmed to word
+// boundaries) and join with "…": "Concrete FDV above … one day after
+// launch?". Falls back to the first question if there's no useful
+// shared structure.
+function deriveEventTitle(questions) {
+  const qs = questions.filter(Boolean);
+  if (!qs.length) return '';
+  if (qs.length === 1) return qs[0];
+  // Longest common prefix.
+  let pre = qs[0];
+  for (const q of qs.slice(1)) {
+    let i = 0;
+    while (i < pre.length && i < q.length && pre[i] === q[i]) i++;
+    pre = pre.slice(0, i);
+    if (!pre) break;
+  }
+  // Longest common suffix.
+  let suf = qs[0];
+  for (const q of qs.slice(1)) {
+    let i = 0;
+    while (i < suf.length && i < q.length && suf[suf.length - 1 - i] === q[q.length - 1 - i]) i++;
+    suf = suf.slice(suf.length - i);
+    if (!suf) break;
+  }
+  // Trim prefix back to the last word boundary, suffix forward to the
+  // first, so we don't cut mid-token ("above $" → "above").
+  const preTrim = pre.replace(/[\s$#]*\S*$/, '').trimEnd();
+  const sufTrim = suf.replace(/^\S*[\s]*/, '').trimStart();
+  if (preTrim && sufTrim && (preTrim.length + sufTrim.length) >= 6) {
+    return `${preTrim} … ${sufTrim}`;
+  }
+  if (preTrim.length >= 6) return `${preTrim} …`;
+  return qs[0];
+}
+
 // Predict.fun event markets carry both `title` (the option label like
 // "Jannik Sinner") and `question` (the parent event question like
 // "Madrid Open 2026 winner"). The alert needs both so the option name
@@ -823,27 +862,33 @@ export async function sendDigestForChat(chatId) {
     return '🔔';
   };
 
-  // Group entries by their parent event question so multiple options
-  // of the same event (e.g. "$50M / $100M / $200M ..." under one
-  // token-launch question) render under a single header instead of
-  // spamming N flat blocks. Subs without a question, or the only
-  // sub under their question, render as standalone rows.
+  // Group entries by their shared event slug. Predict.fun gives every
+  // option of one event the SAME slug (e.g. all of "$20M/$50M/$100M..."
+  // share "concrete-fdv-above-one-day-after-launch") while each option's
+  // `question` differs (it embeds the amount), so slug is the reliable
+  // grouping key. The group header is derived from the options' questions
+  // via deriveEventTitle. Subs with no slug, or the only sub under their
+  // slug, render as standalone rows.
   const buildBlocks = (arr) => {
-    const byQ = new Map();
+    const bySlug = new Map();
     for (const e of arr) {
-      const q = (e.sub.question || '').trim();
-      const key = q || `__solo:${e.sub.marketId}`;
-      if (!byQ.has(key)) byQ.set(key, { question: q, items: [] });
-      byQ.get(key).items.push(e);
+      const slug = (e.sub.slug || '').trim();
+      const key = slug || `__solo:${e.sub.marketId}`;
+      if (!bySlug.has(key)) bySlug.set(key, { slug, items: [] });
+      bySlug.get(key).items.push(e);
     }
     const out = [];
-    for (const { question, items } of byQ.values()) {
+    for (const { slug, items } of bySlug.values()) {
       items.sort((a, b) => (b._biggest ?? 0) - (a._biggest ?? 0));
+      const isGroup = items.length > 1 && !!slug;
+      const header = isGroup
+        ? deriveEventTitle(items.map((e) => (e.sub.question || '').trim()))
+        : '';
       out.push({
-        question,
+        header,
         items,
         biggest: items[0]._biggest ?? 0,
-        isGroup: items.length > 1 && !!question,
+        isGroup,
       });
     }
     out.sort((a, b) => b.biggest - a.biggest);
@@ -859,7 +904,7 @@ export async function sendDigestForChat(chatId) {
   for (const b of changedBlocks) {
     if (detailCount >= CAP_DETAIL) { dropped += b.items.length; continue; }
     if (b.isGroup) {
-      const qText = b.question.length > 80 ? b.question.slice(0, 77) + '…' : b.question;
+      const qText = b.header.length > 80 ? b.header.slice(0, 77) + '…' : b.header;
       lines.push(`<b>📂 ${htmlEscape(qText)}</b>`);
       const room = CAP_DETAIL - detailCount;
       const showItems = b.items.slice(0, room);
@@ -898,7 +943,7 @@ export async function sendDigestForChat(chatId) {
     for (const b of freshBlocks) {
       if (freshDetail >= FRESH_CAP) { freshDropped += b.items.length; continue; }
       if (b.isGroup) {
-        const qText = b.question.length > 80 ? b.question.slice(0, 77) + '…' : b.question;
+        const qText = b.header.length > 80 ? b.header.slice(0, 77) + '…' : b.header;
         lines.push(`<b>📂 ${htmlEscape(qText)}</b>  <i>🆕 首次</i>`);
         const room = FRESH_CAP - freshDetail;
         const showItems = b.items.slice(0, room);
