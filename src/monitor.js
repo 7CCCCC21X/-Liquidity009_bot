@@ -4,7 +4,7 @@ import { sendMessage, htmlEscape } from './telegram.js';
 import {
   listAllSubscriptions, removeSubscription, saveState,
   setSubscriptionInitial, setSubscriptionDigestBaseline,
-  setSubscriptionLastSnap,
+  setSubscriptionLastSnap, setSubscriptionQuestion,
   getAllChatSettings, markChatDigestSent, isChatInQuietHours,
   isChatDigestOnly,
   ALL_LEVELS, LEVEL_LABEL, subKey,
@@ -22,6 +22,10 @@ const lastNotify = new Map();
 // this map gives the digest renderer + aggregate the actual current
 // orderbook at digest time.
 const latestSnapPerSub = new Map();
+// Subs we've already attempted a question-backfill for this process,
+// so a market that genuinely has no `question` isn't re-queried every
+// poll. Reset on restart (one retry per process is fine).
+const questionBackfillTried = new Set();
 // Excursion buffer: during cooldown, if the book briefly moves away
 // from prev and then snaps back, the standard A→B→A pattern leaves
 // `bookChanged(prev=A, cur=A)` = false once cooldown lifts, so the B
@@ -534,6 +538,22 @@ async function pollOnce() {
       if (!prev && s.lastSnap) {
         prev = s.lastSnap;
         lastBookPerSub.set(k, prev);
+      }
+      // Lazily backfill the parent event question for subs created
+      // before the field shipped — drives digest grouping (options
+      // of the same event collapse under one 📂 header). Cache hit
+      // after the first markets fetch, so the await is cheap; one
+      // attempt per sub per process avoids re-querying markets that
+      // genuinely have no question.
+      if (!s.question && !questionBackfillTried.has(k)) {
+        questionBackfillTried.add(k);
+        try {
+          const m = await getMarketById(s.marketId);
+          if (m?.question) {
+            setSubscriptionQuestion(s.chatId, s.marketId, m.question);
+            needsSave = true;
+          }
+        } catch { /* best-effort; retry next process */ }
       }
       // Backfill the "vs 监控起点" baseline for subs created before
       // this feature shipped. Set once per sub on the first poll

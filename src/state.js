@@ -197,6 +197,16 @@ export function setSubscriptionLastSnap(chatId, marketId, snapshot) {
   return s;
 }
 
+// Lazily-filled parent event question (for digest grouping). Subs
+// created before the `question` field shipped get this populated on
+// the next poll from the cached market record.
+export function setSubscriptionQuestion(chatId, marketId, question) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  s.question = question || null;
+  return s;
+}
+
 // Per-sub pause window. untilMs=null clears the pause; otherwise stores
 // a UTC ms timestamp after which the sub auto-resumes (monitor.js does
 // the resume-check on every tick so no scheduler is needed).
