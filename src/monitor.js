@@ -895,7 +895,10 @@ export async function sendDigestForChat(chatId) {
     return out;
   };
 
-  const CAP_DETAIL = 25; // max option/single rows we'll render
+  // Render every changed row. sendMessage auto-splits into multiple
+  // Telegram messages, so the cap is just a pathological-case guard
+  // (thousands of movers), not a real truncation point.
+  const CAP_DETAIL = 300;
   let detailCount = 0;
   let dropped = 0;
 
@@ -939,7 +942,7 @@ export async function sendDigestForChat(chatId) {
     const freshBlocks = buildBlocks(fresh);
     let freshDetail = 0;
     let freshDropped = 0;
-    const FRESH_CAP = 12;
+    const FRESH_CAP = 100;
     for (const b of freshBlocks) {
       if (freshDetail >= FRESH_CAP) { freshDropped += b.items.length; continue; }
       if (b.isGroup) {
