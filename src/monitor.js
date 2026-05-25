@@ -924,7 +924,11 @@ export async function sendDigestForChat(chatId) {
     } else {
       const e = b.items[0];
       const { sub, snap } = e;
-      const titleLink = marketLink(sub.title || `Market ${sub.marketId}`, sub.slug);
+      // Singleton: prefer the full question as the headline so the
+      // event context isn't lost (a bare "Ghana" / "September 30,
+      // 2026" option label is meaningless on its own).
+      const headline = sub.question || sub.title || `Market ${sub.marketId}`;
+      const titleLink = marketLink(headline, sub.slug);
       const bb = snap.bestBid.price.toFixed(4);
       const ba = snap.bestAsk.price.toFixed(4);
       lines.push(`${dot(e._dBid, e._dAsk)} ${titleLink}`);
@@ -962,7 +966,8 @@ export async function sendDigestForChat(chatId) {
         if (hidden > 0) { lines.push(`  <i>… 另 ${hidden} 个选项</i>`); freshDropped += hidden; }
       } else {
         const e = b.items[0];
-        const titleLink = marketLink(e.sub.title || `Market ${e.sub.marketId}`, e.sub.slug);
+        const headline = e.sub.question || e.sub.title || `Market ${e.sub.marketId}`;
+        const titleLink = marketLink(headline, e.sub.slug);
         const bb = e.snap.bestBid.price.toFixed(4);
         const ba = e.snap.bestAsk.price.toFixed(4);
         lines.push(`🆕 ${titleLink}`);

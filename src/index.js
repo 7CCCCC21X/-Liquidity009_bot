@@ -1842,7 +1842,10 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
       }
     } else {
       const r = b.items[0];
-      const titleLink = marketLink(r.title || `Market ${r.id}`, r.slug);
+      // Singleton: prefer the full question so the event context shows
+      // (bare "Ghana" / "September 30, 2026" is meaningless alone).
+      const headline = r.question || r.title || `Market ${r.id}`;
+      const titleLink = marketLink(headline, r.slug);
       lines.push(`${dot(r.dBid, r.dAsk)} ${titleLink}`);
       lines.push(`  <code>${r.id}</code> · 买1 ${r.start.bestBid.toFixed(4)}→${r.end.bestBid.toFixed(4)} (${fmtDelta(r.dBid)}) / 卖1 ${r.start.bestAsk.toFixed(4)}→${r.end.bestAsk.toFixed(4)} (${fmtDelta(r.dAsk)})`);
       shown += 1;
