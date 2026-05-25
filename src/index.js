@@ -1762,13 +1762,18 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
     return '🔔';
   };
   const fmtDelta = (dp) => Math.abs(dp) < 1e-9 ? '0' : `${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`;
-  for (const r of moved.slice(0, 30)) {
+  // Show every mover. sendMessage auto-splits into multiple Telegram
+  // messages (3800-char chunks with tag rebalancing), so there's no
+  // need to truncate — a 200-cap only guards against a pathological
+  // thousands-of-subs case.
+  const MOVE_CAP = 200;
+  for (const r of moved.slice(0, MOVE_CAP)) {
     const titleLink = marketLink(r.title || `Market ${r.id}`, r.slug);
     lines.push(`${dot(r.dBid, r.dAsk)} ${titleLink}`);
     lines.push(`  <code>${r.id}</code> · 买1 ${r.start.bestBid.toFixed(4)}→${r.end.bestBid.toFixed(4)} (${fmtDelta(r.dBid)}) / 卖1 ${r.start.bestAsk.toFixed(4)}→${r.end.bestAsk.toFixed(4)} (${fmtDelta(r.dAsk)})`);
   }
-  if (moved.length > 30) {
-    lines.push('', `<i>… 还有 ${moved.length - 30} 个有变化（按净 Δ 大小排序）</i>`);
+  if (moved.length > MOVE_CAP) {
+    lines.push('', `<i>… 还有 ${moved.length - MOVE_CAP} 个有变化（已达 ${MOVE_CAP} 上限，按净 Δ 大小排序）</i>`);
   }
   if (flatCount) {
     lines.push('', `<i>· 另 ${flatCount} 个市场无变化（已隐藏）</i>`);
