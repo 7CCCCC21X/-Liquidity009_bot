@@ -1142,22 +1142,25 @@ async function handleCommand(chatId, text) {
       `可分组事件（≥2 选项同标题）：<b>${groups}</b>`,
       '',
     ];
-    // Probe up to 5 missing ones live so we know if Predict.fun even
-    // exposes a question for them.
-    const probe = without.slice(0, 5);
-    if (probe.length) {
-      lines.push('<b>探测缺失项（实时查 Predict.fun）：</b>');
-      for (const s of probe) {
-        let fetched = null, err = null;
-        try { const m = await getMarketById(s.marketId); fetched = m?.question ?? null; }
-        catch (e) { err = e.message; }
-        const got = err ? `错误:${htmlEscape(err).slice(0, 30)}` : (fetched ? `"${htmlEscape(fetched).slice(0, 40)}"` : 'NULL');
-        lines.push(`· <code>${s.marketId}</code> ${htmlEscape((s.title || '').slice(0, 16))} → ${got}`);
-      }
-      lines.push('');
+    // Show actual question + slug + categorySlug for the first handful
+    // of subs so we can see what the real grouping key should be when
+    // `question` turns out to be per-option (unique) rather than the
+    // shared event title.
+    const sample = subs.slice(0, 6);
+    lines.push('<b>样本（看真正能分组的字段）：</b>');
+    for (const s of sample) {
+      let catSlug = null, fq = null;
+      try {
+        const m = await getMarketById(s.marketId);
+        catSlug = m?.categorySlug ?? m?.slug ?? m?.marketSlug ?? null;
+        fq = m?.question ?? null;
+      } catch { /* ignore */ }
+      lines.push(`· <code>${s.marketId}</code> title="${htmlEscape((s.title || '').slice(0, 14))}"`);
+      lines.push(`   q="${htmlEscape((fq || s.question || '').slice(0, 46))}"`);
+      lines.push(`   slug=${s.slug ? htmlEscape(String(s.slug).slice(0, 30)) : 'NULL'} · catSlug=${catSlug ? htmlEscape(String(catSlug).slice(0, 30)) : 'NULL'}`);
     }
-    lines.push('<i>若探测结果多为 NULL = Predict.fun 没暴露事件标题，需换分组方式；</i>');
-    lines.push('<i>若有值但订阅里缺失 = 等下一轮 poll 自动回填后再看摘要。</i>');
+    lines.push('');
+    lines.push('<i>把这条发回——看 q / slug / catSlug 哪个在同事件的几个选项间是一样的，就用那个当分组 key。</i>');
     await sendMessage(chatId, lines.join('\n'));
     return true;
   }
