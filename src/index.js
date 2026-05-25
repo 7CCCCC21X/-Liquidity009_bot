@@ -1121,6 +1121,46 @@ async function handleCommand(chatId, text) {
     await runDigestLog(chatId, { sinceMs: Date.now() - ms, windowLabel: arg, full });
     return true;
   }
+  if (c === '/diagq') {
+    // Diagnose digest-grouping: report question coverage for this
+    // chat's subs and probe Predict.fun for a few that are missing it.
+    const subs = listSubscriptionsForChat(chatId);
+    if (!subs.length) { await sendMessage(chatId, '当前没有订阅。'); return true; }
+    const withQ = subs.filter((s) => s.question && String(s.question).trim());
+    const without = subs.filter((s) => !(s.question && String(s.question).trim()));
+    // Groupability of currently-stored questions.
+    const qCount = new Map();
+    for (const s of withQ) {
+      const q = s.question.trim();
+      qCount.set(q, (qCount.get(q) ?? 0) + 1);
+    }
+    const groups = [...qCount.values()].filter((n) => n >= 2).length;
+    const lines = [
+      '<b>🔧 摘要分组诊断</b>',
+      `订阅总数：<b>${subs.length}</b>`,
+      `已存事件标题(question)：<b>${withQ.length}</b> · 缺失：<b>${without.length}</b>`,
+      `可分组事件（≥2 选项同标题）：<b>${groups}</b>`,
+      '',
+    ];
+    // Probe up to 5 missing ones live so we know if Predict.fun even
+    // exposes a question for them.
+    const probe = without.slice(0, 5);
+    if (probe.length) {
+      lines.push('<b>探测缺失项（实时查 Predict.fun）：</b>');
+      for (const s of probe) {
+        let fetched = null, err = null;
+        try { const m = await getMarketById(s.marketId); fetched = m?.question ?? null; }
+        catch (e) { err = e.message; }
+        const got = err ? `错误:${htmlEscape(err).slice(0, 30)}` : (fetched ? `"${htmlEscape(fetched).slice(0, 40)}"` : 'NULL');
+        lines.push(`· <code>${s.marketId}</code> ${htmlEscape((s.title || '').slice(0, 16))} → ${got}`);
+      }
+      lines.push('');
+    }
+    lines.push('<i>若探测结果多为 NULL = Predict.fun 没暴露事件标题，需换分组方式；</i>');
+    lines.push('<i>若有值但订阅里缺失 = 等下一轮 poll 自动回填后再看摘要。</i>');
+    await sendMessage(chatId, lines.join('\n'));
+    return true;
+  }
   if (c === '/digestonly') {
     // Toggle, or set explicitly with /digestonly on|off.
     const arg = (args[0] ?? '').toLowerCase();

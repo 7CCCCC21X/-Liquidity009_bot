@@ -12,6 +12,7 @@
     "start:local": "node --env-file=.env src/index.js",
     "get-chat-id": "node --env-file=.env scripts/get-chat-id.js",
     "diagnose": "node --env-file=.env scripts/diagnose.js",
+    "diagnose-question": "node --env-file=.env scripts/diagnose-question.js",
     "prune-history": "node --env-file=.env scripts/prune-history.js",
     "backfill-question": "node --env-file=.env scripts/backfill-question.js",
     "reset-thresholds": "node --env-file=.env scripts/reset-thresholds.js",
