@@ -931,7 +931,7 @@ export async function sendDigestForChat(chatId) {
       const titleLink = marketLink(headline, sub.slug);
       const bb = snap.bestBid.price.toFixed(4);
       const ba = snap.bestAsk.price.toFixed(4);
-      lines.push(`${dot(e._dBid, e._dAsk)} ${titleLink}`);
+      lines.push(`📄 ${dot(e._dBid, e._dAsk)} ${titleLink}`);
       lines.push(`  <code>${sub.marketId}</code> · 买1 ${bb}${fmtDelta(e._dBid)} / 卖1 ${ba}${fmtDelta(e._dAsk)}`);
       detailCount += 1;
     }
@@ -970,7 +970,7 @@ export async function sendDigestForChat(chatId) {
         const titleLink = marketLink(headline, e.sub.slug);
         const bb = e.snap.bestBid.price.toFixed(4);
         const ba = e.snap.bestAsk.price.toFixed(4);
-        lines.push(`🆕 ${titleLink}`);
+        lines.push(`📄 🆕 ${titleLink}`);
         lines.push(`  <code>${e.sub.marketId}</code> · 买1 ${bb} / 卖1 ${ba}`);
         freshDetail += 1;
       }
