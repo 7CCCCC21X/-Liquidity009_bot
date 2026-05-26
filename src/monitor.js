@@ -924,15 +924,17 @@ export async function sendDigestForChat(chatId) {
     } else {
       const e = b.items[0];
       const { sub, snap } = e;
-      // Singleton: prefer the full question as the headline so the
-      // event context isn't lost (a bare "Ghana" / "September 30,
-      // 2026" option label is meaningless on its own).
+      // Singleton: render exactly like a group — bold black 📂 header
+      // (the full question for event context) + one indented row with
+      // the clickable option label. Telegram links can't be black, so
+      // the header is plain bold and the link lives on the child row.
       const headline = sub.question || sub.title || `Market ${sub.marketId}`;
-      const titleLink = marketLink(headline, sub.slug);
+      const qText = headline.length > 80 ? headline.slice(0, 77) + '…' : headline;
+      lines.push(`<b>📂 ${htmlEscape(qText)}</b>`);
+      const optLabel = (sub.title && sub.title.trim() && sub.title !== headline) ? sub.title : '查看盘口';
       const bb = snap.bestBid.price.toFixed(4);
       const ba = snap.bestAsk.price.toFixed(4);
-      lines.push(`📄 ${dot(e._dBid, e._dAsk)} ${titleLink}`);
-      lines.push(`  <code>${sub.marketId}</code> · 买1 ${bb}${fmtDelta(e._dBid)} / 卖1 ${ba}${fmtDelta(e._dAsk)}`);
+      lines.push(`  ${dot(e._dBid, e._dAsk)} ${marketLink(optLabel, sub.slug)} <code>${sub.marketId}</code> · 买1 ${bb}${fmtDelta(e._dBid)} / 卖1 ${ba}${fmtDelta(e._dAsk)}`);
       detailCount += 1;
     }
   }
@@ -967,11 +969,12 @@ export async function sendDigestForChat(chatId) {
       } else {
         const e = b.items[0];
         const headline = e.sub.question || e.sub.title || `Market ${e.sub.marketId}`;
-        const titleLink = marketLink(headline, e.sub.slug);
+        const qText = headline.length > 80 ? headline.slice(0, 77) + '…' : headline;
+        lines.push(`<b>📂 ${htmlEscape(qText)}</b>  <i>🆕 首次</i>`);
+        const optLabel = (e.sub.title && e.sub.title.trim() && e.sub.title !== headline) ? e.sub.title : '查看盘口';
         const bb = e.snap.bestBid.price.toFixed(4);
         const ba = e.snap.bestAsk.price.toFixed(4);
-        lines.push(`📄 🆕 ${titleLink}`);
-        lines.push(`  <code>${e.sub.marketId}</code> · 买1 ${bb} / 卖1 ${ba}`);
+        lines.push(`  🆕 ${marketLink(optLabel, e.sub.slug)} <code>${e.sub.marketId}</code> · 买1 ${bb} / 卖1 ${ba}`);
         freshDetail += 1;
       }
     }

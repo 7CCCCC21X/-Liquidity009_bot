@@ -1842,12 +1842,13 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
       }
     } else {
       const r = b.items[0];
-      // Singleton: prefer the full question so the event context shows
-      // (bare "Ghana" / "September 30, 2026" is meaningless alone).
+      // Singleton: mirror a group — bold black 📂 header (question) +
+      // one indented row carrying the clickable option label.
       const headline = r.question || r.title || `Market ${r.id}`;
-      const titleLink = marketLink(headline, r.slug);
-      lines.push(`📄 ${dot(r.dBid, r.dAsk)} ${titleLink}`);
-      lines.push(`  <code>${r.id}</code> · 买1 ${r.start.bestBid.toFixed(4)}→${r.end.bestBid.toFixed(4)} (${fmtDelta(r.dBid)}) / 卖1 ${r.start.bestAsk.toFixed(4)}→${r.end.bestAsk.toFixed(4)} (${fmtDelta(r.dAsk)})`);
+      const h = headline.length > 80 ? headline.slice(0, 77) + '…' : headline;
+      lines.push(`<b>📂 ${htmlEscape(h)}</b>`);
+      const optLabel = (r.title && r.title.trim() && r.title !== headline) ? r.title : '查看盘口';
+      lines.push(`  ${dot(r.dBid, r.dAsk)} ${marketLink(optLabel, r.slug)} <code>${r.id}</code> · 买1 ${r.start.bestBid.toFixed(4)}→${r.end.bestBid.toFixed(4)} (${fmtDelta(r.dBid)}) / 卖1 ${r.start.bestAsk.toFixed(4)}→${r.end.bestAsk.toFixed(4)} (${fmtDelta(r.dAsk)})`);
       shown += 1;
     }
   }
