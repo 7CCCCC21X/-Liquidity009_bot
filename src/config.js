@@ -70,6 +70,11 @@ export const config = {
   // resolved/closed. Resolved markets get a 🏁 notice and their subs
   // auto-removed so they stop burning poll slots. 0 disables the sweep.
   resolvedCheckIntervalMs: envNum('RESOLVED_CHECK_INTERVAL_MS', 900_000),
+  // Admin heartbeat: after this many consecutive poll ticks in which
+  // EVERY market fetch failed, ping TELEGRAM_CHAT_ID (the admin chat)
+  // so an outage doesn't sit unnoticed in the logs. A recovery notice
+  // follows on the first fully-clean tick. 0 disables.
+  adminAlertConsecutiveFails: envNum('ADMIN_ALERT_CONSECUTIVE_FAILS', 3),
   graphqlTimeoutMs: envNum('GRAPHQL_TIMEOUT_MS', 30_000),
   orderbookTimeoutMs: envNum('ORDERBOOK_TIMEOUT_MS', 10_000),
 

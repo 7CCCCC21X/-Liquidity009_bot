@@ -37,6 +37,47 @@ export async function appendEvent(evt) {
   return _appendQueue.catch(() => {});
 }
 
+// Stream the file's lines newest-first WITHOUT loading the whole file
+// into memory. Reads fixed 64KiB chunks from the tail; the partial
+// line at each chunk's head is carried as raw bytes (never decoded
+// mid-chunk) so multi-byte UTF-8 sequences that straddle a boundary
+// stay intact — '\n' is a single byte in UTF-8 and can't appear inside
+// a multi-byte sequence, so splitting the buffer on 0x0A is safe.
+// Exported for tests.
+export async function* iterLinesBackwards(file, chunkSize = 64 * 1024) {
+  let fh;
+  try {
+    fh = await fs.open(file, 'r');
+  } catch (err) {
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
+  try {
+    const stat = await fh.stat();
+    let pos = stat.size;
+    let carry = Buffer.alloc(0); // bytes of the (possibly partial) earliest line seen so far
+    const buf = Buffer.alloc(chunkSize);
+    while (pos > 0) {
+      const readLen = Math.min(chunkSize, pos);
+      pos -= readLen;
+      await fh.read(buf, 0, readLen, pos);
+      // Buffer.concat copies, so reusing `buf` next iteration is safe.
+      const chunk = Buffer.concat([buf.subarray(0, readLen), carry]);
+      // Walk newline positions back-to-front, yielding complete lines.
+      let end = chunk.length;
+      for (let i = chunk.length - 1; i >= 0; i--) {
+        if (chunk[i] !== 0x0a) continue;
+        if (i + 1 < end) yield chunk.toString('utf8', i + 1, end);
+        end = i;
+      }
+      carry = Buffer.from(chunk.subarray(0, end));
+    }
+    if (carry.length) yield carry.toString('utf8');
+  } finally {
+    await fh.close();
+  }
+}
+
 // Same backwards scan as readEvents, but filters to type='digest'.
 // Used by /digestlog so the user can replay summaries they missed
 // (overnight, while travelling, etc.). Returns newest-first.
@@ -44,18 +85,9 @@ export async function appendEvent(evt) {
 // timestamp; `limit` is always honoured as a hard cap.
 export async function readDigests({ chatId, limit = 10, sinceMs = 0 } = {}) {
   if (!config.historyEnabled) return [];
-  let raw;
-  try {
-    raw = await fs.readFile(config.historyFile, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    throw err;
-  }
-  const lines = raw.split('\n');
   const out = [];
-  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
-    const line = lines[i];
-    if (!line) continue;
+  for await (const line of iterLinesBackwards(config.historyFile)) {
+    if (out.length >= limit) break;
     let evt;
     try { evt = JSON.parse(line); } catch { continue; }
     if (evt.type !== 'digest') continue;
@@ -66,24 +98,14 @@ export async function readDigests({ chatId, limit = 10, sinceMs = 0 } = {}) {
   return out;
 }
 
-// Tail the file for the last N events matching a filter. Reads the
-// whole file then walks backwards — fine for the 14-day default; if
-// the file ever gets huge consider an indexed format. limit is a hard
-// cap so we don't blow Telegram's message length.
+// Tail the file for the last N events matching a filter. Streams the
+// file backwards and stops as soon as `limit` matches are collected,
+// so cost scales with how far back the matches are — not file size.
 export async function readEvents({ chatId, marketId, limit = 50 } = {}) {
   if (!config.historyEnabled) return [];
-  let raw;
-  try {
-    raw = await fs.readFile(config.historyFile, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    throw err;
-  }
-  const lines = raw.split('\n');
   const out = [];
-  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
-    const line = lines[i];
-    if (!line) continue;
+  for await (const line of iterLinesBackwards(config.historyFile)) {
+    if (out.length >= limit) break;
     let evt;
     try { evt = JSON.parse(line); } catch { continue; }
     if (chatId != null && String(evt.chatId) !== String(chatId)) continue;

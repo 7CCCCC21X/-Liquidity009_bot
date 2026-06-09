@@ -638,6 +638,52 @@ async function firePriceAlerts(s, snap) {
   return fired;
 }
 
+// ---- Admin heartbeat -------------------------------------------------
+
+// All-markets-failing for N consecutive ticks usually means the
+// Predict API (or our egress) is down — page the admin chat instead of
+// silently spamming the logs. State is process-local: a restart resets
+// the counter, which is fine (the restart itself is a recovery).
+let _consecutiveBadTicks = 0;
+let _healthAlertActive = false;
+let _lastHealthAlertAt = 0;
+
+async function trackFetchHealth(fetched) {
+  if (!config.telegramChatId || !(config.adminAlertConsecutiveFails > 0)) return;
+  const total = fetched.length;
+  if (!total) return;
+  const failed = fetched.filter((r) => r.error).length;
+  if (failed === total) {
+    _consecutiveBadTicks += 1;
+    // Re-alert at most every 30 minutes while the outage persists.
+    if (_consecutiveBadTicks >= config.adminAlertConsecutiveFails
+        && Date.now() - _lastHealthAlertAt > 30 * 60_000) {
+      _lastHealthAlertAt = Date.now();
+      _healthAlertActive = true;
+      const sample = fetched.find((r) => r.error)?.error ?? '';
+      try {
+        await sendThrottled(config.telegramChatId, [
+          '🚨 <b>监控抓取连续失败</b>',
+          `<i>连续 ${_consecutiveBadTicks} 个轮询周期，全部 ${total} 个市场抓取失败。</i>`,
+          `<code>${htmlEscape(String(sample).slice(0, 200))}</code>`,
+        ].join('\n'));
+      } catch (err) {
+        console.warn('[monitor] health alert send failed:', err.message);
+      }
+    }
+  } else {
+    _consecutiveBadTicks = 0;
+    // Only announce recovery after a fully-clean tick, so a flapping
+    // API doesn't ping-pong alert/recover messages.
+    if (_healthAlertActive && failed === 0) {
+      _healthAlertActive = false;
+      try {
+        await sendThrottled(config.telegramChatId, '✅ <i>监控抓取已恢复正常。</i>');
+      } catch { /* best-effort */ }
+    }
+  }
+}
+
 // ---- Market resolution sweep ---------------------------------------
 
 const RESOLVED_STATUS_RE = /resolved|settled|closed|finali[sz]ed|ended|expired|cancell?ed/i;
@@ -708,6 +754,8 @@ async function pollOnce() {
     config.pollConcurrency,
     ([marketId, group]) => fetchMarketSnap(marketId, group),
   );
+  // Admin heartbeat — flag a full-outage tick before processing.
+  await trackFetchHealth(fetched);
   // Process notifications serially per market so we don't fire
   // multiple Telegram sends in the same tick (rate-limit friendly).
   const now = Date.now();

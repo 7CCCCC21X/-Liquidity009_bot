@@ -25,7 +25,9 @@
 | `/note <id> <文字>` | 设置备注（不带文字 → 弹输入框；发 `-` 清除） |
 | `/alert <id> 买1>0.55` | **到价提醒**（一次性）。指标：买/卖1-3、中价、价差；比较：`>` `>=` `<` `<=`。`/alert` 看全部，`/alert <id> -` 清除 |
 | `/history <id> [N]` | 查看该市场最近 N 条变动（默认 10，最多 50） |
+| `/chart <id> [窗口]` | 中价走势 sparkline（默认 24h，例 `/chart 272779 7d`） |
 | `/export` | 把整个 `history.jsonl` 文件发回到聊天里 |
+| `/exportsubs` | 导出本聊天全部订阅（`/watch` 格式，换机器粘贴即可恢复） |
 | `/stop <id>` | 取消单个订阅 |
 | `/stopall` | 取消全部订阅 |
 
@@ -95,6 +97,18 @@ npm run diagnose -- https://predict.fun/zh-cn/market/fifa-world-cup-group-e-winn
   ```
   在聊天里 `/export` 直接拿到完整文件，或本地 `tail -f /data/history.jsonl | jq` 实时观察。
 - `npm run prune-history` 强制压缩（保留最近 `HISTORY_KEEP_DAYS` 天）。
+
+### 管理员心跳
+设置 `TELEGRAM_CHAT_ID` 后，若连续 `ADMIN_ALERT_CONSECUTIVE_FAILS`（默认 3）个轮询周期
+全部市场抓取失败（Predict API 故障 / 出口网络断），bot 会主动给该 chat 推 🚨 告警，
+恢复后再推 ✅。设 0 关闭。
+
+## 测试
+```bash
+npm test          # node:test 单元测试（纯函数 + 历史文件倒读）
+npm run check     # 全文件语法检查
+```
+GitHub Actions（`.github/workflows/ci.yml`）在每次 push / PR 自动跑这两步。
 
 ## 调参（频率 + 阈值）
 所有都是 env 变量，不用改代码。**频率四要素**：

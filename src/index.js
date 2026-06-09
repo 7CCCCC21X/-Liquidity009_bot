@@ -20,7 +20,7 @@ import {
   ALERT_METRICS, ALERT_METRIC_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, sendDigestForChat, effectiveThresholds, deriveEventTitle, clearSubRuntime, alertMetricValue } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, fmtClockDateTime, sendDigestForChat, effectiveThresholds, deriveEventTitle, clearSubRuntime, alertMetricValue } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -73,8 +73,10 @@ const HELP_DETAIL = [
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
   '/alert &lt;id&gt; 买1&gt;0.55 — 到价提醒（一次性；支持 买/卖1-3、中价、价差，&gt; &gt;= &lt; &lt;=）',
   '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
+  '/chart &lt;id&gt; [窗口] — 中价走势 sparkline（默认 24h，例 <code>/chart 272779 7d</code>）',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
   '/export — 把整个 history.jsonl 发回给你',
+  '/exportsubs — 导出本聊天全部订阅（/watch 格式，粘贴即可恢复）',
   '/probe &lt;id&gt; — 立即抓一次订单簿（不等下次轮询）',
   '/speedtest [N] — 测延迟（默认 5 次），给出推荐的最快 POLL_INTERVAL_MS',
   '/stop [id] — 取消订阅（不带 id 时回复网址，弹出确认/选项）',
@@ -1136,6 +1138,56 @@ async function handleCommand(chatId, text) {
     await runStats(chatId, id, hours);
     return true;
   }
+  // /chart <id> [窗口] — mid-price sparkline from history. Window
+  // accepts the same duration grammar as /pause (30m / 2h / 7d).
+  if (c === '/chart' || /^\/chart_\d+$/.test(c)) {
+    let id = args[0];
+    let winRaw = args[1];
+    if (/^\/chart_\d+$/.test(c)) {
+      id = c.slice('/chart_'.length);
+      winRaw = args[0];
+    }
+    if (!id) {
+      await promptCommandTarget(chatId, 'chart', {
+        headline: '<b>📈 价格走势</b>  <i>回复要画的市场</i>',
+      });
+      return true;
+    }
+    const windowMs = parseDurationMs(winRaw) ?? 24 * 3600_000;
+    const windowLabel = winRaw || '24h';
+    await runChart(chatId, id, windowMs, windowLabel);
+    return true;
+  }
+  // /exportsubs — dump this chat's subscriptions in /watch bulk format
+  // so they can be pasted into another chat / bot instance to restore.
+  if (c === '/exportsubs') {
+    const subs = listSubscriptionsForChat(chatId);
+    if (!subs.length) {
+      await sendMessage(chatId, '当前没有订阅可导出。');
+      return true;
+    }
+    const lines = subs.map((s) => {
+      const noteBits = [
+        (s.tags ?? []).map((t) => `#${t}`).join(' '),
+        s.note ?? '',
+      ].filter(Boolean).join(' ').trim();
+      return noteBits ? `${s.marketId} ${noteBits}` : `${s.marketId}`;
+    });
+    const payload = lines.join('\n');
+    const header = `<b>📦 订阅导出</b>  <i>${subs.length} 条 · /watch 粘贴即可恢复</i>`;
+    // Long lists go out as a file so copy-paste stays clean.
+    if (lines.length > 40 || payload.length > 3000) {
+      await sendDocument(chatId, {
+        fileName: `subs-${chatId}-${new Date().toISOString().slice(0, 10)}.txt`,
+        content: payload + '\n',
+        contentType: 'text/plain',
+        caption: header,
+      });
+    } else {
+      await sendMessage(chatId, `${header}\n<pre>${htmlEscape(payload)}</pre>`);
+    }
+    return true;
+  }
   if (c === '/settings') {
     await renderSettingsPanel(chatId);
     return true;
@@ -2166,6 +2218,9 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
     case 'probe':
       await runProbe(chatId, marketId);
       return;
+    case 'chart':
+      await runChart(chatId, marketId, args.windowMs ?? 24 * 3600_000, args.windowLabel ?? '24h');
+      return;
     case 'threshold': {
       const sub = getSubscription(chatId, marketId);
       if (!sub) {
@@ -2289,6 +2344,80 @@ async function runStats(chatId, marketId, hours = 24) {
   if (lastSpread != null) lines.push(`🟢 最近价差：<b>${lastSpread.toFixed(4)}</b>`);
   lines.push(`⏱ 最近触发：<i>${fmtClockTime(latest.ts)} ${config.displayTzLabel || ''}</i>`);
   lines.push('', `<i>/history_${marketId} 查变动 · /threshold_${marketId} 调阈值 · /probe_${marketId} 立即抓</i>`);
+  await sendMessage(chatId, lines.join('\n'));
+}
+
+// ---- /chart: Unicode sparkline from history ------------------------
+
+const SPARK_CHARS = '▁▂▃▄▅▆▇█';
+
+// Map a numeric series onto the 8-step block characters. Flat series
+// renders as all-▁ (min === max). Exported via test through replica.
+function sparkline(values) {
+  if (!values.length) return '';
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min;
+  return values.map((v) => {
+    const idx = span < 1e-12 ? 0 : Math.min(7, Math.floor(((v - min) / span) * 8));
+    return SPARK_CHARS[idx];
+  }).join('');
+}
+
+// Evenly-spaced downsample preserving first + last points.
+function downsample(points, n) {
+  if (points.length <= n) return points;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push(points[Math.round((i * (points.length - 1)) / (n - 1))]);
+  }
+  return out;
+}
+
+async function runChart(chatId, marketId, windowMs = 24 * 3600_000, windowLabel = '24h') {
+  const cutoff = Date.now() - windowMs;
+  const events = await readEvents({ chatId, marketId, limit: 5000 });
+  // events are newest-first; collect in-window change records that
+  // carry a full top-of-book, then flip to chronological order.
+  const pts = [];
+  for (const e of events) {
+    if (e.ts < cutoff) break;
+    if (e.type) continue; // price_alert / market_ended aren't book samples
+    const bb = e.cur?.bestBid?.price;
+    const ba = e.cur?.bestAsk?.price;
+    if (bb == null || ba == null) continue;
+    pts.push({ ts: e.ts, mid: (bb + ba) / 2, bid: bb, ask: ba });
+  }
+  pts.reverse();
+  if (pts.length < 2) {
+    await sendMessage(chatId, [
+      `<i>📈 最近 ${htmlEscape(windowLabel)} 内 <code>${htmlEscape(marketId)}</code> 的样本不足（${pts.length} 个）。</i>`,
+      `<i>样本来自每次变动推送；可拉长窗口：<code>/chart ${htmlEscape(marketId)} 7d</code></i>`,
+    ].join('\n'));
+    return;
+  }
+  // 48 cols fits comfortably in Telegram's monospace block on mobile.
+  const sampled = downsample(pts, 48);
+  const mids = pts.map((p) => p.mid);
+  const first = pts[0], last = pts[pts.length - 1];
+  const min = Math.min(...mids), max = Math.max(...mids);
+  const delta = last.mid - first.mid;
+  const arrow = delta > 1e-9 ? '🟢↑' : delta < -1e-9 ? '🔴↓' : '⚪→';
+  const sub = getSubscription(chatId, marketId);
+  const titleLink = marketLink(events[0]?.title || sub?.title || `Market ${marketId}`, events[0]?.slug || sub?.slug);
+  const tzLabel = config.displayTzLabel ? ` ${config.displayTzLabel}` : '';
+  const lines = [
+    `<b>📈 ${titleLink}</b>  <i>中价 · 最近 ${htmlEscape(windowLabel)}</i>`,
+    `<code>id=${marketId}</code>`,
+    '',
+    `<pre>${sparkline(sampled.map((p) => p.mid))}</pre>`,
+    `<i>${fmtClockDateTime(first.ts)} → ${fmtClockDateTime(last.ts)}${tzLabel} · ${pts.length} 个样本</i>`,
+    '',
+    `${arrow} ${first.mid.toFixed(4)} → <b>${last.mid.toFixed(4)}</b>  (${delta >= 0 ? '+' : ''}${delta.toFixed(4)})`,
+    `区间 ${min.toFixed(4)} – ${max.toFixed(4)} · 现价差 ${(last.ask - last.bid).toFixed(4)}`,
+    '',
+    `<i>/stats_${marketId} 统计 · /history_${marketId} 明细 · /probe_${marketId} 立即抓</i>`,
+  ];
   await sendMessage(chatId, lines.join('\n'));
 }
 
@@ -3106,8 +3235,10 @@ async function main() {
     { command: 'digestonly', description: '只发摘要 · 静音即时提醒（开关）' },
     { command: 'alert',     description: '到价提醒（一次性，例 /alert 272779 买1>0.55）' },
     { command: 'settings',  description: '聊天设置面板（默认档位/触发/摘要/勿扰…）' },
+    { command: 'chart',     description: '中价走势图（例 /chart 272779 7d）' },
     { command: 'status',    description: 'Bot 健康状态' },
     { command: 'export',    description: '导出 history.jsonl' },
+    { command: 'exportsubs', description: '导出订阅清单（/watch 粘贴恢复）' },
     { command: 'speedtest', description: '测抓取延迟' },
     { command: 'stop',      description: '取消订阅（回复网址，弹确认/选项）' },
     { command: 'stopall',   description: '取消全部订阅' },
