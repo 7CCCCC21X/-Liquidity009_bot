@@ -1,13 +1,14 @@
 import { config } from './config.js';
-import { getOrderbook, getMarketById } from './predict.js';
+import { getOrderbook, getMarketById, getMarketStatusById } from './predict.js';
 import { sendMessage, htmlEscape } from './telegram.js';
 import {
   listAllSubscriptions, removeSubscription, saveState,
   setSubscriptionInitial, setSubscriptionDigestBaseline,
   setSubscriptionLastSnap, setSubscriptionQuestion,
+  removeSubscriptionPriceAlert,
   getAllChatSettings, markChatDigestSent, isChatInQuietHours,
   isChatDigestOnly,
-  ALL_LEVELS, LEVEL_LABEL, subKey,
+  ALL_LEVELS, LEVEL_LABEL, ALERT_METRIC_LABEL, subKey,
 } from './state.js';
 import { appendEvent } from './history.js';
 
@@ -34,6 +35,43 @@ const questionBackfillTried = new Set();
 // cooldown, the buffer is preferred over the (possibly reverted)
 // current snap so the user still hears about the move.
 const pendingExcursion = new Map();
+// Per-market timestamp of the last resolution-status check, so the
+// sweep runs at most once per RESOLVED_CHECK_INTERVAL_MS per market.
+const lastStatusCheckPerMarket = new Map();
+
+// Drop every in-memory trace of a subscription. MUST be called when a
+// sub is removed (unsubscribe, stopall, blocked chat, resolved market)
+// — otherwise these Maps grow forever on a long-running process, and a
+// later re-subscribe would diff against a stale baseline.
+export function clearSubRuntime(chatId, marketId) {
+  const k = subKey(chatId, marketId);
+  lastBookPerSub.delete(k);
+  lastNotify.delete(k);
+  latestSnapPerSub.delete(k);
+  pendingExcursion.delete(k);
+  questionBackfillTried.delete(k);
+}
+
+// Telegram errors that mean this chat is permanently unreachable —
+// retrying every tick is pointless, so the caller drops the sub.
+// 403 = bot blocked; the text variants cover kicked-from-group,
+// deleted accounts and migrated/deleted chats.
+const PERMANENT_SEND_ERROR = /\b403\b|bot was blocked|user is deactivated|chat not found|bot was kicked|not enough rights/i;
+export function isPermanentSendError(err) {
+  return PERMANENT_SEND_ERROR.test(String(err?.message ?? ''));
+}
+
+// Per-chat send pacing. Telegram allows roughly 1 msg/sec per chat —
+// when one tick produces a burst of alerts for the same chat (many
+// hot markets at once) we space them out instead of eating 429s.
+const lastSendPerChat = new Map();
+async function sendThrottled(chatId, text, opts) {
+  const key = String(chatId);
+  const wait = 1_000 - (Date.now() - (lastSendPerChat.get(key) ?? 0));
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastSendPerChat.set(key, Date.now());
+  return sendMessage(chatId, text, opts);
+}
 
 // Build a Predict.fun market URL, optionally with the configured
 // referral code. Returns null when slug is missing — caller falls
@@ -531,6 +569,128 @@ async function runWithConcurrency(items, limit, worker) {
   return results;
 }
 
+// ---- Price-cross alerts (one-shot limit alerts) --------------------
+
+// Current value of an alert metric on a snapshot. null = not derivable
+// (missing side / level) — the alert simply stays armed.
+export function alertMetricValue(snap, metric) {
+  if (!snap) return null;
+  if (metric === 'mid') {
+    const bb = snap.bestBid?.price, ba = snap.bestAsk?.price;
+    return bb != null && ba != null ? (bb + ba) / 2 : null;
+  }
+  if (metric === 'spread') {
+    const bb = snap.bestBid?.price, ba = snap.bestAsk?.price;
+    return bb != null && ba != null ? ba - bb : null;
+  }
+  return getLevel(snap, metric)?.price ?? null;
+}
+
+function alertSatisfied(value, op, target) {
+  switch (op) {
+    case '>': return value > target;
+    case '>=': return value >= target;
+    case '<': return value < target;
+    case '<=': return value <= target;
+    default: return false;
+  }
+}
+
+// Evaluate every armed alert on this sub against the fresh snapshot.
+// Fired alerts are disarmed BEFORE the send (one-shot semantics even
+// if Telegram hiccups — better to lose one ping than spam forever).
+// Returns the number fired so the caller knows to saveState().
+async function firePriceAlerts(s, snap) {
+  let fired = 0;
+  for (const a of [...(s.priceAlerts ?? [])]) {
+    const value = alertMetricValue(snap, a.metric);
+    if (value == null || !alertSatisfied(value, a.op, a.price)) continue;
+    removeSubscriptionPriceAlert(s.chatId, s.marketId, a.id);
+    fired += 1;
+    const label = ALERT_METRIC_LABEL[a.metric] ?? a.metric;
+    const condition = `${label} ${a.op} ${a.price}`;
+    const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
+    const levels = s.levels?.length ? s.levels : ALL_LEVELS;
+    const lines = [
+      `🎯 <b>${htmlEscape(condition)} 已触发</b>  当前 <b>${value.toFixed(4)}</b>`,
+      `📊 ${titleLink}`,
+    ];
+    if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
+    lines.push('', fmtSpreadLine(snap), '', fmtBook(null, snap, levels));
+    lines.push('', `<code>id=${s.marketId}</code>`, `<i>一次性提醒，已自动解除。再设：/alert_${s.marketId}</i>`);
+    try {
+      await sendThrottled(s.chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(s.marketId) });
+    } catch (err) {
+      console.warn('[monitor] price-alert send failed', s.chatId, err.message);
+    }
+    await appendEvent({
+      type: 'price_alert',
+      chatId: s.chatId,
+      marketId: s.marketId,
+      title: s.title || null,
+      note: s.note || null,
+      summary: `🎯 ${condition} 触发 @ ${value.toFixed(4)}`,
+      cur: { bestBid: snap.bestBid, bestAsk: snap.bestAsk, bids: snap.bids, asks: snap.asks },
+      slug: s.slug || null,
+      updatedAtMs: snap.updatedAtMs,
+    });
+  }
+  return fired;
+}
+
+// ---- Market resolution sweep ---------------------------------------
+
+const RESOLVED_STATUS_RE = /resolved|settled|closed|finali[sz]ed|ended|expired|cancell?ed/i;
+
+// Ask GraphQL whether the market has ended. Conservative: only acts on
+// an explicit isResolved=true or a status string that clearly says so;
+// a null record or a query error is treated as "still alive" so an API
+// hiccup never deletes anyone's subscription.
+async function checkMarketEnded(marketId) {
+  try {
+    const m = await getMarketStatusById(marketId);
+    if (!m) return null;
+    if (m.isResolved === true) return m;
+    const status = `${m.status ?? ''} ${m.tradingStatus ?? ''}`.trim();
+    if (status && RESOLVED_STATUS_RE.test(status)) return m;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Notify each subscriber + drop the subs for a market that resolved.
+async function retireEndedMarket(marketId, group, endedRecord) {
+  const status = endedRecord.isResolved === true
+    ? '已结算'
+    : `已关闭（${endedRecord.status ?? endedRecord.tradingStatus ?? '—'}）`;
+  for (const s of group) {
+    const titleLink = marketLink(s.title || `Market ${marketId}`, s.slug);
+    const lines = [
+      `🏁 <b>市场${htmlEscape(status)}</b>`,
+      `📊 ${titleLink}`,
+    ];
+    if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
+    lines.push('', `<i>已自动取消订阅；历史记录保留（/history_${marketId}）。</i>`);
+    try {
+      await sendThrottled(s.chatId, lines.join('\n'));
+    } catch (err) {
+      console.warn('[monitor] retire notice failed', s.chatId, err.message);
+    }
+    removeSubscription(s.chatId, s.marketId);
+    clearSubRuntime(s.chatId, s.marketId);
+    await appendEvent({
+      type: 'market_ended',
+      chatId: s.chatId,
+      marketId: s.marketId,
+      title: s.title || null,
+      summary: `🏁 市场${status} · 订阅已自动取消`,
+      slug: s.slug || null,
+    });
+  }
+  lastStatusCheckPerMarket.delete(String(marketId));
+}
+
 async function pollOnce() {
   const subs = listAllSubscriptions();
   if (!subs.length) return;
@@ -552,6 +712,22 @@ async function pollOnce() {
   // multiple Telegram sends in the same tick (rate-limit friendly).
   const now = Date.now();
   for (const result of fetched) {
+    // Resolution sweep — runs even when the orderbook fetch failed
+    // (a vanished orderbook is often the first symptom of a resolved
+    // market). Throttled per market; conservative on API errors.
+    if (config.resolvedCheckIntervalMs > 0) {
+      const mk = String(result.marketId);
+      const lastCheck = lastStatusCheckPerMarket.get(mk) ?? 0;
+      if (now - lastCheck >= config.resolvedCheckIntervalMs) {
+        lastStatusCheckPerMarket.set(mk, now);
+        const ended = await checkMarketEnded(result.marketId);
+        if (ended) {
+          await retireEndedMarket(result.marketId, result.group, ended);
+          needsSave = true;
+          continue;
+        }
+      }
+    }
     if (result.error) {
       console.warn(new Date().toISOString(), `[monitor] ${result.marketId} fetch failed:`, result.error);
       continue;
@@ -566,6 +742,16 @@ async function pollOnce() {
       // slow-drifting markets that never cross the alert threshold
       // still report accurate prices in summaries.
       latestSnapPerSub.set(k, snap);
+      // One-shot price-cross alerts. Evaluated before the change-diff
+      // pipeline because they deliberately BYPASS cooldown and
+      // digest-only mode (the user asked for this exact price). Pause
+      // and quiet hours still gate evaluation — the alert stays armed
+      // and fires on the first poll after the mute lifts.
+      if (s.priceAlerts?.length
+          && !(s.pausedUntil && now < s.pausedUntil)
+          && !isChatInQuietHours(s.chatId, now)) {
+        if (await firePriceAlerts(s, snap)) needsSave = true;
+      }
       // Hydrate the in-memory baseline from the persisted last-alert
       // snapshot on the first poll after a restart. Without this every
       // sub fires "🆕 初次抓取" right after a redeploy because the
@@ -728,7 +914,7 @@ async function pollOnce() {
       const muted = isChatInQuietHours(s.chatId, now) || isChatDigestOnly(s.chatId);
       try {
         if (!muted) {
-          await sendMessage(s.chatId, text, { replyMarkup });
+          await sendThrottled(s.chatId, text, { replyMarkup });
         }
         lastNotify.set(k, now);
         lastBookPerSub.set(k, snap);
@@ -770,8 +956,11 @@ async function pollOnce() {
         });
       } catch (err) {
         console.warn('[monitor] send failed', s.chatId, err.message);
-        if (err.message?.includes('403')) {
+        // Chat permanently unreachable (blocked / kicked / deleted) —
+        // drop the sub AND its runtime maps so we stop retrying.
+        if (isPermanentSendError(err)) {
           removeSubscription(s.chatId, s.marketId);
+          clearSubRuntime(s.chatId, s.marketId);
           await saveState();
         }
       }
@@ -997,7 +1186,7 @@ export async function sendDigestForChat(chatId) {
   lines.push('', `<i>改频率 /digest · 历史 /history &lt;id&gt; · 统计 /stats &lt;id&gt;</i>`);
 
   const text = lines.join('\n');
-  await sendMessage(chatId, text);
+  await sendThrottled(chatId, text);
 
   // Persist the rendered digest so /digestlog can replay past summaries
   // (e.g. user wakes up and wants to see what was sent overnight).

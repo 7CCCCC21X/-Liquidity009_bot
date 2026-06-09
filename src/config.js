@@ -66,6 +66,10 @@ export const config = {
   // with many subscriptions.
   pollConcurrency: envNum('POLL_CONCURRENCY', 8),
   marketsCacheTtlMs: envNum('MARKETS_CACHE_TTL_MS', 600_000),
+  // How often (per market) to ask GraphQL whether the market has
+  // resolved/closed. Resolved markets get a 🏁 notice and their subs
+  // auto-removed so they stop burning poll slots. 0 disables the sweep.
+  resolvedCheckIntervalMs: envNum('RESOLVED_CHECK_INTERVAL_MS', 900_000),
   graphqlTimeoutMs: envNum('GRAPHQL_TIMEOUT_MS', 30_000),
   orderbookTimeoutMs: envNum('ORDERBOOK_TIMEOUT_MS', 10_000),
 

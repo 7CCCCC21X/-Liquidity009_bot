@@ -20,6 +20,12 @@ export const LEVEL_LABEL = {
   ask1: '卖1', ask2: '卖2', ask3: '卖3',
 };
 
+// Price-cross alert metrics: any watched level's price, plus the two
+// derived values. One-shot — the alert is removed the moment it fires.
+export const ALERT_METRICS = [...ALL_LEVELS, 'mid', 'spread'];
+export const ALERT_METRIC_LABEL = { ...LEVEL_LABEL, mid: '中价', spread: '价差' };
+export const ALERT_OPS = ['>=', '<=', '>', '<'];
+
 // Per-subscription trigger condition. Default 'both' = alert on price
 // OR size change (legacy behavior). 'price' / 'size' suppress the
 // other half so the user can mute one signal entirely.
@@ -147,6 +153,11 @@ export function addSubscription(sub) {
     question: sub.question ?? existing?.question ?? null,
     addedAt: existing?.addedAt ?? Date.now(),
   };
+  // Re-subscribing the same market must not silently disarm pending
+  // price alerts — carry them over.
+  if (existing?.priceAlerts?.length) {
+    _state.subs[k].priceAlerts = existing.priceAlerts;
+  }
   // Apply per-chat default cooldown to new subs only — existing subs
   // keep whatever they had (incl. /threshold per-sub override).
   if (!existing && cs.defaultCooldownMs != null && cs.defaultCooldownMs > 0) {
@@ -229,6 +240,42 @@ export function setSubscriptionThresholds(chatId, marketId, thresholds) {
     };
   }
   return s;
+}
+
+// One-shot price-cross alerts. Stored on the sub as
+//   sub.priceAlerts = [{ id, metric, op, price, createdAt }]
+// metric ∈ ALERT_METRICS, op ∈ ALERT_OPS. The monitor evaluates them
+// every poll and removes each alert the moment it fires (one-shot).
+export function addSubscriptionPriceAlert(chatId, marketId, { metric, op, price }) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  if (!Array.isArray(s.priceAlerts)) s.priceAlerts = [];
+  const alert = {
+    id: Math.random().toString(36).slice(2, 8),
+    metric, op, price,
+    createdAt: Date.now(),
+  };
+  s.priceAlerts.push(alert);
+  // Cap per sub so a runaway script can't bloat the state file.
+  if (s.priceAlerts.length > 20) s.priceAlerts = s.priceAlerts.slice(-20);
+  return alert;
+}
+
+export function removeSubscriptionPriceAlert(chatId, marketId, alertId) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s?.priceAlerts?.length) return false;
+  const before = s.priceAlerts.length;
+  s.priceAlerts = s.priceAlerts.filter((a) => a.id !== alertId);
+  if (!s.priceAlerts.length) delete s.priceAlerts;
+  return (s.priceAlerts?.length ?? 0) < before;
+}
+
+export function clearSubscriptionPriceAlerts(chatId, marketId) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return 0;
+  const n = s.priceAlerts?.length ?? 0;
+  delete s.priceAlerts;
+  return n;
 }
 
 export function setSubscriptionPause(chatId, marketId, untilMs) {

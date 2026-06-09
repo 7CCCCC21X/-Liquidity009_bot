@@ -9,7 +9,9 @@
 - **网址识别**：事件页（多张卡片选择）/ 单市场页（自动订阅）
 - **自定义档位**：每张订阅独立勾选买1/2/3、卖1/2/3。订阅成功消息附带「📐 配置档位」按钮，或随时 `/levels <id>`。
 - **备注**：每张订阅可加自定义文字标签，列表和通知里都显示。点「📝 设置备注」按钮（ForceReply 弹输入框）或 `/note <id> <文字>`。
-- 变动监控：默认 30s 轮询，被勾选的档位价位（变动 ≥ 0.005）或量（变动 ≥ 50 张或 10%）触发推送
+- 变动监控：默认 30s 轮询，被勾选的档位价位（变动 ≥ 0.001）或量（变动 ≥ 10 张或 5%）触发推送
+- **到价提醒**：`/alert <id> 买1>0.55` 一次性限价提醒，触发即解除；绕过冷却和「只发摘要」
+- **结算检测**：市场结算/关闭后自动发 🏁 通知并取消订阅（间隔 `RESOLVED_CHECK_INTERVAL_MS`，默认 15 分钟查一次）
 - 持久化：订阅 + 档位 + 备注写入 `STATE_FILE`，Railway redeploy 不丢
 - 0 第三方依赖：纯 Node 20 内置 fetch
 
@@ -21,6 +23,7 @@
 | `/list` | 列出当前聊天的订阅、监控档位、备注 |
 | `/levels <id>` | 调出档位勾选键盘（买1/2/3、卖1/2/3） |
 | `/note <id> <文字>` | 设置备注（不带文字 → 弹输入框；发 `-` 清除） |
+| `/alert <id> 买1>0.55` | **到价提醒**（一次性）。指标：买/卖1-3、中价、价差；比较：`>` `>=` `<` `<=`。`/alert` 看全部，`/alert <id> -` 清除 |
 | `/history <id> [N]` | 查看该市场最近 N 条变动（默认 10，最多 50） |
 | `/export` | 把整个 `history.jsonl` 文件发回到聊天里 |
 | `/stop <id>` | 取消单个订阅 |
@@ -79,6 +82,8 @@ npm run diagnose -- https://predict.fun/zh-cn/market/fifa-world-cup-group-e-winn
    STATE_FILE=/data/state.json
    HISTORY_FILE=/data/history.jsonl
    ```
+   公网部署建议同时设置 `ALLOWED_CHAT_IDS=<你的chatId>`，否则任何找到
+   bot 的人都能订阅（用 `npm run get-chat-id` 查自己的 id）。
    其它如 `POLL_INTERVAL_MS`、`PRICE_EPSILON`、`HISTORY_KEEP_DAYS` 都有合理默认值。
 5. `railway.json` 已配好 `npm start`、自动重启策略；启动时自动 prune 旧记录（间隔 ≥24h）。
 
@@ -115,9 +120,10 @@ Bot 内部并行抓多市场（`Promise.all` + 并发上限），所以 N 个订
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PRICE_EPSILON` | `0.005` | 价格变动 ≥ 0.5¢ |
-| `SIZE_RELATIVE_EPSILON` | `0.10` | 量变 ≥ 10% |
-| `SIZE_ABSOLUTE_MIN` | `50` | 量变 ≥ 50 张 |
+| `PRICE_EPSILON` | `0.001` | 价格变动 ≥ 0.1¢（Predict.fun 最小可见跳动） |
+| `SIZE_RELATIVE_EPSILON` | `0.05` | 量变 ≥ 5% |
+| `SIZE_ABSOLUTE_MIN` | `10` | 量变 ≥ 10 张 |
+| `RESOLVED_CHECK_INTERVAL_MS` | `900000` | 结算检测频率（每市场，ms）；0 关闭 |
 
 **历史记录**：
 

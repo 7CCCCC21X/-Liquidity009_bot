@@ -431,6 +431,20 @@ export async function getMarketById(id) {
   return data?.market ?? null;
 }
 
+// Lean single-market fetch used by the monitor's resolution sweep.
+// Unlike getMarketById this NEVER touches the full-list cache — one
+// GraphQL query per call, no pagination — so it's safe to call on a
+// periodic per-market timer without keeping the whole market list warm.
+export async function getMarketStatusById(id) {
+  const { selection } = await getMarketSelection();
+  const data = await postGraphQL(
+    `query GetMarketStatus($id: ID!) { market(id: $id) { ${selection} } }`,
+    { id: String(id) },
+    'GetMarketStatus',
+  );
+  return data?.market ?? null;
+}
+
 // REST `/v1/markets` exposes `categorySlug` (the actual URL slug) on
 // every market, while GraphQL doesn't reliably surface it. Cache an
 // id → categorySlug map so resolveSlugToMarkets has an authoritative

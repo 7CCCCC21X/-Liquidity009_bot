@@ -15,10 +15,12 @@ import {
   setChatDigestOnly, isChatDigestOnly,
   setChatDefaultLevels, setChatDefaultTriggerMode, setChatDefaultCooldown,
   putPendingBulkRetry, takePendingBulkRetry, gcPendingBulkRetry,
+  addSubscriptionPriceAlert, clearSubscriptionPriceAlerts,
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
+  ALERT_METRICS, ALERT_METRIC_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, sendDigestForChat, effectiveThresholds, deriveEventTitle } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, sendDigestForChat, effectiveThresholds, deriveEventTitle, clearSubRuntime, alertMetricValue } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -69,6 +71,7 @@ const HELP_DETAIL = [
   '/quiet &lt;HH:MM-HH:MM&gt; — 勿扰时段（例 23:00-08:00），勿扰期间只写历史不推送',
   '/settings — 聊天设置面板（默认档位 / 默认触发 / 默认冷却 / 摘要 / 勿扰）',
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
+  '/alert &lt;id&gt; 买1&gt;0.55 — 到价提醒（一次性；支持 买/卖1-3、中价、价差，&gt; &gt;= &lt; &lt;=）',
   '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
   '/export — 把整个 history.jsonl 发回给你',
@@ -129,9 +132,87 @@ function fmtRelativeRemaining(untilMs) {
 // per-level prev→cur deltas. Uses bestBid/bestAsk only because that's
 // what the JSONL records (we save the full top-3 for cur, but prev is
 // just bestBid/bestAsk to keep entries small).
+// User-facing aliases for /alert metrics — Chinese labels and short
+// forms all collapse to the canonical bid1/ask1/mid/spread keys.
+const ALERT_ALIAS = {
+  '买1': 'bid1', '买2': 'bid2', '买3': 'bid3',
+  '卖1': 'ask1', '卖2': 'ask2', '卖3': 'ask3',
+  'b1': 'bid1', 'b2': 'bid2', 'b3': 'bid3',
+  'a1': 'ask1', 'a2': 'ask2', 'a3': 'ask3',
+  '中价': 'mid', '价差': 'spread',
+};
+
+// Parse a price-cross expression like "bid1>0.55", "买1≥0.55",
+// "mid<0.3", "spread<=0.02" → { metric, op, price } or null.
+function parseAlertExpr(raw) {
+  const s = String(raw ?? '').replace(/\s+/g, '').toLowerCase();
+  const m = s.match(/^([a-z一-鿿]+\d?)(>=|<=|≥|≤|>|<)(\d*\.?\d+)$/);
+  if (!m) return null;
+  const metric = ALERT_ALIAS[m[1]] ?? m[1];
+  if (!ALERT_METRICS.includes(metric)) return null;
+  const op = ({ '≥': '>=', '≤': '<=' })[m[2]] ?? m[2];
+  const price = Number(m[3]);
+  // Predict.fun prices live on the 0–1 scale; spread too.
+  if (!Number.isFinite(price) || price < 0 || price > 1) return null;
+  return { metric, op, price };
+}
+
+const ALERT_USAGE = [
+  '<b>🎯 到价提醒用法</b>',
+  '<code>/alert &lt;id&gt; 买1&gt;0.55</code> — 设一条（触发一次后自动解除）',
+  '指标：买1/2/3 · 卖1/2/3 · 中价 · 价差（也可用 bid1 / ask1 / mid / spread）',
+  '比较：&gt; &gt;= &lt; &lt;=',
+  '<code>/alert &lt;id&gt;</code> — 查看该市场的提醒',
+  '<code>/alert</code> — 查看本聊天全部提醒',
+  '<code>/alert &lt;id&gt; -</code> — 清除该市场全部提醒',
+].join('\n');
+
+function fmtAlertLine(a, snap) {
+  const label = ALERT_METRIC_LABEL[a.metric] ?? a.metric;
+  const cur = alertMetricValue(snap, a.metric);
+  const curStr = cur != null ? `  <i>当前 ${cur.toFixed(4)}</i>` : '';
+  return `🎯 <code>${htmlEscape(`${label} ${a.op} ${a.price}`)}</code>${curStr}`;
+}
+
+async function renderAlertsForSub(chatId, sub) {
+  const alerts = sub.priceAlerts ?? [];
+  const lines = [
+    `<b>🎯 ${marketLink(sub.title || `Market ${sub.marketId}`, sub.slug)}</b>`,
+    `<code>id=${sub.marketId}</code>`,
+    '',
+  ];
+  if (!alerts.length) {
+    lines.push('<i>该市场没有到价提醒。</i>', '', ALERT_USAGE);
+  } else {
+    for (const a of alerts) lines.push(fmtAlertLine(a, sub.lastSnap));
+    lines.push('', `<i>触发一次后自动解除 · 清除全部：/alert ${sub.marketId} -</i>`);
+  }
+  await sendMessage(chatId, lines.join('\n'));
+}
+
+async function renderAlertOverview(chatId) {
+  const subs = listSubscriptionsForChat(chatId).filter((s) => s.priceAlerts?.length);
+  if (!subs.length) {
+    await sendMessage(chatId, `<i>当前没有到价提醒。</i>\n\n${ALERT_USAGE}`);
+    return;
+  }
+  const lines = ['<b>🎯 全部到价提醒</b>', ''];
+  for (const s of subs) {
+    lines.push(`<b>${marketLink(s.title || `Market ${s.marketId}`, s.slug)}</b>  <code>${s.marketId}</code>`);
+    for (const a of s.priceAlerts) lines.push(`  ${fmtAlertLine(a, s.lastSnap)}`);
+  }
+  lines.push('', '<i>触发一次后自动解除 · /alert &lt;id&gt; - 清除某市场的提醒</i>');
+  await sendMessage(chatId, lines.join('\n'));
+}
+
 function fmtHistoryEntry(e) {
   const t = fmtClockTime(e.ts);
   const head = `<code>${t}</code>`;
+  // Typed events (price_alert, market_ended) carry a self-contained
+  // plain-text summary — render it directly instead of the diff path.
+  if (e.type && e.summary) {
+    return `${head}  ${htmlEscape(e.summary)}`;
+  }
   if (!e.prev) {
     const bb = e.cur?.bestBid;
     const ba = e.cur?.bestAsk;
@@ -883,7 +964,10 @@ async function handleCommand(chatId, text) {
       return true;
     }
     const ok = removeSubscription(chatId, id);
-    if (ok) await saveState();
+    if (ok) {
+      clearSubRuntime(chatId, id);
+      await saveState();
+    }
     await sendMessage(chatId, ok ? `✅ 已取消订阅 <code>${htmlEscape(id)}</code>` : `❌ 没有订阅 <code>${htmlEscape(id)}</code>`);
     return true;
   }
@@ -979,6 +1063,62 @@ async function handleCommand(chatId, text) {
     await sendMessage(chatId, thresholdHeader(sub), {
       replyMarkup: buildThresholdKeyboard(id, preset),
     });
+    return true;
+  }
+  // /alert                      — list all price alerts in this chat
+  // /alert <id>                 — list alerts on one sub (+ usage)
+  // /alert <id> 买1>0.55        — arm a one-shot price-cross alert
+  // /alert <id> -|clear         — clear all alerts on that sub
+  if (c === '/alert' || /^\/alert_\d+$/.test(c)) {
+    let id = args[0];
+    let rest = args.slice(1);
+    if (/^\/alert_\d+$/.test(c)) {
+      id = c.slice('/alert_'.length);
+      rest = args;
+    }
+    if (!id) {
+      await renderAlertOverview(chatId);
+      return true;
+    }
+    const sub = getSubscription(chatId, id);
+    if (!sub) {
+      await sendMessage(chatId, `❌ 没有订阅 <code>${htmlEscape(id)}</code>，先订阅再设提醒。`);
+      return true;
+    }
+    if (!rest.length) {
+      await renderAlertsForSub(chatId, sub);
+      return true;
+    }
+    if (rest[0] === '-' || rest[0].toLowerCase() === 'clear') {
+      const n = clearSubscriptionPriceAlerts(chatId, id);
+      if (n) await saveState();
+      await sendMessage(chatId, n
+        ? `🧹 已清除 <code>${htmlEscape(id)}</code> 的 ${n} 条到价提醒。`
+        : `该市场没有到价提醒。`);
+      return true;
+    }
+    const parsed = parseAlertExpr(rest.join(' '));
+    if (!parsed) {
+      await sendMessage(chatId, `❌ 无法解析条件。\n\n${ALERT_USAGE}`);
+      return true;
+    }
+    const alert = addSubscriptionPriceAlert(chatId, id, parsed);
+    await saveState();
+    const label = ALERT_METRIC_LABEL[parsed.metric] ?? parsed.metric;
+    const cur = alertMetricValue(sub.lastSnap, parsed.metric);
+    const lines = [
+      `🎯 <b>已设置到价提醒</b>`,
+      `📊 ${marketLink(sub.title || `Market ${id}`, sub.slug)}`,
+      `<code>${htmlEscape(`${label} ${parsed.op} ${parsed.price}`)}</code>${cur != null ? `  <i>当前 ${cur.toFixed(4)}</i>` : ''}`,
+      `<i>触发一次后自动解除；绕过冷却与「只发摘要」，暂停/勿扰期间不触发（解除后补查）。</i>`,
+    ];
+    // Heads-up when the condition is already true right now — it will
+    // fire on the very next poll tick.
+    if (cur != null && alert) {
+      const already = ({ '>': cur > parsed.price, '>=': cur >= parsed.price, '<': cur < parsed.price, '<=': cur <= parsed.price })[parsed.op];
+      if (already) lines.push('⚠️ <i>当前价格已满足该条件，下次轮询会立即触发。</i>');
+    }
+    await sendMessage(chatId, lines.join('\n'));
     return true;
   }
   if (c === '/stats' || /^\/stats_\d+$/.test(c)) {
@@ -2100,7 +2240,9 @@ async function runStats(chatId, marketId, hours = 24) {
   // window math is honest. Old entries past 14-day retention just
   // aren't there.
   const events = await readEvents({ chatId, marketId, limit: 5000 });
-  const inWindow = events.filter((e) => e.ts >= cutoff);
+  // Typed records (price_alert / market_ended) aren't change triggers —
+  // keep them out of the trigger count and delta math.
+  const inWindow = events.filter((e) => e.ts >= cutoff && !e.type);
   if (!inWindow.length) {
     await sendMessage(chatId, `<i>📊 最近 ${hours}h 没有 <code>${htmlEscape(marketId)}</code> 的触发记录。</i>`);
     return;
@@ -2586,7 +2728,12 @@ async function handleCallback(cb) {
   if (unsubAll) {
     const ids = unsubAll[1].split(',').filter(Boolean);
     let removed = 0;
-    for (const id of ids) if (removeSubscription(chatId, id)) removed += 1;
+    for (const id of ids) {
+      if (removeSubscription(chatId, id)) {
+        clearSubRuntime(chatId, id);
+        removed += 1;
+      }
+    }
     if (removed) await saveState();
     await answerCallbackQuery(cb.id, { text: `已停止 ${removed}` });
     if (messageId) {
@@ -2602,7 +2749,10 @@ async function handleCallback(cb) {
   if (unsubOk) {
     const id = unsubOk[1];
     const ok = removeSubscription(chatId, id);
-    if (ok) await saveState();
+    if (ok) {
+      clearSubRuntime(chatId, id);
+      await saveState();
+    }
     await answerCallbackQuery(cb.id, { text: ok ? '已停止' : '订阅已不存在' });
     if (messageId) {
       try {
@@ -2697,7 +2847,10 @@ async function handleCallback(cb) {
 
   if (data === 'stopall_ok') {
     const subs = listSubscriptionsForChat(chatId);
-    for (const s of subs) removeSubscription(chatId, s.marketId);
+    for (const s of subs) {
+      removeSubscription(chatId, s.marketId);
+      clearSubRuntime(chatId, s.marketId);
+    }
     if (subs.length) await saveState();
     await answerCallbackQuery(cb.id, { text: `已停止 ${subs.length}` });
     if (messageId) {
@@ -2951,6 +3104,7 @@ async function main() {
     { command: 'digest',    description: '定期摘要（防遗漏盘口）' },
     { command: 'digestlog', description: '查看历史摘要（睡醒补看）' },
     { command: 'digestonly', description: '只发摘要 · 静音即时提醒（开关）' },
+    { command: 'alert',     description: '到价提醒（一次性，例 /alert 272779 买1>0.55）' },
     { command: 'settings',  description: '聊天设置面板（默认档位/触发/摘要/勿扰…）' },
     { command: 'status',    description: 'Bot 健康状态' },
     { command: 'export',    description: '导出 history.jsonl' },

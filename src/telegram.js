@@ -104,6 +104,17 @@ export async function tgApi(method, payload, { timeoutMs = 15_000, retries = 2 }
 }
 
 export async function getUpdates({ offset, timeoutSec = 25, signal } = {}) {
+  // Local watchdog: a healthy long-poll returns within ~timeoutSec, so
+  // anything past +10s means the connection died mid-flight (half-open
+  // TCP, dropped NAT entry, …). Without this abort the await would hang
+  // forever and freeze the entire command-processing loop.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), (timeoutSec + 10) * 1000);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    signal.addEventListener('abort', onAbort);
+  }
   try {
     const res = await fetch(tgUrl('getUpdates'), {
       method: 'POST',
@@ -113,7 +124,7 @@ export async function getUpdates({ offset, timeoutSec = 25, signal } = {}) {
         timeout: timeoutSec,
         allowed_updates: ['message', 'callback_query', 'my_chat_member'],
       }),
-      signal,
+      signal: ctrl.signal,
     });
     if (!res.ok) throw new Error(`getUpdates ${res.status}: ${(await res.text()).slice(0, 200)}`);
     const json = await res.json();
@@ -122,6 +133,9 @@ export async function getUpdates({ offset, timeoutSec = 25, signal } = {}) {
   } catch (err) {
     err.message = redactTokens(err.message);
     throw err;
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
   }
 }
 
