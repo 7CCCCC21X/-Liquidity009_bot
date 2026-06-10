@@ -17,7 +17,7 @@ import {
   putPendingBulkRetry, takePendingBulkRetry, gcPendingBulkRetry,
   addSubscriptionPriceAlert, clearSubscriptionPriceAlerts,
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
-  ALERT_METRICS, ALERT_METRIC_LABEL,
+  ALERT_METRICS, ALERT_METRIC_LABEL, ALERT_OP_DECODE,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
 import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, fmtClockDateTime, sendDigestForChat, effectiveThresholds, deriveEventTitle, clearSubRuntime, alertMetricValue } from './monitor.js';
@@ -169,6 +169,157 @@ const ALERT_USAGE = [
   '<code>/alert &lt;id&gt; -</code> — 清除该市场全部提醒',
 ].join('\n');
 
+// Tolerant price parsing for the button flow's ForceReply step:
+// "0.55" / ".55" / "55" / "55¢" / "55%" all land on 0.55. Anything
+// above 1 on the 0–1 internal scale must be cents, so divide by 100.
+function parseAlertPrice(raw) {
+  const s = String(raw ?? '').trim().replace(/[¢￠%％\s]/g, '');
+  if (!s) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const v = n > 1 ? n / 100 : n;
+  return v <= 1 ? v : null;
+}
+
+// ---- /alert button flow (alm:<id>:… callbacks) ---------------------
+
+function alertMenuHeader(sub, step) {
+  const lines = [
+    `🎯 <b>到价提醒</b> · ${marketLink(sub.title || `Market ${sub.marketId}`, sub.slug)}`,
+    `<code>id=${sub.marketId}</code>`,
+  ];
+  const snap = sub.lastSnap;
+  if (snap?.bestBid && snap?.bestAsk) {
+    const mid = (snap.bestBid.price + snap.bestAsk.price) / 2;
+    lines.push(`<i>当前 买1 ${snap.bestBid.price.toFixed(4)} · 卖1 ${snap.bestAsk.price.toFixed(4)} · 中价 ${mid.toFixed(4)}</i>`);
+  }
+  lines.push('', step);
+  return lines.join('\n');
+}
+
+function buildAlertMetricKeyboard(marketId) {
+  const btn = (k) => ({ text: ALERT_METRIC_LABEL[k] ?? k, callback_data: `alm:${marketId}:m:${k}` });
+  return {
+    inline_keyboard: [
+      [btn('bid1'), btn('ask1')],
+      [btn('bid2'), btn('ask2')],
+      [btn('bid3'), btn('ask3')],
+      [btn('mid'), btn('spread')],
+      [{ text: '❌ 取消', callback_data: `alm:${marketId}:cancel` }],
+    ],
+  };
+}
+
+function buildAlertDirKeyboard(marketId, metric) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '📈 高于 ≥', callback_data: `alm:${marketId}:d:${metric}:ge` },
+        { text: '📉 低于 ≤', callback_data: `alm:${marketId}:d:${metric}:le` },
+      ],
+      [{ text: '↩️ 返回', callback_data: `alm:${marketId}:back` }],
+    ],
+  };
+}
+
+// Shared confirmation for every way an alert gets armed (typed
+// expression, button flow, one-tap reverse).
+async function sendAlertSetConfirmation(chatId, sub, parsed) {
+  const label = ALERT_METRIC_LABEL[parsed.metric] ?? parsed.metric;
+  const cur = alertMetricValue(sub.lastSnap, parsed.metric);
+  const lines = [
+    `🎯 <b>已设置到价提醒</b>`,
+    `📊 ${marketLink(sub.title || `Market ${sub.marketId}`, sub.slug)}`,
+    `<code>${htmlEscape(`${label} ${parsed.op} ${parsed.price}`)}</code>${cur != null ? `  <i>当前 ${cur.toFixed(4)}</i>` : ''}`,
+    `<i>触发一次后自动解除；绕过冷却与「只发摘要」，暂停/勿扰期间不触发（解除后补查）。</i>`,
+  ];
+  if (cur != null) {
+    const already = ({ '>': cur > parsed.price, '>=': cur >= parsed.price, '<': cur < parsed.price, '<=': cur <= parsed.price })[parsed.op];
+    if (already) lines.push('⚠️ <i>当前价格已满足该条件，下次轮询会立即触发。</i>');
+  }
+  await sendMessage(chatId, lines.join('\n'));
+}
+
+// Dispatch for alm:<marketId>[:<action>] callbacks — the multi-step
+// button flow: metric picker → direction picker → ForceReply price.
+async function handleAlertMenuCallback(chatId, messageId, callbackId, marketId, action) {
+  const sub = getSubscription(chatId, marketId);
+  if (!sub) {
+    await answerCallbackQuery(callbackId, { text: '订阅不存在', showAlert: true });
+    return;
+  }
+  // Entry point (🎯 button on any card) — fresh picker message so we
+  // never clobber the alert/notification the button lives on.
+  if (!action) {
+    await answerCallbackQuery(callbackId);
+    await sendMessage(chatId, alertMenuHeader(sub, '<b>① 选择监控指标</b>'), {
+      replyMarkup: buildAlertMetricKeyboard(marketId),
+    });
+    return;
+  }
+  if (action === 'cancel') {
+    await answerCallbackQuery(callbackId, { text: '已取消' });
+    try { await editMessageText(chatId, messageId, '🎯 <i>已取消设置到价提醒。</i>'); } catch { /* old message */ }
+    return;
+  }
+  if (action === 'back') {
+    await answerCallbackQuery(callbackId);
+    try {
+      await editMessageText(chatId, messageId, alertMenuHeader(sub, '<b>① 选择监控指标</b>'), buildAlertMetricKeyboard(marketId));
+    } catch { /* unchanged */ }
+    return;
+  }
+  const mMatch = action.match(/^m:(\w+)$/);
+  if (mMatch && ALERT_METRICS.includes(mMatch[1])) {
+    const metric = mMatch[1];
+    const label = ALERT_METRIC_LABEL[metric] ?? metric;
+    await answerCallbackQuery(callbackId, { text: label });
+    try {
+      await editMessageText(chatId, messageId,
+        alertMenuHeader(sub, `<b>② ${htmlEscape(label)} — 选择方向</b>`),
+        buildAlertDirKeyboard(marketId, metric));
+    } catch { /* unchanged */ }
+    return;
+  }
+  const dMatch = action.match(/^d:(\w+):(ge|le)$/);
+  if (dMatch && ALERT_METRICS.includes(dMatch[1])) {
+    const metric = dMatch[1];
+    const op = ALERT_OP_DECODE[dMatch[2]];
+    const label = ALERT_METRIC_LABEL[metric] ?? metric;
+    await answerCallbackQuery(callbackId);
+    try {
+      await editMessageText(chatId, messageId,
+        alertMenuHeader(sub, `<b>③ ${htmlEscape(`${label} ${op}`)} …</b>  <i>请回复目标价</i>`));
+    } catch { /* unchanged */ }
+    const cur = alertMetricValue(sub.lastSnap, metric);
+    const sent = await sendMessage(chatId, [
+      `🎯 <b>回复此条消息输入目标价</b>`,
+      `<code>${htmlEscape(`${label} ${op} ?`)}</code>${cur != null ? `  <i>当前 ${cur.toFixed(4)}</i>` : ''}`,
+      `<i>接受 0.55 / 55 / 55¢ / 55%（自动换算到 0–1）。30 分钟内有效。</i>`,
+    ].join('\n'), {
+      replyMarkup: { force_reply: true, selective: true, input_field_placeholder: '目标价，如 0.55' },
+    });
+    putPendingPrompt(chatId, sent.message_id, 'alertprice', { marketId, metric, op });
+    await saveState();
+    return;
+  }
+  // One-tap reverse alert from a fired-alert message.
+  const invMatch = action.match(/^inv:(\w+):(gt|ge|lt|le):([\d.]+)$/);
+  if (invMatch && ALERT_METRICS.includes(invMatch[1])) {
+    const parsed = { metric: invMatch[1], op: ALERT_OP_DECODE[invMatch[2]], price: Number(invMatch[3]) };
+    if (!Number.isFinite(parsed.price) || parsed.price < 0 || parsed.price > 1) {
+      await answerCallbackQuery(callbackId, { text: '价格无效', showAlert: true });
+      return;
+    }
+    addSubscriptionPriceAlert(chatId, marketId, parsed);
+    await saveState();
+    await answerCallbackQuery(callbackId, { text: '✅ 反向提醒已设置' });
+    await sendAlertSetConfirmation(chatId, sub, parsed);
+    return;
+  }
+  await answerCallbackQuery(callbackId);
+}
+
 function fmtAlertLine(a, snap) {
   const label = ALERT_METRIC_LABEL[a.metric] ?? a.metric;
   const cur = alertMetricValue(snap, a.metric);
@@ -184,12 +335,13 @@ async function renderAlertsForSub(chatId, sub) {
     '',
   ];
   if (!alerts.length) {
-    lines.push('<i>该市场没有到价提醒。</i>', '', ALERT_USAGE);
+    lines.push('<i>该市场没有到价提醒。点下方按钮选指标，或：</i>', '', ALERT_USAGE);
   } else {
     for (const a of alerts) lines.push(fmtAlertLine(a, sub.lastSnap));
-    lines.push('', `<i>触发一次后自动解除 · 清除全部：/alert ${sub.marketId} -</i>`);
+    lines.push('', `<i>触发一次后自动解除 · 清除全部：/alert ${sub.marketId} - · 点下方按钮再加一条</i>`);
   }
-  await sendMessage(chatId, lines.join('\n'));
+  // Button-first: the metric picker doubles as the "add another" entry.
+  await sendMessage(chatId, lines.join('\n'), { replyMarkup: buildAlertMetricKeyboard(sub.marketId) });
 }
 
 async function renderAlertOverview(chatId) {
@@ -477,6 +629,11 @@ async function sendSubscribed(chatId, m, { wasExisting = false, askForNote = tru
     await saveState();
   } else {
     lines.push('', '<i>当前订单簿抓取失败 — 不影响订阅，下一轮轮询会自动重试。</i>');
+  }
+  // Surface the price-cross feature right where a fresh subscriber is
+  // looking — the 🎯 button below opens the picker flow.
+  if (!wasExisting) {
+    lines.push('', '<i>🎯 想在到价时收到提醒？点下方「🎯 到价」按钮设置。</i>');
   }
   await sendMessage(chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(m.id) });
 
@@ -1104,23 +1261,9 @@ async function handleCommand(chatId, text) {
       await sendMessage(chatId, `❌ 无法解析条件。\n\n${ALERT_USAGE}`);
       return true;
     }
-    const alert = addSubscriptionPriceAlert(chatId, id, parsed);
+    addSubscriptionPriceAlert(chatId, id, parsed);
     await saveState();
-    const label = ALERT_METRIC_LABEL[parsed.metric] ?? parsed.metric;
-    const cur = alertMetricValue(sub.lastSnap, parsed.metric);
-    const lines = [
-      `🎯 <b>已设置到价提醒</b>`,
-      `📊 ${marketLink(sub.title || `Market ${id}`, sub.slug)}`,
-      `<code>${htmlEscape(`${label} ${parsed.op} ${parsed.price}`)}</code>${cur != null ? `  <i>当前 ${cur.toFixed(4)}</i>` : ''}`,
-      `<i>触发一次后自动解除；绕过冷却与「只发摘要」，暂停/勿扰期间不触发（解除后补查）。</i>`,
-    ];
-    // Heads-up when the condition is already true right now — it will
-    // fire on the very next poll tick.
-    if (cur != null && alert) {
-      const already = ({ '>': cur > parsed.price, '>=': cur >= parsed.price, '<': cur < parsed.price, '<=': cur <= parsed.price })[parsed.op];
-      if (already) lines.push('⚠️ <i>当前价格已满足该条件，下次轮询会立即触发。</i>');
-    }
-    await sendMessage(chatId, lines.join('\n'));
+    await sendAlertSetConfirmation(chatId, sub, parsed);
     return true;
   }
   if (c === '/stats' || /^\/stats_\d+$/.test(c)) {
@@ -1617,6 +1760,12 @@ async function renderListView(chatId, page = 0, { onlyPaused = false, search = n
       `档位：${levels} · 触发：${mode}`,
     ];
     if (isPaused) lines.push(`<i>⏸ 已暂停，${fmtRelativeRemaining(s.pausedUntil)}后恢复 · /resume_${s.marketId}</i>`);
+    if (s.priceAlerts?.length) {
+      const preview = s.priceAlerts.slice(0, 2)
+        .map((a) => `${ALERT_METRIC_LABEL[a.metric] ?? a.metric}${a.op}${a.price}`).join('、');
+      const more = s.priceAlerts.length > 2 ? ` 等 ${s.priceAlerts.length} 条` : '';
+      lines.push(`🎯 ${htmlEscape(preview)}${more} · /alert_${s.marketId}`);
+    }
     { const nl = fmtNoteLine(s); if (nl) lines.push(nl); }
     await sendMessage(chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(s.marketId) });
   }
@@ -1648,8 +1797,9 @@ async function renderListCompact(chatId, search = null) {
     const mode = TRIGGER_LABEL[s.triggerMode] ?? '价+量';
     const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
     const noteBit = s.note ? ` 📝 ${htmlEscape(s.note.slice(0, 16))}` : '';
+    const alertBit = s.priceAlerts?.length ? ` 🎯${s.priceAlerts.length}` : '';
     lines.push(`${dot} ${titleLink}`);
-    lines.push(`  <code>${s.marketId}</code> · ${levels} · ${mode}${noteBit}`);
+    lines.push(`  <code>${s.marketId}</code> · ${levels} · ${mode}${alertBit}${noteBit}`);
   }
   if (subs.length > 50) lines.push('', `<i>… 还有 ${subs.length - 50} 个，请用 /list 默认视图分页。</i>`);
   lines.push('', `<i>/list 默认视图 · /list paused 仅看暂停 · /list 关键字 搜索</i>`);
@@ -2102,6 +2252,24 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
     await applySettingsReply(chatId, cmd, replyText);
     return;
   }
+  // 🎯 alert button flow, step ③: the reply is the target price.
+  if (cmd === 'alertprice') {
+    const sub = getSubscription(chatId, args.marketId);
+    if (!sub) {
+      await sendMessage(chatId, `❌ 订阅 <code>${htmlEscape(String(args.marketId))}</code> 已不存在。`);
+      return;
+    }
+    const price = parseAlertPrice(replyText);
+    if (price == null) {
+      await sendMessage(chatId, '❌ 价格无效。请发 0–1 的小数（0.55）或分值（55 / 55¢ / 55%），然后重新点 🎯 到价。');
+      return;
+    }
+    const parsed = { metric: args.metric, op: args.op, price };
+    addSubscriptionPriceAlert(chatId, args.marketId, parsed);
+    await saveState();
+    await sendAlertSetConfirmation(chatId, sub, parsed);
+    return;
+  }
   // /digestlog 自定义 sub-flow: the reply is a duration ("3h") or a
   // bare integer ("10"); no market resolution needed.
   if (cmd === 'digestlog') {
@@ -2374,7 +2542,28 @@ function downsample(points, n) {
   return out;
 }
 
-async function runChart(chatId, marketId, windowMs = 24 * 3600_000, windowLabel = '24h') {
+// Window-switch row under every chart. The active window is marked;
+// tapping another re-renders the same message in place.
+function chartWindowKeyboard(marketId, activeLabel) {
+  const wins = ['1h', '6h', '24h', '7d'];
+  return {
+    inline_keyboard: [wins.map((w) => ({
+      text: w === activeLabel ? `· ${w} ·` : w,
+      callback_data: `chart:${marketId}:${w}`,
+    }))],
+  };
+}
+
+async function runChart(chatId, marketId, windowMs = 24 * 3600_000, windowLabel = '24h', { editMessageId = null } = {}) {
+  // Edit-in-place when invoked from the window-switch buttons; fresh
+  // message otherwise. editMessageText throws on identical content —
+  // swallow it (the user just re-tapped the active window).
+  const deliver = async (text, replyMarkup) => {
+    if (editMessageId) {
+      try { await editMessageText(chatId, editMessageId, text, replyMarkup); return; } catch { /* unchanged or too old */ }
+    }
+    await sendMessage(chatId, text, { replyMarkup });
+  };
   const cutoff = Date.now() - windowMs;
   const events = await readEvents({ chatId, marketId, limit: 5000 });
   // events are newest-first; collect in-window change records that
@@ -2390,10 +2579,10 @@ async function runChart(chatId, marketId, windowMs = 24 * 3600_000, windowLabel 
   }
   pts.reverse();
   if (pts.length < 2) {
-    await sendMessage(chatId, [
+    await deliver([
       `<i>📈 最近 ${htmlEscape(windowLabel)} 内 <code>${htmlEscape(marketId)}</code> 的样本不足（${pts.length} 个）。</i>`,
-      `<i>样本来自每次变动推送；可拉长窗口：<code>/chart ${htmlEscape(marketId)} 7d</code></i>`,
-    ].join('\n'));
+      `<i>样本来自每次变动推送；点下方按钮换窗口试试。</i>`,
+    ].join('\n'), chartWindowKeyboard(marketId, windowLabel));
     return;
   }
   // 48 cols fits comfortably in Telegram's monospace block on mobile.
@@ -2418,7 +2607,7 @@ async function runChart(chatId, marketId, windowMs = 24 * 3600_000, windowLabel 
     '',
     `<i>/stats_${marketId} 统计 · /history_${marketId} 明细 · /probe_${marketId} 立即抓</i>`,
   ];
-  await sendMessage(chatId, lines.join('\n'));
+  await deliver(lines.join('\n'), chartWindowKeyboard(marketId, windowLabel));
 }
 
 async function runProbe(chatId, marketId) {
@@ -3166,6 +3355,27 @@ async function handleCallback(cb) {
     const token = pickMatch[1];
     const action = pickMatch[2];
     await handlePickCallback(chatId, messageId, cb.id, token, action);
+    return;
+  }
+
+  // 🎯 alert button flow: alm:<id> / alm:<id>:m:… / :d:… / :inv:… / :back / :cancel
+  const almMatch = data.match(/^alm:(\d+)(?::(.+))?$/);
+  if (almMatch) {
+    await handleAlertMenuCallback(chatId, messageId, cb.id, almMatch[1], almMatch[2] ?? '');
+    return;
+  }
+
+  // 📈 chart window switcher on a /chart message.
+  const chartMatch = data.match(/^chart:(\d+):(\w+)$/);
+  if (chartMatch) {
+    const [, id, winLabel] = chartMatch;
+    const windowMs = parseDurationMs(winLabel);
+    if (!windowMs) {
+      await answerCallbackQuery(cb.id, { text: '窗口无效' });
+      return;
+    }
+    await answerCallbackQuery(cb.id, { text: winLabel });
+    await runChart(chatId, id, windowMs, winLabel, { editMessageId: messageId });
     return;
   }
 

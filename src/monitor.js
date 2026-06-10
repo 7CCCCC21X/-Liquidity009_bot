@@ -8,7 +8,8 @@ import {
   removeSubscriptionPriceAlert,
   getAllChatSettings, markChatDigestSent, isChatInQuietHours,
   isChatDigestOnly,
-  ALL_LEVELS, LEVEL_LABEL, ALERT_METRIC_LABEL, subKey,
+  ALL_LEVELS, LEVEL_LABEL, ALERT_METRIC_LABEL,
+  ALERT_OP_ENCODE, ALERT_OP_FLIP, subKey,
 } from './state.js';
 import { appendEvent } from './history.js';
 
@@ -197,6 +198,7 @@ export function subActionKeyboard(marketId) {
         { text: '🔍 抓取', callback_data: `probe:${marketId}` },
         { text: '📐 档位', callback_data: `lvl:${marketId}:open` },
         { text: '📝 备注', callback_data: `note:${marketId}` },
+        { text: '🎯 到价', callback_data: `alm:${marketId}` },
       ],
       [
         { text: '⏸ 30m', callback_data: `pause:${marketId}:30m` },
@@ -617,9 +619,18 @@ async function firePriceAlerts(s, snap) {
     ];
     if (s.note) lines.push(`📝 <i>${htmlEscape(s.note)}</i>`);
     lines.push('', fmtSpreadLine(snap), '', fmtBook(null, snap, levels));
-    lines.push('', `<code>id=${s.marketId}</code>`, `<i>一次性提醒，已自动解除。再设：/alert_${s.marketId}</i>`);
+    lines.push('', `<code>id=${s.marketId}</code>`, `<i>一次性提醒，已自动解除。</i>`);
+    // Quick-action row: re-arm a new alert via the button flow, or
+    // one-tap the mirror condition (e.g. ask1>0.55 fired → ask1<0.55
+    // re-armed at the same price) to catch the pull-back.
+    const flipped = ALERT_OP_FLIP[a.op] ?? '<';
+    const keyboard = subActionKeyboard(s.marketId);
+    keyboard.inline_keyboard.unshift([
+      { text: '🎯 再设一条', callback_data: `alm:${s.marketId}` },
+      { text: `🔁 反向 ${label}${flipped}${a.price}`, callback_data: `alm:${s.marketId}:inv:${a.metric}:${ALERT_OP_ENCODE[flipped]}:${a.price}` },
+    ]);
     try {
-      await sendThrottled(s.chatId, lines.join('\n'), { replyMarkup: subActionKeyboard(s.marketId) });
+      await sendThrottled(s.chatId, lines.join('\n'), { replyMarkup: keyboard });
     } catch (err) {
       console.warn('[monitor] price-alert send failed', s.chatId, err.message);
     }

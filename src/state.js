@@ -25,6 +25,11 @@ export const LEVEL_LABEL = {
 export const ALERT_METRICS = [...ALL_LEVELS, 'mid', 'spread'];
 export const ALERT_METRIC_LABEL = { ...LEVEL_LABEL, mid: '中价', spread: '价差' };
 export const ALERT_OPS = ['>=', '<=', '>', '<'];
+// Compact op tokens for Telegram callback_data (no </> chars) and the
+// one-tap "reverse alert" flip on a fired-alert message.
+export const ALERT_OP_ENCODE = { '>': 'gt', '>=': 'ge', '<': 'lt', '<=': 'le' };
+export const ALERT_OP_DECODE = { gt: '>', ge: '>=', lt: '<', le: '<=' };
+export const ALERT_OP_FLIP = { '>': '<', '>=': '<=', '<': '>', '<=': '>=' };
 
 // Per-subscription trigger condition. Default 'both' = alert on price
 // OR size change (legacy behavior). 'price' / 'size' suppress the
