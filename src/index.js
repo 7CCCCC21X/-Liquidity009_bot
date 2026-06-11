@@ -441,7 +441,7 @@ async function promptForNote(chatId, marketId) {
   await saveState();
 }
 
-function buildChoiceKeyboard(token, matches, selected = [], existingIds = new Set()) {
+function buildChoiceKeyboard(token, matches, selected = [], existingIds = new Set(), mode = 'sub') {
   const sel = new Set(selected);
   const rows = [];
   for (let i = 0; i < matches.length; i++) {
@@ -469,13 +469,22 @@ function buildChoiceKeyboard(token, matches, selected = [], existingIds = new Se
     { text: '⬜ 清空', callback_data: `pick:${token}:none` },
   ]);
   rows.push([
-    { text: `✓ 完成 (${sel.size})`, callback_data: `pick:${token}:done` },
+    {
+      text: mode === 'unsub' ? `🛑 取消所选 (${sel.size})` : `✓ 完成 (${sel.size})`,
+      callback_data: `pick:${token}:done`,
+    },
     { text: '✖ 取消', callback_data: `pick:${token}:cancel` },
   ]);
   return { inline_keyboard: rows };
 }
 
-function buildChoiceHeaderText(matches, selectedCount, existingCount = 0) {
+function buildChoiceHeaderText(matches, selectedCount, existingCount = 0, mode = 'sub') {
+  if (mode === 'unsub') {
+    return [
+      `🛑 这个事件里你订阅了 <b>${matches.length}</b> 个市场，请<b>勾选</b>要取消的：`,
+      `<i>已选 <b>${selectedCount}</b> 个 · 30 分钟内有效</i>`,
+    ].join('\n');
+  }
   const existingHint = existingCount
     ? ` · 🟢 ${existingCount} 个已在监控（再次勾选会刷新信息，不会动档位/备注）`
     : '';
@@ -516,19 +525,20 @@ async function handlePickCallback(chatId, messageId, callbackId, token, action) 
     return;
   }
   const { matches } = entry;
+  const mode = entry.mode === 'unsub' ? 'unsub' : 'sub';
 
   if (action === 'all') {
     entry.selected = matches.map((_, i) => i);
     await saveState();
     await answerCallbackQuery(callbackId, { text: `已全选 ${matches.length}` });
-    await refreshChoiceKeyboard(chatId, messageId, token, matches, entry.selected);
+    await refreshChoiceKeyboard(chatId, messageId, token, matches, entry.selected, mode);
     return;
   }
   if (action === 'none') {
     entry.selected = [];
     await saveState();
     await answerCallbackQuery(callbackId, { text: '已清空' });
-    await refreshChoiceKeyboard(chatId, messageId, token, matches, entry.selected);
+    await refreshChoiceKeyboard(chatId, messageId, token, matches, entry.selected, mode);
     return;
   }
   if (action.startsWith('t:')) {
@@ -542,7 +552,7 @@ async function handlePickCallback(chatId, messageId, callbackId, token, action) 
     entry.selected = [...set].sort((a, b) => a - b);
     await saveState();
     await answerCallbackQuery(callbackId);
-    await refreshChoiceKeyboard(chatId, messageId, token, matches, entry.selected);
+    await refreshChoiceKeyboard(chatId, messageId, token, matches, entry.selected, mode);
     return;
   }
   if (action === 'done') {
@@ -551,6 +561,11 @@ async function handlePickCallback(chatId, messageId, callbackId, token, action) 
       return;
     }
     takePendingChoice(chatId, token);
+    if (mode === 'unsub') {
+      await answerCallbackQuery(callbackId, { text: `取消 ${entry.selected.length} 个…` });
+      await commitPickedUnsubscriptions(chatId, messageId, matches, entry.selected);
+      return;
+    }
     await answerCallbackQuery(callbackId, { text: `订阅 ${entry.selected.length} 个…` });
     await commitPickedSubscriptions(chatId, messageId, matches, entry.selected);
     return;
@@ -558,17 +573,50 @@ async function handlePickCallback(chatId, messageId, callbackId, token, action) 
   await answerCallbackQuery(callbackId);
 }
 
-async function refreshChoiceKeyboard(chatId, messageId, token, matches, selected) {
+async function refreshChoiceKeyboard(chatId, messageId, token, matches, selected, mode = 'sub') {
   if (!messageId) return;
   const existingIds = existingMatchIds(chatId, matches);
   try {
     await editMessageText(
       chatId,
       messageId,
-      buildChoiceHeaderText(matches, selected.length, existingIds.size),
-      buildChoiceKeyboard(token, matches, selected, existingIds),
+      buildChoiceHeaderText(matches, selected.length, existingIds.size, mode),
+      buildChoiceKeyboard(token, matches, selected, existingIds, mode),
     );
   } catch { /* edit may fail on old messages — ignore */ }
+}
+
+// 完成 in unsub mode — remove every picked subscription and replace
+// the picker message with a summary.
+async function commitPickedUnsubscriptions(chatId, messageId, matches, selectedIdx) {
+  const lines = [];
+  let removed = 0;
+  for (const idx of selectedIdx) {
+    const m = matches[idx];
+    if (!m) continue;
+    if (removeSubscription(chatId, m.id)) {
+      removed += 1;
+      const titleShort = (m.title || m.question || '').replace(/\s+/g, ' ').slice(0, 50);
+      lines.push(`✓ <code>${m.id}</code> ${htmlEscape(titleShort)}`);
+    } else {
+      lines.push(`✗ <code>${m.id}</code> 订阅已不存在`);
+    }
+  }
+  if (removed) await saveState();
+  const summary = [
+    `🛑 <b>已取消 ${removed} 个订阅</b>`,
+    '',
+    ...lines,
+    '',
+    '<i>历史记录保留；重新发送网址可再次订阅。</i>',
+  ].join('\n');
+  if (messageId) {
+    try {
+      await editMessageText(chatId, messageId, summary);
+      return;
+    } catch { /* old message — fall through to a fresh send */ }
+  }
+  await sendMessage(chatId, summary);
 }
 
 async function commitPickedSubscriptions(chatId, messageId, matches, selectedIdx) {
@@ -1934,9 +1982,12 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
   }
   // /stop reply-flow: a URL may map to several subscribed sub-markets
   // (event page). Resolve to the full set, keep only the ones this
-  // chat actually subscribes, and show a cancel button per market
-  // plus a "取消全部" when there's more than one. Numeric ids fall
-  // through to the single-market confirm in the switch below.
+  // chat actually subscribes, and show the same checkbox card picker
+  // as the subscribe flow, in 'unsub' mode. The picker keeps callback
+  // data token-sized — packing the id list into a button used to blow
+  // Telegram's 64-byte callback_data cap and the whole card message
+  // got rejected (BUTTON_DATA_INVALID), so the user saw nothing.
+  // Numeric ids fall through to the single-market confirm below.
   if (cmd === 'stop') {
     const t = String(replyText ?? '').trim();
     const numeric = extractMarketId(t);
@@ -1955,17 +2006,13 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
         return;
       }
       if (subscribed.length > 1) {
-        const rows = subscribed.slice(0, 20).map((m) => {
-          const sub = getSubscription(chatId, m.id);
-          const label = (sub?.title || m.title || m.question || `#${m.id}`).slice(0, 40);
-          return [{ text: `🛑 ${label}`, callback_data: `unsub_ok:${m.id}` }];
+        const token = shortToken();
+        putPendingChoice(chatId, token, subscribed, [], 'unsub');
+        await saveState();
+        const existingIds = existingMatchIds(chatId, subscribed);
+        await sendMessage(chatId, buildChoiceHeaderText(subscribed, 0, existingIds.size, 'unsub'), {
+          replyMarkup: buildChoiceKeyboard(token, subscribed, [], existingIds, 'unsub'),
         });
-        rows.push([{ text: `🛑 全部取消（${subscribed.length} 个）`, callback_data: `unsuball:${subscribed.map((m) => m.id).join(',')}` }]);
-        rows.push([{ text: '↩️ 返回', callback_data: 'noop' }]);
-        await sendMessage(chatId, [
-          `🛑 <b>这个事件里你订阅了 ${subscribed.length} 个市场</b>`,
-          '<i>点对应市场取消，或「全部取消」。</i>',
-        ].join('\n'), { replyMarkup: { inline_keyboard: rows } });
         return;
       }
       if (subscribed.length === 1) {
@@ -2581,7 +2628,10 @@ async function handleCallback(cb) {
     return;
   }
 
-  // Bulk stop from the event-page reply flow — comma-separated ids.
+  // Legacy bulk-stop button (comma-separated ids in callback_data).
+  // New messages use the pick:<token> unsub picker instead — id lists
+  // routinely exceeded Telegram's 64-byte callback_data cap. Kept so
+  // old messages that did send keep working.
   const unsubAll = data.match(/^unsuball:([\d,]+)$/);
   if (unsubAll) {
     const ids = unsubAll[1].split(',').filter(Boolean);
