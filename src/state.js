@@ -324,11 +324,17 @@ export function listAllSubscriptions() {
 // data stays under Telegram's 64-byte limit. Auto-expire after 30 min.
 const CHOICE_TTL_MS = 30 * 60 * 1000;
 
-export function putPendingChoice(chatId, token, matches, selected = []) {
+// mode: 'sub' (default) subscribes the picked markets on 完成;
+// 'unsub' removes them instead — used by the /stop reply flow so an
+// event URL with many subscribed sub-markets gets the same checkbox
+// picker UX as subscribing (callback data stays within Telegram's
+// 64-byte cap because only the token travels in the button).
+export function putPendingChoice(chatId, token, matches, selected = [], mode = 'sub') {
   const k = `${chatId}:${token}`;
   _state.pendingChoices[k] = {
     matches,
     selected: Array.from(selected ?? []),
+    mode,
     expiresAt: Date.now() + CHOICE_TTL_MS,
   };
 }
