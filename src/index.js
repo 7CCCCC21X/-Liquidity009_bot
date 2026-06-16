@@ -1815,7 +1815,20 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
       endById.set(id, { ...e, ts: d.ts });
     }
   }
-  if (!startById.size) return;
+  if (!startById.size) {
+    // Digests existed in the window but none carried per-market
+    // structured data (e.g. digests written before the `entries` field
+    // landed, or ones whose snapshots had no top-of-book). Without this
+    // branch the function returned silently and the user — who just
+    // tapped a /digestlog button — saw no response at all.
+    await sendMessage(chatId, [
+      `<b>📊 ${windowLabel} 没有可用于计算变化的数据</b>`,
+      `<i>这段时间有 ${totalDigests ?? chronoDigests.length} 份摘要，但都不带结构化盘口数据（可能是早期版本生成的旧摘要）。</i>`,
+      '',
+      '<i>之后的摘要会带上结构化数据；等下一份 <code>/digest</code> 摘要生成后再用 <code>/digestlog</code> 即可看到净变化。</i>',
+    ].join('\n'));
+    return;
+  }
   const rows = [];
   for (const [id, start] of startById) {
     const end = endById.get(id);
