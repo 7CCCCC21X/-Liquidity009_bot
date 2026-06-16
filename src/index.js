@@ -1739,7 +1739,27 @@ async function sendDigestLogPicker(chatId) {
 // message that lists each market once with its net Δ over the window.
 // `full: true` additionally replays every individual digest first
 // (legacy behaviour, kept for users who want the time-ordered view).
-async function runDigestLog(chatId, { sinceMs, windowLabel, count, full = false } = {}) {
+// Public entry: never let /digestlog leave the user with no feedback.
+// Any unexpected failure (history read error, Telegram send error, …)
+// surfaces as an explicit ❌ message instead of a silent throw that the
+// poll loop would only log. Empty/no-data cases are handled inside.
+async function runDigestLog(chatId, args = {}) {
+  try {
+    await runDigestLogInner(chatId, args);
+  } catch (err) {
+    console.error(new Date().toISOString(), '[digestlog] failed:', err.stack || err.message);
+    try {
+      await sendMessage(chatId, [
+        '❌ <b>加载历史摘要出错</b>',
+        `<i>${htmlEscape(err.message || String(err))}</i>`,
+        '',
+        '<i>已记录日志；稍后重试，或换个时间窗口。</i>',
+      ].join('\n'));
+    } catch { /* even the error report failed — already logged above */ }
+  }
+}
+
+async function runDigestLogInner(chatId, { sinceMs, windowLabel, count, full = false } = {}) {
   // Aggregate scans more digests than we'd ever replay since the cap
   // there was about Telegram message throughput, not data volume.
   const SCAN_LIMIT = 500;

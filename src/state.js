@@ -238,21 +238,6 @@ export function setSubscriptionPause(chatId, marketId, untilMs) {
   return s;
 }
 
-// Mark a subscription as resolved/closed — set when its orderbook
-// 404s ("not_found") for several consecutive polls, i.e. the market
-// settled on Predict.fun and its book was deleted. Resolved subs are
-// skipped by the poll loop (no more 404 spam, no digest pollution) and
-// behave like an indefinite pause. The flag is dropped automatically
-// when the market is re-subscribed (addSubscription rebuilds the sub
-// object without copying it).
-export function setSubscriptionResolved(chatId, marketId, resolved) {
-  const s = _state.subs[subKey(chatId, marketId)];
-  if (!s) return null;
-  if (resolved) s.resolved = true;
-  else delete s.resolved;
-  return s;
-}
-
 // Pause every sub in a chat. Returns the count actually changed so the
 // caller can render an accurate confirmation.
 export function pauseAllForChat(chatId, untilMs) {

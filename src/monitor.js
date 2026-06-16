@@ -4,7 +4,7 @@ import { sendMessage, htmlEscape } from './telegram.js';
 import {
   listAllSubscriptions, removeSubscription, saveState,
   setSubscriptionInitial, setSubscriptionDigestBaseline,
-  setSubscriptionLastSnap, setSubscriptionQuestion, setSubscriptionResolved,
+  setSubscriptionLastSnap, setSubscriptionQuestion,
   getAllChatSettings, markChatDigestSent, isChatInQuietHours,
   isChatDigestOnly,
   ALL_LEVELS, LEVEL_LABEL, subKey,
@@ -36,10 +36,10 @@ const questionBackfillTried = new Set();
 const pendingExcursion = new Map();
 // Consecutive "orderbook not found / 404" count per marketId. When a
 // market resolves on Predict.fun its book is deleted and every fetch
-// 404s forever; after RESOLVED_404_STREAK straight misses we auto-pause
-// (mark resolved) all its subs so the poll loop stops hammering a dead
-// endpoint and digests stop counting it. Reset on any success or on a
-// transient (non-404) error so a network blip never trips it.
+// 404s forever; after RESOLVED_404_STREAK straight misses we auto-remove
+// (unsubscribe) all its subs so the poll loop stops hammering a dead
+// endpoint. Reset on any success or on a transient (non-404) error so a
+// network blip never trips it.
 const notFoundStreak = new Map();
 const RESOLVED_404_STREAK = 5;
 
@@ -560,10 +560,7 @@ async function pollOnce() {
   }
   // Fetch every market in parallel (bounded). With 1 sub the wall-clock
   // is one HTTP call; with N subs it's max(L), not N×L.
-  // Skip markets whose every sub is flagged resolved (settled/delisted)
-  // — their book 404s forever, so polling them just wastes a request and
-  // spams the log. Re-subscribing clears the flag and they poll again.
-  const groups = [...byMarket.entries()].filter(([, group]) => !group.every((s) => s.resolved));
+  const groups = [...byMarket.entries()];
   const fetched = await runWithConcurrency(
     groups,
     config.pollConcurrency,
@@ -572,29 +569,30 @@ async function pollOnce() {
   // Process notifications serially per market so we don't fire
   // multiple Telegram sends in the same tick (rate-limit friendly).
   const now = Date.now();
-  // Markets auto-paused this tick (book 404'd long enough to look
-  // settled). Collected here and announced once per chat after the loop.
-  const newlyResolved = [];
+  // Markets auto-removed this tick (book 404'd long enough to look
+  // settled/delisted). Collected here and announced once per chat after
+  // the loop.
+  const newlyRemoved = [];
   for (const result of fetched) {
     if (result.error) {
       console.warn(new Date().toISOString(), `[monitor] ${result.marketId} fetch failed:`, result.error);
       if (isResolvedMiss(result.error)) {
         const streak = (notFoundStreak.get(result.marketId) ?? 0) + 1;
         if (streak >= RESOLVED_404_STREAK) {
-          // Looks settled/delisted — auto-pause every (not-yet-resolved)
-          // sub for this market so we stop polling a dead endpoint.
+          // Looks settled/delisted — auto-unsubscribe every sub for this
+          // market so we stop polling a dead endpoint. History records
+          // in history.jsonl are append-only and stay intact.
           notFoundStreak.delete(result.marketId);
           const group = result.group ?? [];
           const chatIds = new Set();
           for (const s of group) {
-            if (s.resolved) continue;
-            setSubscriptionResolved(s.chatId, s.marketId, true);
-            s.resolved = true;
-            chatIds.add(String(s.chatId));
-            needsSave = true;
+            if (removeSubscription(s.chatId, s.marketId)) {
+              chatIds.add(String(s.chatId));
+              needsSave = true;
+            }
           }
           if (chatIds.size) {
-            newlyResolved.push({
+            newlyRemoved.push({
               marketId: result.marketId,
               title: group[0]?.title || `Market ${result.marketId}`,
               chatIds,
@@ -605,7 +603,7 @@ async function pollOnce() {
         }
       } else {
         // Transient error (timeout / 5xx / network) — don't let it
-        // accumulate toward an auto-pause.
+        // accumulate toward an auto-removal.
         notFoundStreak.delete(result.marketId);
       }
       continue;
@@ -833,11 +831,11 @@ async function pollOnce() {
       }
     }
   }
-  // Tell each affected chat which markets we just auto-paused. One
+  // Tell each affected chat which markets we just auto-removed. One
   // message per chat even if several markets resolved in the same tick.
-  if (newlyResolved.length) {
+  if (newlyRemoved.length) {
     const byChat = new Map();
-    for (const r of newlyResolved) {
+    for (const r of newlyRemoved) {
       for (const cid of r.chatIds) {
         if (!byChat.has(cid)) byChat.set(cid, []);
         byChat.get(cid).push(r);
@@ -845,17 +843,17 @@ async function pollOnce() {
     }
     for (const [cid, items] of byChat) {
       const lines = [
-        `<b>⏸ 已自动暂停 ${items.length} 个已结束的市场</b>`,
-        `<i>这些市场在 Predict.fun 已无订单簿（连续 ${RESOLVED_404_STREAK} 次 404 not_found），通常表示已结算 / 下架。已停止轮询，不再推送，也不再刷错误日志。</i>`,
+        `<b>🗑 已自动删除 ${items.length} 个已结束的市场订阅</b>`,
+        `<i>这些市场在 Predict.fun 已无订单簿（连续 ${RESOLVED_404_STREAK} 次 404 not_found），通常表示已结算 / 下架，已自动退订、不再轮询。</i>`,
         '',
         ...items.map((r) => `· <code>${r.marketId}</code> ${htmlEscape((r.title || '').slice(0, 50))}`),
         '',
-        `<i>历史记录保留；要彻底移除用 /stop；若市场重新开放，重新订阅即可恢复监控。</i>`,
+        `<i>历史记录保留；若市场重新开放，重新发送网址 / id 即可再次订阅。</i>`,
       ];
       try {
         await sendMessage(cid, lines.join('\n'));
       } catch (err) {
-        console.warn('[monitor] resolved-notify failed:', cid, err.message);
+        console.warn('[monitor] removed-notify failed:', cid, err.message);
       }
     }
   }
@@ -903,10 +901,7 @@ export async function sendDigestForChat(chatId) {
       ?? s.lastSnap
       ?? null;
     const baseline = s.digestBaseline ?? null;
-    // Resolved (auto-paused, settled) subs behave like a manual pause
-    // in the digest: bucketed into "unchanged" rather than surfaced as
-    // a live market with no data.
-    const isPaused = !!s.resolved || (s.pausedUntil && s.pausedUntil > now);
+    const isPaused = s.pausedUntil && s.pausedUntil > now;
     return { sub: s, snap, baseline, isPaused };
   });
 
@@ -1097,9 +1092,7 @@ export async function sendDigestForChat(chatId) {
     text,
     totals: { changed: changed.length, fresh: fresh.length, unchanged: unchanged.length },
     entries: entries
-      // Drop resolved (auto-paused) subs — their last snap is stale, so
-      // persisting it would feed /digestlog's aggregate dead data.
-      .filter((e) => !e.sub.resolved && e.snap?.bestBid && e.snap?.bestAsk)
+      .filter((e) => e.snap?.bestBid && e.snap?.bestAsk)
       .map((e) => ({
         marketId: e.sub.marketId,
         title: e.sub.title || null,
