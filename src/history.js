@@ -1,6 +1,37 @@
 import fs from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import readline from 'node:readline';
 import path from 'node:path';
 import { config } from './config.js';
+
+// Stream a JSONL file line by line. Critical: never read the whole file
+// into one string — an append-only history.jsonl can grow past V8's
+// ~512MB max string length, at which point fs.readFile(..., 'utf8')
+// throws "Invalid string length" and every reader (/digestlog, /history,
+// prune) breaks at once. readline over a byte stream sidesteps that.
+// Returns the parsed events to `onEvt`; ENOENT resolves to no-op.
+async function streamLines(file, onLine) {
+  let input;
+  try {
+    input = createReadStream(file, { encoding: 'utf8' });
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  }
+  const rl = readline.createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (line) await onLine(line);
+    }
+    return true;
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  } finally {
+    rl.close();
+    input.destroy();
+  }
+}
 
 // Append-only JSONL log of every notification we send. One line per
 // event; cheap to write, easy to grep, easy to ship off-box. On Railway
@@ -44,26 +75,21 @@ export async function appendEvent(evt) {
 // timestamp; `limit` is always honoured as a hard cap.
 export async function readDigests({ chatId, limit = 10, sinceMs = 0 } = {}) {
   if (!config.historyEnabled) return [];
-  let raw;
-  try {
-    raw = await fs.readFile(config.historyFile, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    throw err;
-  }
-  const lines = raw.split('\n');
-  const out = [];
-  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
-    const line = lines[i];
-    if (!line) continue;
+  // Forward stream (oldest→newest) keeping only the newest `limit`
+  // matches in a sliding window, so memory stays bounded no matter how
+  // big the file is. Returns newest-first to preserve the old contract.
+  const window = [];
+  await streamLines(config.historyFile, (line) => {
     let evt;
-    try { evt = JSON.parse(line); } catch { continue; }
-    if (evt.type !== 'digest') continue;
-    if (chatId != null && String(evt.chatId) !== String(chatId)) continue;
-    if (sinceMs && evt.ts < sinceMs) break; // walking backwards in time
-    out.push(evt);
-  }
-  return out;
+    try { evt = JSON.parse(line); } catch { return; }
+    if (evt.type !== 'digest') return;
+    if (chatId != null && String(evt.chatId) !== String(chatId)) return;
+    if (sinceMs && evt.ts < sinceMs) return; // older than the window
+    window.push(evt);
+    if (window.length > limit) window.shift();
+  });
+  window.reverse();
+  return window;
 }
 
 // Tail the file for the last N events matching a filter. Reads the
@@ -72,25 +98,19 @@ export async function readDigests({ chatId, limit = 10, sinceMs = 0 } = {}) {
 // cap so we don't blow Telegram's message length.
 export async function readEvents({ chatId, marketId, limit = 50 } = {}) {
   if (!config.historyEnabled) return [];
-  let raw;
-  try {
-    raw = await fs.readFile(config.historyFile, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    throw err;
-  }
-  const lines = raw.split('\n');
-  const out = [];
-  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
-    const line = lines[i];
-    if (!line) continue;
+  // Same bounded forward-stream as readDigests; keep newest `limit` and
+  // return newest-first.
+  const window = [];
+  await streamLines(config.historyFile, (line) => {
     let evt;
-    try { evt = JSON.parse(line); } catch { continue; }
-    if (chatId != null && String(evt.chatId) !== String(chatId)) continue;
-    if (marketId != null && String(evt.marketId) !== String(marketId)) continue;
-    out.push(evt);
-  }
-  return out;
+    try { evt = JSON.parse(line); } catch { return; }
+    if (chatId != null && String(evt.chatId) !== String(chatId)) return;
+    if (marketId != null && String(evt.marketId) !== String(marketId)) return;
+    window.push(evt);
+    if (window.length > limit) window.shift();
+  });
+  window.reverse();
+  return window;
 }
 
 export async function fileStats() {
@@ -130,28 +150,42 @@ export async function maybePrune() {
 export async function forcePrune() {
   if (!config.historyEnabled) return { kept: 0, dropped: 0 };
   const cutoff = Date.now() - (config.historyKeepDays || 14) * 86_400_000;
-  let raw;
+  // Stream read → stream write so a multi-hundred-MB log is rewritten
+  // without ever materialising it in memory (the old readFile('utf8')
+  // path threw "Invalid string length" once the file got big enough,
+  // which is exactly what let it keep growing).
+  const tmp = `${config.historyFile}.tmp`;
+  const out = createWriteStream(tmp);
+  let kept = 0;
+  let dropped = 0;
+  let streamed;
   try {
-    raw = await fs.readFile(config.historyFile, 'utf8');
+    streamed = await streamLines(config.historyFile, async (line) => {
+      let ts;
+      try { ts = JSON.parse(line).ts; } catch { dropped += 1; return; }
+      if (ts >= cutoff) {
+        kept += 1;
+        // Honour backpressure: if the kernel buffer is full, wait for
+        // 'drain' before queueing more so memory stays bounded.
+        if (!out.write(line + '\n')) {
+          await new Promise((resolve) => out.once('drain', resolve));
+        }
+      } else {
+        dropped += 1;
+      }
+    });
   } catch (err) {
-    if (err.code === 'ENOENT') return { kept: 0, dropped: 0 };
+    out.destroy();
+    await fs.rm(tmp, { force: true }).catch(() => {});
     throw err;
   }
-  const kept = [];
-  let dropped = 0;
-  for (const line of raw.split('\n')) {
-    if (!line) continue;
-    try {
-      const evt = JSON.parse(line);
-      if (evt.ts >= cutoff) kept.push(line);
-      else dropped += 1;
-    } catch {
-      dropped += 1;
-    }
+  await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve())));
+  if (streamed === false) {
+    // Source file didn't exist — nothing to prune; drop the empty temp.
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    return { kept: 0, dropped: 0 };
   }
-  const tmp = `${config.historyFile}.tmp`;
-  await fs.writeFile(tmp, kept.length ? kept.join('\n') + '\n' : '');
   await fs.rename(tmp, config.historyFile);
-  console.log(new Date().toISOString(), `[history] pruned: kept ${kept.length}, dropped ${dropped}`);
-  return { kept: kept.length, dropped };
+  console.log(new Date().toISOString(), `[history] pruned: kept ${kept}, dropped ${dropped}`);
+  return { kept, dropped };
 }
