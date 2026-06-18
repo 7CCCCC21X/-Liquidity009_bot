@@ -96,16 +96,19 @@ export async function readDigests({ chatId, limit = 10, sinceMs = 0 } = {}) {
 // whole file then walks backwards — fine for the 14-day default; if
 // the file ever gets huge consider an indexed format. limit is a hard
 // cap so we don't blow Telegram's message length.
-export async function readEvents({ chatId, marketId, limit = 50 } = {}) {
+export async function readEvents({ chatId, marketId, limit = 50, sinceMs = 0 } = {}) {
   if (!config.historyEnabled) return [];
   // Same bounded forward-stream as readDigests; keep newest `limit` and
-  // return newest-first.
+  // return newest-first. `sinceMs` (optional) drops events older than the
+  // cutoff before they ever enter the window — used by /movers to scan a
+  // bounded time slice instead of a fixed count.
   const window = [];
   await streamLines(config.historyFile, (line) => {
     let evt;
     try { evt = JSON.parse(line); } catch { return; }
     if (chatId != null && String(evt.chatId) !== String(chatId)) return;
     if (marketId != null && String(evt.marketId) !== String(marketId)) return;
+    if (sinceMs && evt.ts < sinceMs) return; // older than the window
     window.push(evt);
     if (window.length > limit) window.shift();
   });

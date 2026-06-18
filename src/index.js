@@ -71,6 +71,7 @@ const HELP_DETAIL = [
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
   '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
+  '/movers [时长] [N] — 近期变动最大的市场排序，例 <code>/movers 24h</code>（默认 24h，最多列 N=20）',
   '/export — 把整个 history.jsonl 发回给你',
   '/probe &lt;id&gt; — 立即抓一次订单簿（不等下次轮询）',
   '/speedtest [N] — 测延迟（默认 5 次），给出推荐的最快 POLL_INTERVAL_MS',
@@ -886,6 +887,18 @@ async function handleCommand(chatId, text) {
     if (!Number.isFinite(n) || n <= 0) n = 10;
     n = Math.min(50, Math.floor(n));
     await runHistoryView(chatId, id, n);
+    return true;
+  }
+  if (c === '/movers' || c === '/top') {
+    // 近期变动最大的市场排序：scan this chat's change history over a
+    // time window (default 24h) and rank markets by how far top-of-book
+    // moved from the window's start to its end. Optional second arg caps
+    // how many rows to show.
+    let windowMs = parseDurationMs(args[0]);
+    let windowLabel = args[0];
+    if (!windowMs) { windowMs = 24 * 3_600_000; windowLabel = '24h'; }
+    const topN = Math.max(1, Math.min(100, Number(args[1]) || 20));
+    await runMoversView(chatId, { windowMs, windowLabel, topN });
     return true;
   }
   if (c === '/export') {
@@ -1938,6 +1951,103 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
   }
   if (flatCount) {
     lines.push('', `<i>· 另 ${flatCount} 个市场无变化（已隐藏）</i>`);
+  }
+  await sendMessage(chatId, lines.join('\n'));
+}
+
+// 近期变动最大的市场排序。Unlike /digestlog (which depends on periodic
+// digests being configured), this works off the raw change-history that
+// every alert writes, so it's available even when digests are off. For
+// each market we take the EARLIEST in-window event's pre-change book as
+// the window start (falling back to its post-change book when prev is
+// absent, e.g. first-ever poll) and the LATEST event's post-change book
+// as the end, then rank by the bigger of |Δ买1| / |Δ卖1|.
+async function runMoversView(chatId, { windowMs, windowLabel, topN } = {}) {
+  const sinceMs = Date.now() - windowMs;
+  // Generous cap: scan all in-window events; busy chats still bounded.
+  const events = await readEvents({ chatId, limit: 100_000, sinceMs });
+  // History stores top-of-book as {price, size}; digests (no `cur`)
+  // and first-poll rows without usable prices get skipped below.
+  const price = (lvl) => (lvl && typeof lvl.price === 'number' ? lvl.price : null);
+  const startById = new Map();
+  const endById = new Map();
+  // readEvents returns newest→oldest; walk oldest→newest so the first
+  // time we see a market is its window-start anchor.
+  for (const e of events.slice().reverse()) {
+    const curBid = price(e.cur?.bestBid);
+    const curAsk = price(e.cur?.bestAsk);
+    if (curBid == null || curAsk == null) continue; // not a usable book row
+    const id = String(e.marketId);
+    if (!startById.has(id)) {
+      // Prefer the pre-change book as the start anchor (one step further
+      // back in time); fall back to this event's own book otherwise.
+      const startBid = price(e.prev?.bestBid);
+      const startAsk = price(e.prev?.bestAsk);
+      startById.set(id, {
+        bestBid: startBid != null ? startBid : curBid,
+        bestAsk: startAsk != null ? startAsk : curAsk,
+        title: e.title || null, slug: e.slug || null, note: e.note || null, ts: e.ts,
+      });
+    }
+    endById.set(id, { bestBid: curBid, bestAsk: curAsk, title: e.title || null, slug: e.slug || null, note: e.note || null, ts: e.ts });
+  }
+  if (!startById.size) {
+    await sendMessage(chatId, [
+      `<i>📭 最近 ${htmlEscape(windowLabel)} 没有任何市场变动记录。</i>`,
+      '',
+      '<i>有订单簿变动时才会记录；换个更长的时间窗试试，例 <code>/movers 3d</code>。</i>',
+    ].join('\n'));
+    return;
+  }
+  const rows = [];
+  for (const [id, start] of startById) {
+    const end = endById.get(id);
+    const dBid = end.bestBid - start.bestBid;
+    const dAsk = end.bestAsk - start.bestAsk;
+    rows.push({
+      id,
+      title: end.title || start.title,
+      slug: end.slug || start.slug,
+      note: end.note || start.note,
+      start, end, dBid, dAsk,
+      mag: Math.max(Math.abs(dBid), Math.abs(dAsk)),
+    });
+  }
+  rows.sort((a, b) => b.mag - a.mag);
+  const moved = rows.filter((r) => r.mag >= 1e-9);
+  const flatCount = rows.length - moved.length;
+  if (!moved.length) {
+    await sendMessage(chatId, [
+      `<b>📈 最近 ${htmlEscape(windowLabel)} 变动最大的市场</b>`,
+      '',
+      `<i>✅ ${rows.length} 个市场在这段时间都没有净变化。</i>`,
+    ].join('\n'));
+    return;
+  }
+  const dot = (dBid, dAsk) => {
+    const dom = Math.abs(dBid) >= Math.abs(dAsk) ? dBid : dAsk;
+    if (dom > 1e-9) return '🟢';
+    if (dom < -1e-9) return '🔴';
+    return '🔔';
+  };
+  const fmtDelta = (dp) => Math.abs(dp) < 1e-9 ? '0' : `${dp > 0 ? '↑' : '↓'}${Math.abs(dp).toFixed(4)}`;
+  const lines = [
+    `<b>📈 最近 ${htmlEscape(windowLabel)} 变动最大的市场（${moved.length} 个）</b>`,
+    `<i>按 买1/卖1 最大净变化排序 · 点市场名进 Predict.fun</i>`,
+    '',
+  ];
+  const shown = moved.slice(0, topN);
+  shown.forEach((r, i) => {
+    const titleLink = marketLink(r.title || `Market ${r.id}`, r.slug);
+    const noteBit = r.note ? ` <i>📝${htmlEscape(String(r.note).slice(0, 20))}</i>` : '';
+    lines.push(`${i + 1}. ${dot(r.dBid, r.dAsk)} ${titleLink} <code>${r.id}</code>${noteBit}`);
+    lines.push(`   买1 ${r.start.bestBid.toFixed(4)}→${r.end.bestBid.toFixed(4)} (${fmtDelta(r.dBid)}) · 卖1 ${r.start.bestAsk.toFixed(4)}→${r.end.bestAsk.toFixed(4)} (${fmtDelta(r.dAsk)})`);
+  });
+  if (moved.length > shown.length) {
+    lines.push('', `<i>… 还有 ${moved.length - shown.length} 个有变化（加大 N 看更多，例 <code>/movers ${htmlEscape(windowLabel)} 50</code>）</i>`);
+  }
+  if (flatCount) {
+    lines.push('', `<i>· 另 ${flatCount} 个市场无净变化（已隐藏）</i>`);
   }
   await sendMessage(chatId, lines.join('\n'));
 }
@@ -3033,6 +3143,7 @@ async function main() {
     { command: 'list',      description: '我的订阅（分页 + 操作按钮）' },
     { command: 'digest',    description: '定期摘要（防遗漏盘口）' },
     { command: 'digestlog', description: '查看历史摘要（睡醒补看）' },
+    { command: 'movers',    description: '近期变动最大的市场排序' },
     { command: 'digestonly', description: '只发摘要 · 静音即时提醒（开关）' },
     { command: 'settings',  description: '聊天设置面板（默认档位/触发/摘要/勿扰…）' },
     { command: 'status',    description: 'Bot 健康状态' },
