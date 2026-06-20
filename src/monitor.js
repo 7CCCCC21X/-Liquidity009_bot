@@ -163,6 +163,16 @@ export function primeSubscriptionSnapshot(chatId, marketId, snap) {
   });
 }
 
+// Freshest orderbook snapshot we've polled for a sub, regardless of
+// whether it ever alerted. `/stale` reads this to show the current 买1/
+// 卖1 alongside how long they've been frozen. Falls back to the last-
+// alert baseline so a market that hasn't been re-polled this process
+// (e.g. just after restart) still reports a book.
+export function getLatestSnapForSub(chatId, marketId) {
+  const k = subKey(chatId, marketId);
+  return latestSnapPerSub.get(k) ?? lastBookPerSub.get(k) ?? null;
+}
+
 // Standard action row attached to every notification + every /list
 // card. The callback handlers for these live in src/index.js.
 //

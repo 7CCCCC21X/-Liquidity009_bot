@@ -18,7 +18,7 @@ import {
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
-import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, sendDigestForChat, effectiveThresholds, deriveEventTitle } from './monitor.js';
+import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, fmtClockDateTime, sendDigestForChat, effectiveThresholds, deriveEventTitle, getLatestSnapForSub } from './monitor.js';
 import { startMonitorLoop } from './monitor.js';
 
 requireConfig();
@@ -72,6 +72,7 @@ const HELP_DETAIL = [
   '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
   '/movers [时长] [N] — 近期变动最大的市场排序，例 <code>/movers 24h</code>（默认 24h，最多列 N=20）',
+  '/stale [N] — 买1/卖1 停滞最久的市场排行（盘口最稳、最不易被插队；辅助判断挂 Yes/No，默认 N=20，别名 /idle）',
   '/export — 把整个 history.jsonl 发回给你',
   '/probe &lt;id&gt; — 立即抓一次订单簿（不等下次轮询）',
   '/speedtest [N] — 测延迟（默认 5 次），给出推荐的最快 POLL_INTERVAL_MS',
@@ -124,6 +125,19 @@ function fmtRelativeRemaining(untilMs) {
   if (sec < 3600) return `${Math.floor(sec / 60)} 分`;
   if (sec < 86400) return `${Math.floor(sec / 3600)} 小时 ${Math.floor((sec % 3600) / 60)} 分`;
   return `${Math.floor(sec / 86400)} 天 ${Math.floor((sec % 86400) / 3600)} 小时`;
+}
+
+// Human-readable elapsed duration (a span, not a countdown). Used by
+// /stale to render how long a market's 买1/卖1 has gone unchanged.
+function fmtElapsed(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  if (sec < 60) return `${sec}秒`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}分`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return min % 60 ? `${hr}小时${min % 60}分` : `${hr}小时`;
+  const d = Math.floor(hr / 24);
+  return hr % 24 ? `${d}天${hr % 24}小时` : `${d}天`;
 }
 
 // Render one history entry as a compact 1-2 line block: timestamp +
@@ -899,6 +913,14 @@ async function handleCommand(chatId, text) {
     if (!windowMs) { windowMs = 24 * 3_600_000; windowLabel = '24h'; }
     const topN = Math.max(1, Math.min(100, Number(args[1]) || 20));
     await runMoversView(chatId, { windowMs, windowLabel, topN });
+    return true;
+  }
+  if (c === '/stale' || c === '/idle' || c === '/停滞') {
+    // 买1/卖1 停滞排行：rank monitored markets by how long their
+    // top-of-book has gone unchanged, so the user can spot the most
+    // "frozen" books and decide which side (Yes/No) to provide.
+    const topN = Math.max(1, Math.min(100, Number(args[0]) || 20));
+    await runStaleView(chatId, { topN });
     return true;
   }
   if (c === '/export') {
@@ -2052,6 +2074,108 @@ async function runMoversView(chatId, { windowMs, windowLabel, topN } = {}) {
   await sendMessage(chatId, lines.join('\n'));
 }
 
+// 买1/卖1 停滞时长排行。For each market this chat monitors, work out
+// when each side's top-of-book price last actually moved, then rank by
+// how long the whole book has sat frozen (longest first). Unlike
+// /movers (which ranks by size of change), this surfaces the *quietest*
+// books — the ones where a maker quote is least likely to be jumped, so
+// the user can judge which side (挂 Yes / 挂 No) to rest liquidity on.
+//
+// "Last moved" is read from this chat's change-history: walking newest→
+// oldest, the first event whose 买1 (resp. 卖1) price differs from its
+// own recorded prev is that side's last-change moment. A market with no
+// recorded change since subscribe is treated as frozen since its
+// monitoring start (sub.initial.atMs / addedAt).
+async function runStaleView(chatId, { topN = 20 } = {}) {
+  const subs = listSubscriptionsForChat(chatId);
+  if (!subs.length) {
+    await sendMessage(chatId, '<i>📭 当前聊天没有订阅。先发个网址 / id / slug 开始监控。</i>');
+    return;
+  }
+  const now = Date.now();
+  const events = await readEvents({ chatId, limit: 100_000 });
+  const price = (lvl) => (lvl && typeof lvl.price === 'number' ? lvl.price : null);
+  // marketId → ts of the most recent event where that side's price moved.
+  const lastBidChange = new Map();
+  const lastAskChange = new Map();
+  for (const e of events) { // newest → oldest
+    const id = String(e.marketId);
+    if (!lastBidChange.has(id)) {
+      const cur = price(e.cur?.bestBid);
+      const prev = price(e.prev?.bestBid);
+      if (cur != null && (prev == null || Math.abs(cur - prev) >= 1e-9)) lastBidChange.set(id, e.ts);
+    }
+    if (!lastAskChange.has(id)) {
+      const cur = price(e.cur?.bestAsk);
+      const prev = price(e.prev?.bestAsk);
+      if (cur != null && (prev == null || Math.abs(cur - prev) >= 1e-9)) lastAskChange.set(id, e.ts);
+    }
+  }
+  const rows = [];
+  for (const s of subs) {
+    const id = String(s.marketId);
+    // Frozen-since anchor for a side with no recorded change: the moment
+    // monitoring started. Clamp to now so a clock skew never yields a
+    // negative span.
+    const anchor = Math.min(now, s.initial?.atMs ?? s.addedAt ?? now);
+    const bidTs = lastBidChange.get(id) ?? anchor;
+    const askTs = lastAskChange.get(id) ?? anchor;
+    const lastChange = Math.max(bidTs, askTs); // whole book frozen since this
+    const snap = getLatestSnapForSub(chatId, s.marketId) ?? s.lastSnap ?? null;
+    rows.push({
+      sub: s,
+      bidTs, askTs, lastChange,
+      stale: now - lastChange,
+      bidStale: now - bidTs,
+      askStale: now - askTs,
+      snap,
+      paused: s.pausedUntil && s.pausedUntil > now,
+    });
+  }
+  rows.sort((a, b) => b.stale - a.stale);
+  const shown = rows.slice(0, topN);
+  const lines = [
+    `<b>🧊 买1/卖1 停滞排行（${rows.length} 个市场）</b>`,
+    '<i>按盘口最久未变排序 · 越靠前 = 报价越稳、越不易被插队</i>',
+    '',
+  ];
+  shown.forEach((r, i) => {
+    const s = r.sub;
+    const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
+    const noteBit = s.note ? ` <i>📝${htmlEscape(String(s.note).slice(0, 20))}</i>` : '';
+    const pauseBit = r.paused ? ' ⏸' : '';
+    lines.push(`${i + 1}. 🧊 ${titleLink} <code>${s.marketId}</code>${noteBit}${pauseBit}`);
+    const bb = r.snap?.bestBid;
+    const ba = r.snap?.bestAsk;
+    if (bb && ba && typeof bb.price === 'number' && typeof ba.price === 'number') {
+      const mid = (bb.price + ba.price) / 2;
+      const spread = ba.price - bb.price;
+      // Line 1 — precise orderbook, same 买1/卖1 vocabulary as alerts /
+      // /history / /movers so the command stays consistent.
+      lines.push(`   买1 ${bb.price.toFixed(4)}×${bb.size}（停 ${fmtElapsed(r.bidStale)}） · 卖1 ${ba.price.toFixed(4)}×${ba.size}（停 ${fmtElapsed(r.askStale)}）`);
+      // Line 2 — Yes/No action translation. 挂 Yes rests a bid (买入
+      // Yes) → reference ≈ 买1, frozen for bidStale. 挂 No rests a
+      // buy-No order, i.e. sell Yes at the ask → the No-denominated
+      // price is 1 − 卖1, frozen for askStale. Mark whichever side has
+      // sat longer (>60s apart) as the more stable queue.
+      const noPrice = 1 - ba.price;
+      const yesMark = r.bidStale - r.askStale > 60_000 ? ' ·更稳' : '';
+      const noMark = r.askStale - r.bidStale > 60_000 ? ' ·更稳' : '';
+      lines.push(`   → 挂 <b>Yes</b> 参考 ${bb.price.toFixed(4)}（停${fmtElapsed(r.bidStale)}${yesMark}） ｜ 挂 <b>No</b> 参考 ${noPrice.toFixed(4)}（停${fmtElapsed(r.askStale)}${noMark}）`);
+      // Line 3 — implied probability + spread for context.
+      lines.push(`   隐含 Yes ${(mid * 100).toFixed(1)}% · 价差 ${spread.toFixed(4)}`);
+    } else {
+      lines.push(`   <i>盘口待抓取 · 整体停滞 ${fmtElapsed(r.stale)}</i>`);
+    }
+    lines.push(`   整体停滞 ${fmtElapsed(r.stale)} <i>（自 ${fmtClockDateTime(r.lastChange)}）</i>`);
+  });
+  if (rows.length > shown.length) {
+    lines.push('', `<i>… 还有 ${rows.length - shown.length} 个（加大 N 看更多，例 <code>/stale 50</code>）</i>`);
+  }
+  lines.push('', '<i>挂 Yes = 在买1侧报价（≈买1）；挂 No = 在卖1侧报价（No 价 = 1−卖1）。停滞越久的一侧队列越稳，仅供参考。</i>');
+  await sendMessage(chatId, lines.join('\n'));
+}
+
 async function runHistoryView(chatId, marketId, n = 10) {
   const events = await readEvents({ chatId, marketId, limit: n });
   if (!events.length) {
@@ -3144,6 +3268,7 @@ async function main() {
     { command: 'digest',    description: '定期摘要（防遗漏盘口）' },
     { command: 'digestlog', description: '查看历史摘要（睡醒补看）' },
     { command: 'movers',    description: '近期变动最大的市场排序' },
+    { command: 'stale',     description: '买1/卖1 停滞最久排行（辅助挂 Yes/No）' },
     { command: 'digestonly', description: '只发摘要 · 静音即时提醒（开关）' },
     { command: 'settings',  description: '聊天设置面板（默认档位/触发/摘要/勿扰…）' },
     { command: 'status',    description: 'Bot 健康状态' },
