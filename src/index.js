@@ -2150,19 +2150,20 @@ async function runStaleView(chatId, { topN = 20 } = {}) {
     if (bb && ba && typeof bb.price === 'number' && typeof ba.price === 'number') {
       const mid = (bb.price + ba.price) / 2;
       const spread = ba.price - bb.price;
-      // 挂 Yes = post a bid (买入 Yes)；挂 No = post an ask (卖 Yes / 买 No).
-      // The side frozen longer is the more "defended" anchor; flag it so
-      // the user knows which quote is sitting on a stable queue.
-      let hint;
-      if (Math.abs(r.bidStale - r.askStale) < 60_000) {
-        hint = '两侧都停滞';
-      } else if (r.bidStale > r.askStale) {
-        hint = '买1 更久未动 → Yes 报价更稳，卖盘在动';
-      } else {
-        hint = '卖1 更久未动 → No 报价更稳，买盘在动';
-      }
+      // Line 1 — precise orderbook, same 买1/卖1 vocabulary as alerts /
+      // /history / /movers so the command stays consistent.
       lines.push(`   买1 ${bb.price.toFixed(4)}×${bb.size}（停 ${fmtElapsed(r.bidStale)}） · 卖1 ${ba.price.toFixed(4)}×${ba.size}（停 ${fmtElapsed(r.askStale)}）`);
-      lines.push(`   隐含 Yes ${(mid * 100).toFixed(1)}% · 价差 ${spread.toFixed(4)} · <i>${hint}</i>`);
+      // Line 2 — Yes/No action translation. 挂 Yes rests a bid (买入
+      // Yes) → reference ≈ 买1, frozen for bidStale. 挂 No rests a
+      // buy-No order, i.e. sell Yes at the ask → the No-denominated
+      // price is 1 − 卖1, frozen for askStale. Mark whichever side has
+      // sat longer (>60s apart) as the more stable queue.
+      const noPrice = 1 - ba.price;
+      const yesMark = r.bidStale - r.askStale > 60_000 ? ' ·更稳' : '';
+      const noMark = r.askStale - r.bidStale > 60_000 ? ' ·更稳' : '';
+      lines.push(`   → 挂 <b>Yes</b> 参考 ${bb.price.toFixed(4)}（停${fmtElapsed(r.bidStale)}${yesMark}） ｜ 挂 <b>No</b> 参考 ${noPrice.toFixed(4)}（停${fmtElapsed(r.askStale)}${noMark}）`);
+      // Line 3 — implied probability + spread for context.
+      lines.push(`   隐含 Yes ${(mid * 100).toFixed(1)}% · 价差 ${spread.toFixed(4)}`);
     } else {
       lines.push(`   <i>盘口待抓取 · 整体停滞 ${fmtElapsed(r.stale)}</i>`);
     }
@@ -2171,7 +2172,7 @@ async function runStaleView(chatId, { topN = 20 } = {}) {
   if (rows.length > shown.length) {
     lines.push('', `<i>… 还有 ${rows.length - shown.length} 个（加大 N 看更多，例 <code>/stale 50</code>）</i>`);
   }
-  lines.push('', '<i>挂 Yes = 在买1侧报价；挂 No = 在卖1侧报价。停滞越久的一侧队列越稳，仅供参考。</i>');
+  lines.push('', '<i>挂 Yes = 在买1侧报价（≈买1）；挂 No = 在卖1侧报价（No 价 = 1−卖1）。停滞越久的一侧队列越稳，仅供参考。</i>');
   await sendMessage(chatId, lines.join('\n'));
 }
 
