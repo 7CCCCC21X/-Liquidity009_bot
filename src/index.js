@@ -1767,8 +1767,13 @@ async function sendDigestLogPicker(chatId) {
   ];
   if (lastAt) {
     lines.push(`🕘 上次查询：<b>${fmtClockDateTime(lastAt)}</b>（${fmtElapsed(Date.now() - lastAt)}前）`);
-    lines.push('');
+  } else {
+    // First use — no query recorded yet. Show the line anyway so the
+    // feature is discoverable instead of silently absent.
+    lines.push('🕘 上次查询：<i>暂无记录</i>');
+    lines.push('<i>选下方任一窗口查一次后开始记录；之后这里会显示上次查询时间，并出现「自上次查询以来」按钮。</i>');
   }
+  lines.push('');
   lines.push('<i>选时间窗口 → 发回这段时间内<b>有变动的市场（去重）</b>，每个市场只显示 1 次。</i>');
   lines.push('<i>需要看每一份摘要原文，加 <code>full</code>，例 <code>/digestlog 6h full</code>。</i>');
   const keyboard = [];
