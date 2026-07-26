@@ -15,6 +15,7 @@ import {
   setChatDigestOnly, isChatDigestOnly,
   setChatDefaultLevels, setChatDefaultTriggerMode, setChatDefaultCooldown,
   putPendingBulkRetry, takePendingBulkRetry, gcPendingBulkRetry,
+  markChatDigestLogQuery, getChatDigestLogLastQueryAt,
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
@@ -64,7 +65,7 @@ const HELP_DETAIL = [
   '/levels &lt;id&gt; — 自定义档位 + 触发模式（价+量 / 只看价 / 只看量）',
   '/note &lt;id&gt; — 弹输入框输入备注（或 /note &lt;id&gt; 文字 直接设；/note &lt;id&gt; - 清除）',
   '/digest [时长] — 定期摘要，例 <code>/digest 30m</code>；不带参数显示当前 + 立即来一份',
-  '/digestlog — 回看时间窗内有变动的市场（去重后汇总；加 <code>full</code> 看每份摘要原文）',
+  '/digestlog — 回看时间窗内有变动的市场（去重后汇总；显示上次查询时间，<code>/digestlog last</code> 直接看上次查询以来；加 <code>full</code> 看每份摘要原文）',
   '/digestonly [on|off] — 只发摘要，静音即时提醒（不带参数 = 切换）',
   '/quiet &lt;HH:MM-HH:MM&gt; — 勿扰时段（例 23:00-08:00），勿扰期间只写历史不推送',
   '/settings — 聊天设置面板（默认档位 / 默认触发 / 默认冷却 / 摘要 / 勿扰）',
@@ -1191,6 +1192,20 @@ async function handleCommand(chatId, text) {
     const full = args.includes('full');
     const tArgs = args.filter((a) => a !== 'full');
     const arg = tArgs[0];
+    if (arg === 'last' || arg === '上次') {
+      // /digestlog last — text shortcut for the 自上次查询以来 button.
+      const lastAt = getChatDigestLogLastQueryAt(chatId);
+      if (!lastAt) {
+        await sendMessage(chatId, '<i>还没有上次查询记录 — 先用 <code>/digestlog 6h</code> 之类查一次，之后就能用 <code>/digestlog last</code> 补看这之后的变动。</i>');
+        return true;
+      }
+      await runDigestLog(chatId, {
+        sinceMs: lastAt,
+        windowLabel: `上次查询以来（${fmtClockDateTime(lastAt)} 起，${fmtElapsed(Date.now() - lastAt)}）`,
+        full,
+      });
+      return true;
+    }
     const asNum = parseInt(arg, 10);
     if (Number.isFinite(asNum) && /^\d+$/.test(arg)) {
       await runDigestLog(chatId, { count: Math.max(1, Math.min(500, asNum)), full });
@@ -1198,7 +1213,7 @@ async function handleCommand(chatId, text) {
     }
     const ms = parseDurationMs(arg);
     if (!ms) {
-      await sendMessage(chatId, '❌ 用法：<code>/digestlog</code>（弹卡片选）· <code>/digestlog 6h</code>（汇总 6 小时变动）· 加 <code>full</code> 同时回放每一份摘要');
+      await sendMessage(chatId, '❌ 用法：<code>/digestlog</code>（弹卡片选）· <code>/digestlog 6h</code>（汇总 6 小时变动）· <code>/digestlog last</code>（上次查询以来）· 加 <code>full</code> 同时回放每一份摘要');
       return true;
     }
     await runDigestLog(chatId, { sinceMs: Date.now() - ms, windowLabel: arg, full });
@@ -1743,30 +1758,43 @@ async function applySettingsReply(chatId, cmd, replyText) {
 // mechanism, cmd='digestlog'). Each preset button maps to a sinceMs
 // cutoff and dispatches runDigestLog directly.
 async function sendDigestLogPicker(chatId) {
-  await sendMessage(chatId, [
+  // Surface when the user last ran /digestlog and offer a one-tap
+  // "everything since then" window — the most common catch-up query.
+  const lastAt = getChatDigestLogLastQueryAt(chatId);
+  const lines = [
     '<b>📚 查看历史摘要</b>',
     '',
-    '<i>选时间窗口 → 发回这段时间内<b>有变动的市场（去重）</b>，每个市场只显示 1 次。</i>',
-    '<i>需要看每一份摘要原文，加 <code>full</code>，例 <code>/digestlog 6h full</code>。</i>',
-  ].join('\n'), {
-    replyMarkup: {
-      inline_keyboard: [
-        [
-          { text: '最近 1h', callback_data: 'dlog:1h' },
-          { text: '最近 6h', callback_data: 'dlog:6h' },
-          { text: '最近 12h', callback_data: 'dlog:12h' },
-        ],
-        [
-          { text: '最近 24h', callback_data: 'dlog:24h' },
-          { text: '最近 3 天', callback_data: 'dlog:3d' },
-          { text: '最近 7 天', callback_data: 'dlog:7d' },
-        ],
-        [
-          { text: '🕒 自定义时长…', callback_data: 'dlog:custom' },
-          { text: '🔢 最近 N 份…', callback_data: 'dlog:countN' },
-        ],
-      ],
-    },
+  ];
+  if (lastAt) {
+    lines.push(`🕘 上次查询：<b>${fmtClockDateTime(lastAt)}</b>（${fmtElapsed(Date.now() - lastAt)}前）`);
+    lines.push('');
+  }
+  lines.push('<i>选时间窗口 → 发回这段时间内<b>有变动的市场（去重）</b>，每个市场只显示 1 次。</i>');
+  lines.push('<i>需要看每一份摘要原文，加 <code>full</code>，例 <code>/digestlog 6h full</code>。</i>');
+  const keyboard = [];
+  if (lastAt) {
+    keyboard.push([
+      { text: `🕘 自上次查询以来（${fmtElapsed(Date.now() - lastAt)}）`, callback_data: 'dlog:sincelast' },
+    ]);
+  }
+  keyboard.push(
+    [
+      { text: '最近 1h', callback_data: 'dlog:1h' },
+      { text: '最近 6h', callback_data: 'dlog:6h' },
+      { text: '最近 12h', callback_data: 'dlog:12h' },
+    ],
+    [
+      { text: '最近 24h', callback_data: 'dlog:24h' },
+      { text: '最近 3 天', callback_data: 'dlog:3d' },
+      { text: '最近 7 天', callback_data: 'dlog:7d' },
+    ],
+    [
+      { text: '🕒 自定义时长…', callback_data: 'dlog:custom' },
+      { text: '🔢 最近 N 份…', callback_data: 'dlog:countN' },
+    ],
+  );
+  await sendMessage(chatId, lines.join('\n'), {
+    replyMarkup: { inline_keyboard: keyboard },
   });
 }
 
@@ -1780,7 +1808,12 @@ async function sendDigestLogPicker(chatId) {
 // poll loop would only log. Empty/no-data cases are handled inside.
 async function runDigestLog(chatId, args = {}) {
   try {
-    await runDigestLogInner(chatId, args);
+    // Capture the previous query time BEFORE stamping the new one, so
+    // this run can still display "上次查询：…" with the old value.
+    const prevQueryAt = getChatDigestLogLastQueryAt(chatId);
+    await runDigestLogInner(chatId, { ...args, prevQueryAt });
+    markChatDigestLogQuery(chatId);
+    await saveState();
   } catch (err) {
     console.error(new Date().toISOString(), '[digestlog] failed:', err.stack || err.message);
     try {
@@ -1794,7 +1827,7 @@ async function runDigestLog(chatId, args = {}) {
   }
 }
 
-async function runDigestLogInner(chatId, { sinceMs, windowLabel, count, full = false } = {}) {
+async function runDigestLogInner(chatId, { sinceMs, windowLabel, count, full = false, prevQueryAt = null } = {}) {
   // Aggregate scans more digests than we'd ever replay since the cap
   // there was about Telegram message throughput, not data volume.
   const SCAN_LIMIT = 500;
@@ -1802,11 +1835,21 @@ async function runDigestLogInner(chatId, { sinceMs, windowLabel, count, full = f
   const opts = { chatId, limit: SCAN_LIMIT };
   if (sinceMs) opts.sinceMs = sinceMs;
   if (count) opts.limit = Math.min(SCAN_LIMIT, count);
+  // Shown on every result so the user always knows when they last
+  // looked; null on the very first query.
+  const lastQueryLine = prevQueryAt
+    ? `<i>🕘 上次查询：${fmtClockDateTime(prevQueryAt)}（${fmtElapsed(Date.now() - prevQueryAt)}前）</i>`
+    : null;
   const digests = await readDigests(opts);
   if (!digests.length) {
-    const label = sinceMs ? `最近 ${windowLabel ?? ''}` : (count ? `最近 ${count} 份` : '');
+    // A 自上次查询以来-style label already reads as a full window
+    // description — don't prepend 最近 to it.
+    const label = sinceMs
+      ? (windowLabel && windowLabel.startsWith('上次查询') ? windowLabel : `最近 ${windowLabel ?? ''}`)
+      : (count ? `最近 ${count} 份` : '');
     await sendMessage(chatId, [
       `<i>📭 ${label}没有摘要记录。</i>`,
+      ...(lastQueryLine ? [lastQueryLine] : []),
       '',
       '<i>开启定期摘要：<code>/digest 30m</code></i>',
     ].join('\n'));
@@ -1817,7 +1860,7 @@ async function runDigestLogInner(chatId, { sinceMs, windowLabel, count, full = f
   const chrono = digests.slice().reverse();
   if (full) {
     const headerLabel = sinceMs
-      ? `最近 ${windowLabel ?? ''} 内 ${digests.length} 份`
+      ? `${windowLabel && windowLabel.startsWith('上次查询') ? windowLabel : `最近 ${windowLabel ?? ''}`} 内 ${digests.length} 份`
       : `最近 ${digests.length} 份`;
     await sendMessage(chatId, `<i>📚 ${headerLabel}摘要（旧→新）：</i>`);
     const toReplay = chrono.slice(-REPLAY_CAP);
@@ -1837,6 +1880,7 @@ async function runDigestLogInner(chatId, { sinceMs, windowLabel, count, full = f
   await sendAggregateSummary(chatId, chrono, {
     windowLabel: windowLabel ?? (count ? `${digests.length} 份` : `${digests.length} 份摘要`),
     totalDigests: chrono.length,
+    lastQueryLine,
   });
 }
 
@@ -1850,7 +1894,7 @@ async function runDigestLogInner(chatId, { sinceMs, windowLabel, count, full = f
 // available, since that's one extra data point further back in time
 // than the digest's own snap. Otherwise falls back to the earliest
 // digest's snap. This lets single-digest windows still report Δ.
-async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalDigests } = {}) {
+async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalDigests, lastQueryLine = null } = {}) {
   const startById = new Map();
   const endById = new Map();
   let digestsWithData = 0;
@@ -1878,6 +1922,7 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
     // tapped a /digestlog button — saw no response at all.
     await sendMessage(chatId, [
       `<b>📊 ${windowLabel} 没有可用于计算变化的数据</b>`,
+      ...(lastQueryLine ? [lastQueryLine] : []),
       `<i>这段时间有 ${totalDigests ?? chronoDigests.length} 份摘要，但都不带结构化盘口数据（可能是早期版本生成的旧摘要）。</i>`,
       '',
       '<i>之后的摘要会带上结构化数据；等下一份 <code>/digest</code> 摘要生成后再用 <code>/digestlog</code> 即可看到净变化。</i>',
@@ -1902,6 +1947,7 @@ async function sendAggregateSummary(chatId, chronoDigests, { windowLabel, totalD
   const lines = [
     `<b>📊 ${windowLabel} 内有变动的市场（去重后 ${moved.length} 个）</b>`,
     `<i>共 ${rows.length} 个订阅市场${digestsBit} · 点市场名进 Predict.fun</i>`,
+    ...(lastQueryLine ? [lastQueryLine] : []),
     '',
   ];
   if (digestsWithData < 2 && moved.length === 0) {
@@ -3071,6 +3117,21 @@ async function handleCallback(cb) {
   const dlogMatch = data.match(/^dlog:(.+)$/);
   if (dlogMatch) {
     const choice = dlogMatch[1];
+    if (choice === 'sincelast') {
+      // "Everything since I last looked" — window starts at the stored
+      // last-query timestamp instead of a fixed duration.
+      const lastAt = getChatDigestLogLastQueryAt(chatId);
+      if (!lastAt) {
+        await answerCallbackQuery(cb.id, { text: '还没有上次查询记录，先选一个时间窗口', showAlert: true });
+        return;
+      }
+      await answerCallbackQuery(cb.id, { text: '加载上次查询以来的变动…' });
+      await runDigestLog(chatId, {
+        sinceMs: lastAt,
+        windowLabel: `上次查询以来（${fmtClockDateTime(lastAt)} 起，${fmtElapsed(Date.now() - lastAt)}）`,
+      });
+      return;
+    }
     if (choice === 'custom') {
       await answerCallbackQuery(cb.id);
       const sent = await sendMessage(chatId, [

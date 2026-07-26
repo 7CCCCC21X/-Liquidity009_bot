@@ -605,3 +605,17 @@ export function markChatDigestSent(chatId, atMs = Date.now()) {
   if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
   _state.chatSettings[k].digestLastSentAt = atMs;
 }
+
+// /digestlog 上次查询时间。Persisted per chat so the picker card can
+// show "上次查询：06-30 11:19" and offer a 自上次查询以来 window that
+// covers exactly what happened since the user last looked.
+export function markChatDigestLogQuery(chatId, atMs = Date.now()) {
+  if (!_state.chatSettings) _state.chatSettings = {};
+  const k = String(chatId);
+  if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
+  _state.chatSettings[k].digestLogLastQueryAt = atMs;
+}
+
+export function getChatDigestLogLastQueryAt(chatId) {
+  return _state.chatSettings?.[String(chatId)]?.digestLogLastQueryAt ?? null;
+}
