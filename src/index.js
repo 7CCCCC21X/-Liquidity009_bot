@@ -72,7 +72,8 @@ const HELP_DETAIL = [
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
   '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
-  '/booklog &lt;id&gt; — 📖 挂撤单日记：逐笔记录该市场前3档的挂单/撤单（带时间，几秒前）；<b>不需要订阅</b>（未订阅的建「仅日记」轮询，不发价格提醒）；<code>on/off</code> 开关 · <code>alert 500</code> 单笔≥500张就提醒 · <code>min 10</code> 记录阈值',
+  '/booklog — 📖 日记总览：所有在记录的市场 + <b>一键给全部设挂单提醒</b>（也可 <code>/booklog alert 500</code>）',
+  '/booklog &lt;id&gt; — 📖 挂撤单日记：逐笔记录该市场前3档的挂单/撤单（带时间，几秒前）；<b>不需要订阅</b>（未订阅的建「仅日记」轮询，不发价格提醒）；<code>on/off</code> 开关 · <code>alert 500</code> 单笔≥500张就提醒（方向可选挂+撤/只挂单/只撤单）· <code>min 10</code> 记录阈值',
   '/movers [时长] [N] — 近期变动最大的市场排序，例 <code>/movers 24h</code>（默认 24h，最多列 N=20）',
   '/stale [N] — 买1/卖1 停滞最久的市场排行（盘口最稳、最不易被插队；辅助判断挂 Yes/No，默认 N=20，别名 /idle）',
   '/export — 把整个 history.jsonl 发回给你',
@@ -988,10 +989,26 @@ async function handleCommand(chatId, text) {
     let rest = args.slice(1);
     if (/^\/booklog_\d+$/.test(c)) { id = c.slice('/booklog_'.length); rest = args; }
     if (!id) {
-      await promptCommandTarget(chatId, 'booklog', {
-        headline: '<b>📖 挂撤单日记</b>  <i>回复要看的市场</i>',
-        hint: '<b>📝 回复此条消息</b>，发送 URL / marketId / slug\n<i>事件页 URL 也行 — 会弹出卡片让你勾选（可多选）要开日记的子市场。</i>',
-      });
+      // No id → 日记总览 with batch-alert buttons for every journal-
+      // enabled market（添加市场 button opens the reply prompt）.
+      await runBooklogOverview(chatId);
+      return true;
+    }
+    if (id.toLowerCase() === 'alert' || id === '提醒') {
+      // /booklog alert <N|off> — batch: apply to ALL journal-enabled
+      // markets (the text twin of the overview buttons).
+      const v = (rest[0] ?? '').toLowerCase();
+      const alertMin = (v === 'off' || v === '关' || v === '0') ? null : Math.floor(Number(v));
+      if (alertMin !== null && (!Number.isFinite(alertMin) || alertMin < 1)) {
+        await sendMessage(chatId, '用法：<code>/booklog alert 500</code>（所有在记录的市场，单笔挂/撤 ≥500 张就提醒）· <code>/booklog alert off</code> 全部关闭');
+        return true;
+      }
+      const nApplied = await applyBooklogAlertToAll(chatId, alertMin);
+      if (!nApplied) {
+        await sendMessage(chatId, '<i>还没有在记录日记的市场 — 先 /booklog 打开总览，点「➕ 添加市场」。</i>');
+        return true;
+      }
+      await runBooklogOverview(chatId);
       return true;
     }
     // No subscription required — 'on' / 'alert' create a journal-only
@@ -2420,6 +2437,11 @@ function buildBooklogKeyboard(marketId, bl) {
     text: (alertMin === v ? '🟢 ' : '') + label,
     callback_data: `blog:${marketId}:al:${v ?? 'off'}`,
   });
+  const kindCur = bl?.alertKind === 'add' || bl?.alertKind === 'cut' ? bl.alertKind : 'both';
+  const kdBtn = (v, label) => ({
+    text: (kindCur === v ? '🟢 ' : '') + label,
+    callback_data: `blog:${marketId}:kd:${v}`,
+  });
   return {
     inline_keyboard: [
       [
@@ -2435,9 +2457,84 @@ function buildBooklogKeyboard(marketId, bl) {
         alBtn(500, '≥500张'),
         alBtn(1000, '≥1000张'),
       ],
+      [
+        kdBtn('both', '提醒:挂+撤'),
+        kdBtn('add', '只挂单'),
+        kdBtn('cut', '只撤单'),
+      ],
       [{ text: '✏️ 自定义提醒张数…', callback_data: `blog:${marketId}:al:custom` }],
     ],
   };
+}
+
+// 日记总览 keyboard: batch alert presets applying to EVERY journal-
+// enabled market in this chat, plus add/refresh.
+function buildBooklogOverviewKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '全部🔕关提醒', callback_data: 'blogall:al:off' },
+        { text: '全部≥100张', callback_data: 'blogall:al:100' },
+        { text: '全部≥500张', callback_data: 'blogall:al:500' },
+      ],
+      [
+        { text: '全部≥1000张', callback_data: 'blogall:al:1000' },
+        { text: '✏️ 全部自定义张数…', callback_data: 'blogall:al:custom' },
+      ],
+      [
+        { text: '➕ 添加市场', callback_data: 'blogall:add' },
+        { text: '🔄 刷新', callback_data: 'blogall:rf' },
+      ],
+    ],
+  };
+}
+
+// /booklog with no id → overview of every journal-enabled market in
+// this chat, with one-tap batch alert setup（挂单提醒 for 监控日记的
+// 这几个 in one go）. Per-market tweaks live behind the /booklog_<id>
+// links on each row.
+async function runBooklogOverview(chatId, { messageId = null } = {}) {
+  const subs = listSubscriptionsForChat(chatId).filter((s) => s.booklog?.enabled);
+  const lines = ['📖 <b>挂撤单日记总览</b>'];
+  if (!subs.length) {
+    lines.push('');
+    lines.push('<i>还没有在记录日记的市场。</i>');
+    lines.push('<i>点「➕ 添加市场」回复 URL / id（事件页可多选勾选），或直接 <code>/booklog &lt;id&gt; on</code> 开启。</i>');
+  } else {
+    lines.push(`<i>记录中 <b>${subs.length}</b> 个市场 · 下方按钮对<b>全部</b>生效；点各行 /booklog_… 单独调整</i>`);
+    lines.push('');
+    const CAP = 30;
+    for (const s of subs.slice(0, CAP)) {
+      const kindLabel = { add: '挂单', cut: '撤单' }[s.booklog?.alertKind] ?? '挂/撤';
+      const alertBit = s.booklog?.alertMin
+        ? `🔔 ${kindLabel}≥${Number(s.booklog.alertMin).toLocaleString('en-US')}张`
+        : '🔕';
+      const badge = s.booklogOnly ? '（仅日记）' : '';
+      const titleShort = (s.title || `Market ${s.marketId}`).replace(/\s+/g, ' ').slice(0, 28);
+      lines.push(`· ${htmlEscape(titleShort)}${badge}  ${alertBit}  /booklog_${s.marketId}`);
+    }
+    if (subs.length > CAP) lines.push(`<i>… 另 ${subs.length - CAP} 个</i>`);
+  }
+  const text = lines.join('\n');
+  const replyMarkup = buildBooklogOverviewKeyboard();
+  if (messageId) {
+    try {
+      await editMessageText(chatId, messageId, text, replyMarkup);
+      return;
+    } catch { /* stale / unchanged — fall through */ }
+  }
+  await sendMessage(chatId, text, { replyMarkup });
+}
+
+// Apply an alert threshold to every journal-enabled market at once.
+// Returns the number of markets touched.
+async function applyBooklogAlertToAll(chatId, alertMin) {
+  const subs = listSubscriptionsForChat(chatId).filter((s) => s.booklog?.enabled);
+  for (const s of subs) {
+    setSubscriptionBooklog(chatId, s.marketId, { alertMin });
+  }
+  if (subs.length) await saveState();
+  return subs.length;
 }
 
 // Make sure the monitor loop polls this market for the journal. If the
@@ -2498,8 +2595,9 @@ async function runBooklogView(chatId, marketId, { n = 20, messageId = null } = {
   const statusBit = bl?.enabled
     ? `🟢 记录中${bl.enabledAtMs ? `（自 ${fmtClockDateTime(bl.enabledAtMs)}${tzLabel} 起）` : ''}`
     : '⚪ 未开启';
+  const kindLabel = { add: '挂单', cut: '撤单' }[bl?.alertKind] ?? '挂/撤';
   const alertBit = bl?.alertMin
-    ? `单笔 ≥ ${Number(bl.alertMin).toLocaleString('en-US')} 张即推送`
+    ? `单笔${kindLabel} ≥ ${Number(bl.alertMin).toLocaleString('en-US')} 张即推送`
     : '🔕 未设';
   lines.push(`状态：${statusBit} · 提醒：${alertBit} · 记录阈值：≥ ${bl?.minSize ?? 10} 张`);
   if (sub?.booklogOnly) {
@@ -2634,6 +2732,29 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
     setSubscriptionBooklog(chatId, mid, patch);
     await saveState();
     await runBooklogView(chatId, mid);
+    return;
+  }
+  // 日记总览批量提醒 sub-flow: the reply is a share count (or "off")
+  // applied to every journal-enabled market in this chat.
+  if (cmd === 'booklogalertall') {
+    const t = String(replyText ?? '').trim().toLowerCase();
+    let alertMin;
+    if (t === 'off' || t === '关' || t === '0') {
+      alertMin = null;
+    } else {
+      const nAl = Number(t);
+      if (!Number.isFinite(nAl) || nAl < 1) {
+        await sendMessage(chatId, '❌ 请回复一个正整数张数（例 <code>300</code>），或 <code>off</code> 全部关闭。');
+        return;
+      }
+      alertMin = Math.floor(nAl);
+    }
+    const nApplied = await applyBooklogAlertToAll(chatId, alertMin);
+    if (!nApplied) {
+      await sendMessage(chatId, '<i>还没有在记录日记的市场。</i>');
+      return;
+    }
+    await runBooklogOverview(chatId);
     return;
   }
   // /booklog reply-flow: an event URL maps to several sub-markets —
@@ -3627,6 +3748,24 @@ async function handleCallback(cb) {
       await runBooklogView(chatId, mid, { messageId });
       return;
     }
+    if (action.startsWith('kd:')) {
+      // Alert direction: both / add(只挂单) / cut(只撤单).
+      const v = action.slice(3);
+      if (!['both', 'add', 'cut'].includes(v)) {
+        await answerCallbackQuery(cb.id);
+        return;
+      }
+      if (!sub) {
+        await answerCallbackQuery(cb.id, { text: '先开启日记再设提醒方向', showAlert: true });
+        return;
+      }
+      setSubscriptionBooklog(chatId, mid, { alertKind: v === 'both' ? null : v });
+      await saveState();
+      const label = { both: '挂+撤都提醒', add: '只提醒挂单', cut: '只提醒撤单' }[v];
+      await answerCallbackQuery(cb.id, { text: label });
+      await runBooklogView(chatId, mid, { messageId });
+      return;
+    }
     if (action === 'rf' || action === 'view' || action === 'more') {
       await answerCallbackQuery(cb.id);
       // 'rf' edits the card in place; 'view' (e.g. from an alert
@@ -3636,6 +3775,62 @@ async function handleCallback(cb) {
         n: action === 'more' ? 50 : 20,
         messageId: action === 'rf' ? messageId : null,
       });
+      return;
+    }
+    await answerCallbackQuery(cb.id);
+    return;
+  }
+
+  // 日记总览 batch actions: blogall:al:<n|off|custom> applies to every
+  // journal-enabled market; add opens the reply prompt; rf refreshes.
+  const blogAllMatch = data.match(/^blogall:(.+)$/);
+  if (blogAllMatch) {
+    const action = blogAllMatch[1];
+    if (action === 'rf') {
+      await answerCallbackQuery(cb.id);
+      await runBooklogOverview(chatId, { messageId });
+      return;
+    }
+    if (action === 'add') {
+      await answerCallbackQuery(cb.id);
+      await promptCommandTarget(chatId, 'booklog', {
+        headline: '<b>📖 挂撤单日记 · 添加市场</b>  <i>回复要记录的市场</i>',
+        hint: '<b>📝 回复此条消息</b>，发送 URL / marketId / slug\n<i>不需要订阅；事件页 URL 会弹卡片让你勾选（可多选）。</i>',
+      });
+      return;
+    }
+    if (action.startsWith('al:')) {
+      const v = action.slice(3);
+      const enabledSubs = listSubscriptionsForChat(chatId).filter((s) => s.booklog?.enabled);
+      if (!enabledSubs.length) {
+        await answerCallbackQuery(cb.id, { text: '还没有在记录日记的市场，先「➕ 添加市场」', showAlert: true });
+        return;
+      }
+      if (v === 'custom') {
+        await answerCallbackQuery(cb.id);
+        const sent = await sendMessage(chatId, [
+          '✏️ <b>全部市场 · 自定义大单提醒</b>',
+          `<i>将对 ${enabledSubs.length} 个在记录的市场统一生效。</i>`,
+          '',
+          '📝 <b>回复此条消息</b>，发一个张数（例 <code>300</code>）— 单笔挂单/撤单达到该数量就推送提醒。',
+          '<i>发送 <code>off</code> 全部关闭；30 分钟内有效。</i>',
+        ].join('\n'), {
+          replyMarkup: { force_reply: true, selective: true, input_field_placeholder: '张数，例 300' },
+        });
+        putPendingPrompt(chatId, sent.message_id, 'booklogalertall', {});
+        await saveState();
+        return;
+      }
+      const alertMin = v === 'off' ? null : Math.floor(Number(v));
+      if (alertMin != null && (!Number.isFinite(alertMin) || alertMin < 1)) {
+        await answerCallbackQuery(cb.id, { text: '未知选项', showAlert: true });
+        return;
+      }
+      const nApplied = await applyBooklogAlertToAll(chatId, alertMin);
+      await answerCallbackQuery(cb.id, {
+        text: alertMin ? `🔔 ${nApplied} 个市场 ≥${alertMin} 张提醒` : `🔕 已关 ${nApplied} 个市场的提醒`,
+      });
+      await runBooklogOverview(chatId, { messageId });
       return;
     }
     await answerCallbackQuery(cb.id);

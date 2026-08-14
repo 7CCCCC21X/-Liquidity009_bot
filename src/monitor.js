@@ -638,14 +638,18 @@ async function recordBooklog(s, k, prevTickSnap, snap, now) {
     if (!Number.isFinite(alertMin) || alertMin <= 0) return;
     if (s.pausedUntil && now < s.pausedUntil) return;
     if (isChatInQuietHours(s.chatId, now) || isChatDigestOnly(s.chatId)) return;
-    const big = changes.filter((c) => c.d >= alertMin);
+    // Direction filter: alertKind 'add' = 只挂单, 'cut' = 只撤单,
+    // anything else (default) = both.
+    const kind = bl.alertKind === 'add' || bl.alertKind === 'cut' ? bl.alertKind : null;
+    const big = changes.filter((c) => c.d >= alertMin && (!kind || c.k === kind));
     if (!big.length) return;
     const lastAt = booklogAlertAt.get(k) ?? 0;
     if (now - lastAt < BOOKLOG_ALERT_COOLDOWN_MS) return;
     booklogAlertAt.set(k, now);
     const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
+    const headWord = kind === 'add' ? '挂单' : kind === 'cut' ? '撤单' : '挂撤单';
     const lines = [
-      `📖 <b>大额挂撤单</b>  <i>≥ ${alertMin.toLocaleString('en-US')} 张</i>`,
+      `📖 <b>大额${headWord}</b>  <i>≥ ${alertMin.toLocaleString('en-US')} 张</i>`,
       `📊 ${titleLink}`,
     ];
     const qSub = questionSubtitle(s);
