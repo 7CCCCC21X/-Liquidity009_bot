@@ -634,3 +634,16 @@ export function markChatDigestLogQuery(chatId, atMs = Date.now()) {
 export function getChatDigestLogLastQueryAt(chatId) {
   return _state.chatSettings?.[String(chatId)]?.digestLogLastQueryAt ?? null;
 }
+
+// 挂撤单日记 poll cadence. Global (the fast loop serves every chat's
+// journal-enabled markets); persisted so it survives restarts. null /
+// unset falls back to BOOKLOG_POLL_INTERVAL_MS (default 1s).
+export function getBooklogPollMs() {
+  const v = _state?.booklogPollMs;
+  return Number.isFinite(v) && v >= 200 ? v : config.booklogPollIntervalMs;
+}
+
+export function setBooklogPollMs(ms) {
+  if (ms == null) delete _state.booklogPollMs;
+  else _state.booklogPollMs = Math.round(ms);
+}
