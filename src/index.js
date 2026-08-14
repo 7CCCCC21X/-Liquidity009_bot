@@ -72,7 +72,7 @@ const HELP_DETAIL = [
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
   '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
-  '/booklog &lt;id&gt; — 📖 挂撤单日记：逐笔记录该市场前3档的挂单/撤单（带时间，几秒前）；<code>on/off</code> 开关 · <code>alert 500</code> 单笔≥500张就提醒 · <code>min 10</code> 记录阈值',
+  '/booklog &lt;id&gt; — 📖 挂撤单日记：逐笔记录该市场前3档的挂单/撤单（带时间，几秒前）；<b>不需要订阅</b>（未订阅的建「仅日记」轮询，不发价格提醒）；<code>on/off</code> 开关 · <code>alert 500</code> 单笔≥500张就提醒 · <code>min 10</code> 记录阈值',
   '/movers [时长] [N] — 近期变动最大的市场排序，例 <code>/movers 24h</code>（默认 24h，最多列 N=20）',
   '/stale [N] — 买1/卖1 停滞最久的市场排行（盘口最稳、最不易被插队；辅助判断挂 Yes/No，默认 N=20，别名 /idle）',
   '/export — 把整个 history.jsonl 发回给你',
@@ -505,8 +505,8 @@ function buildChoiceHeaderText(matches, selectedCount, existingCount = 0, mode =
   if (mode === 'booklog') {
     const enabledHint = existingCount ? ` · 🟢 ${existingCount} 个已在记录` : '';
     return [
-      `📖 这个事件里你订阅了 <b>${matches.length}</b> 个市场，请<b>勾选</b>要开启挂撤单日记的（可多选）：`,
-      `<i>已选 <b>${selectedCount}</b> 个${enabledHint} · 只选 1 个会直接打开日记卡片 · 30 分钟内有效</i>`,
+      `📖 识别出 <b>${matches.length}</b> 个市场，请<b>勾选</b>要开启挂撤单日记的（可多选）：`,
+      `<i>不需要订阅 — 未订阅的会建「仅日记」轮询（不发价格提醒）。已选 <b>${selectedCount}</b> 个${enabledHint} · 30 分钟内有效</i>`,
     ].join('\n');
   }
   const existingHint = existingCount
@@ -672,9 +672,11 @@ async function commitPickedBooklog(chatId, messageId, matches, selectedIdx) {
   const lines = [];
   let ok = 0;
   for (const m of picked) {
-    const sub = getSubscription(chatId, m.id);
+    // Unsubscribed picks get a journal-only poll entry — the diary is
+    // decoupled from regular subscription monitoring.
+    const sub = await ensureBooklogSub(chatId, m.id, m);
     if (!sub) {
-      lines.push(`✗ <code>${m.id}</code> 未订阅（已跳过）`);
+      lines.push(`✗ <code>${m.id}</code> 无法获取市场信息（已跳过）`);
       continue;
     }
     if (!sub.booklog?.enabled) {
@@ -682,7 +684,8 @@ async function commitPickedBooklog(chatId, messageId, matches, selectedIdx) {
     }
     ok += 1;
     const titleShort = (sub.title || m.title || '').replace(/\s+/g, ' ').slice(0, 40);
-    lines.push(`✓ ${htmlEscape(titleShort)}  /booklog_${m.id}`);
+    const badge = sub.booklogOnly ? '（仅日记）' : '';
+    lines.push(`✓ ${htmlEscape(titleShort)}${badge}  /booklog_${m.id}`);
   }
   if (ok) await saveState();
   if (picked.length === 1 && ok === 1) {
@@ -991,29 +994,42 @@ async function handleCommand(chatId, text) {
       });
       return true;
     }
-    const sub = getSubscription(chatId, id);
-    if (!sub) {
-      await sendMessage(chatId, `❌ 没有订阅 <code>${htmlEscape(id)}</code> — 日记依赖轮询，先发 URL / id 订阅它。`);
-      return true;
-    }
+    // No subscription required — 'on' / 'alert' create a journal-only
+    // poll entry on demand (ensureBooklogSub), keeping the diary
+    // decoupled from regular subscription monitoring.
     const a0 = (rest[0] ?? '').toLowerCase();
     if (a0 === 'on' || a0 === '开') {
+      const sub = await ensureBooklogSub(chatId, id);
+      if (!sub) {
+        await sendMessage(chatId, `❌ 找不到市场 <code>${htmlEscape(id)}</code> — 检查 id 是否正确。`);
+        return true;
+      }
       setSubscriptionBooklog(chatId, id, { enabled: true, enabledAtMs: Date.now() });
       await saveState();
       await runBooklogView(chatId, id);
       return true;
     }
     if (a0 === 'off' || a0 === '关') {
-      setSubscriptionBooklog(chatId, id, { enabled: false });
-      await saveState();
+      const sub = getSubscription(chatId, id);
+      if (sub?.booklogOnly) {
+        // Journal-only entry: stopping the diary removes the poll
+        // entirely. History lines stay in history.jsonl.
+        removeSubscription(chatId, id);
+        await saveState();
+      } else if (sub) {
+        setSubscriptionBooklog(chatId, id, { enabled: false });
+        await saveState();
+      }
       await runBooklogView(chatId, id);
       return true;
     }
     if (a0 === 'alert' || a0 === '提醒') {
       const v = (rest[1] ?? '').toLowerCase();
       if (v === 'off' || v === '关' || v === '0') {
-        setSubscriptionBooklog(chatId, id, { alertMin: null });
-        await saveState();
+        if (getSubscription(chatId, id)) {
+          setSubscriptionBooklog(chatId, id, { alertMin: null });
+          await saveState();
+        }
         await runBooklogView(chatId, id);
         return true;
       }
@@ -1023,6 +1039,11 @@ async function handleCommand(chatId, text) {
         return true;
       }
       // Setting an alert implies wanting the journal running.
+      const sub = await ensureBooklogSub(chatId, id);
+      if (!sub) {
+        await sendMessage(chatId, `❌ 找不到市场 <code>${htmlEscape(id)}</code> — 检查 id 是否正确。`);
+        return true;
+      }
       const patch = { alertMin: Math.floor(nAl) };
       if (!sub.booklog?.enabled) { patch.enabled = true; patch.enabledAtMs = Date.now(); }
       setSubscriptionBooklog(chatId, id, patch);
@@ -1034,6 +1055,10 @@ async function handleCommand(chatId, text) {
       const nMin = Number(rest[1]);
       if (!Number.isFinite(nMin) || nMin < 1) {
         await sendMessage(chatId, '用法：<code>/booklog &lt;id&gt; min 10</code>（小于 10 张的挂/撤不记录）');
+        return true;
+      }
+      if (!getSubscription(chatId, id)) {
+        await sendMessage(chatId, `<i>还没开始记录 — 先 <code>/booklog ${htmlEscape(id)} on</code> 开启日记，再设记录阈值。</i>`);
         return true;
       }
       setSubscriptionBooklog(chatId, id, { minSize: Math.floor(nMin) });
@@ -1655,14 +1680,15 @@ async function renderListView(chatId, page = 0, { onlyPaused = false, search = n
   for (const s of slice) {
     const levels = s.levels?.length
       ? s.levels.map((l) => LEVEL_LABEL[l]).join('/')
-      : '（无 — 不会推送）';
+      : (s.booklogOnly ? '仅 📖 日记（无价格提醒）' : '（无 — 不会推送）');
     const mode = TRIGGER_LABEL[s.triggerMode] ?? '价+量';
     const isPaused = s.pausedUntil && s.pausedUntil > Date.now();
-    const dot = isPaused ? '⏸' : '🟢';
+    const dot = isPaused ? '⏸' : (s.booklogOnly ? '📖' : '🟢');
+    const booklogBit = (!s.booklogOnly && s.booklog?.enabled) ? ' · 📖 日记中' : '';
     const lines = [
       `${dot} <b>${marketLink(s.title || `Market ${s.marketId}`, s.slug)}</b>`,
       `<code>id=${s.marketId}</code>`,
-      `档位：${levels} · 触发：${mode}`,
+      `档位：${levels} · 触发：${mode}${booklogBit}`,
     ];
     if (isPaused) lines.push(`<i>⏸ 已暂停，${fmtRelativeRemaining(s.pausedUntil)}后恢复 · /resume_${s.marketId}</i>`);
     { const nl = fmtNoteLine(s); if (nl) lines.push(nl); }
@@ -2414,24 +2440,61 @@ function buildBooklogKeyboard(marketId, bl) {
   };
 }
 
+// Make sure the monitor loop polls this market for the journal. If the
+// chat already subscribes, reuse that sub; otherwise create a hidden
+// "仅日记" subscription with levels=[] — the poll loop records the
+// diary but never fires price/size alerts for empty levels, keeping
+// 日记监控 decoupled from regular 订阅监控. Returns the sub or null
+// when the market can't be resolved. `marketHint` (a resolver match
+// carrying conditionId/title/slug) skips the extra lookup.
+async function ensureBooklogSub(chatId, marketId, marketHint = null) {
+  const existing = getSubscription(chatId, marketId);
+  if (existing) return existing;
+  let m = marketHint;
+  if (!m?.conditionId) {
+    try { m = await getMarketById(marketId); } catch { m = null; }
+  }
+  if (!m) return null;
+  addSubscription({
+    chatId,
+    marketId: String(m.id ?? marketId),
+    conditionId: m.conditionId,
+    title: m.title || m.question || `Market ${marketId}`,
+    question: m.question ?? null,
+    slug: m.slug ?? marketHint?.slug ?? null,
+    levels: [], // journal-only: no price/size alerts
+    booklogOnly: true,
+  });
+  return getSubscription(chatId, marketId);
+}
+
 // Render the diary card: config header + newest-first add/cut entries,
 // each stamped with clock time AND relative "N秒前" so the user can see
-// exactly how long ago someone placed / pulled an order.
+// exactly how long ago someone placed / pulled an order. Works with or
+// without a subscription — an unsubscribed market renders the 未开启
+// state and「▶️ 开始记录」creates a journal-only poll entry on tap.
 async function runBooklogView(chatId, marketId, { n = 20, messageId = null } = {}) {
   const sub = getSubscription(chatId, marketId);
-  if (!sub) {
-    await sendMessage(chatId, `❌ 没有订阅 <code>${htmlEscape(marketId)}</code> — 日记依赖轮询，先发 URL / id 订阅它。`);
-    return;
+  const bl = sub?.booklog ?? null;
+  const events = await readBookEvents({ chatId, marketId, limit: n });
+  // Title/slug: sub if present, else the freshest journal line's copy,
+  // else a live market lookup (cached ~10min in predict.js).
+  let title = sub?.title ?? events[0]?.title ?? null;
+  let slug = sub?.slug ?? events[0]?.slug ?? null;
+  if (!sub && !title) {
+    try {
+      const m = await getMarketById(marketId);
+      if (m) { title = m.title || m.question || null; slug = slug ?? m.slug ?? null; }
+    } catch { /* offline/unknown — render with the bare id */ }
   }
-  const bl = sub.booklog ?? null;
   const now = Date.now();
   const tzLabel = config.displayTzLabel ? ` ${config.displayTzLabel}` : '';
   const lines = [
     `📖 <b>挂撤单日记</b>`,
-    `📊 ${marketLink(sub.title || `Market ${marketId}`, sub.slug)}`,
+    `📊 ${marketLink(title || `Market ${marketId}`, slug)}`,
     `<code>id=${marketId}</code>`,
   ];
-  { const nl = fmtNoteLine(sub); if (nl) lines.push(nl); }
+  if (sub) { const nl = fmtNoteLine(sub); if (nl) lines.push(nl); }
   const statusBit = bl?.enabled
     ? `🟢 记录中${bl.enabledAtMs ? `（自 ${fmtClockDateTime(bl.enabledAtMs)}${tzLabel} 起）` : ''}`
     : '⚪ 未开启';
@@ -2439,12 +2502,16 @@ async function runBooklogView(chatId, marketId, { n = 20, messageId = null } = {
     ? `单笔 ≥ ${Number(bl.alertMin).toLocaleString('en-US')} 张即推送`
     : '🔕 未设';
   lines.push(`状态：${statusBit} · 提醒：${alertBit} · 记录阈值：≥ ${bl?.minSize ?? 10} 张`);
+  if (sub?.booklogOnly) {
+    lines.push('<i>📖 仅日记 — 独立于订阅监控，不发价格/数量提醒；停止记录即取消轮询。</i>');
+  }
   lines.push('');
 
   if (!bl?.enabled) {
-    lines.push('<i>点「▶️ 开始记录」后，每次轮询都会把前3档的挂单 / 撤单逐笔写进日记；随时回来翻看，或设置大单提醒。</i>');
+    lines.push(sub
+      ? '<i>点「▶️ 开始记录」后，每次轮询都会把前3档的挂单 / 撤单逐笔写进日记；随时回来翻看，或设置大单提醒。</i>'
+      : '<i>这个市场不需要订阅也能记日记 — 点「▶️ 开始记录」会建立一个「仅日记」轮询（不发价格提醒），逐笔记录前3档挂单 / 撤单。</i>');
   }
-  const events = await readBookEvents({ chatId, marketId, limit: n });
   if (bl?.enabled && !events.length) {
     lines.push('<i>📭 还没有日记记录 — 盘口一有挂/撤单（≥记录阈值）就会出现在这里。</i>');
   }
@@ -2542,20 +2609,24 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
   if (cmd === 'booklogalert') {
     const t = String(replyText ?? '').trim().toLowerCase();
     const mid = args.marketId;
-    const sub = getSubscription(chatId, mid);
-    if (!sub) {
-      await sendMessage(chatId, `❌ 订阅 <code>${htmlEscape(String(mid))}</code> 已不存在。`);
-      return;
-    }
     if (t === 'off' || t === '关' || t === '0') {
-      setSubscriptionBooklog(chatId, mid, { alertMin: null });
-      await saveState();
+      if (getSubscription(chatId, mid)) {
+        setSubscriptionBooklog(chatId, mid, { alertMin: null });
+        await saveState();
+      }
       await runBooklogView(chatId, mid);
       return;
     }
     const nAl = Number(t);
     if (!Number.isFinite(nAl) || nAl < 1) {
       await sendMessage(chatId, '❌ 请回复一个正整数张数（例 <code>300</code>），或 <code>off</code> 关闭提醒。');
+      return;
+    }
+    // Alert implies recording — create the journal-only poll entry if
+    // this market isn't tracked yet.
+    const sub = await ensureBooklogSub(chatId, mid);
+    if (!sub) {
+      await sendMessage(chatId, `❌ 找不到市场 <code>${htmlEscape(String(mid))}</code>（可能已下架）。`);
       return;
     }
     const patch = { alertMin: Math.floor(nAl) };
@@ -2582,25 +2653,20 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
         await sendMessage(chatId, `❌ 解析失败：${htmlEscape(err.message)}`);
         return;
       }
-      if (markets.length) {
-        const subscribed = markets.filter((m) => getSubscription(chatId, m.id));
-        if (!subscribed.length) {
-          await sendMessage(chatId, [
-            `<i>这个链接对应的 ${markets.length} 个市场你都没有订阅。</i>`,
-            '<i>日记依赖轮询 — 先把网址直接发给我订阅，再来开日记。</i>',
-          ].join('\n'));
-          return;
-        }
-        if (subscribed.length === 1) {
-          await runBooklogView(chatId, subscribed[0].id);
-          return;
-        }
+      if (markets.length === 1) {
+        await runBooklogView(chatId, markets[0].id);
+        return;
+      }
+      if (markets.length > 1) {
+        // All sub-markets, subscribed or not — the diary doesn't
+        // require a subscription (journal-only entries are created on
+        // commit for unsubscribed picks).
         const token = shortToken();
-        putPendingChoice(chatId, token, subscribed, [], 'booklog');
+        putPendingChoice(chatId, token, markets, [], 'booklog');
         await saveState();
-        const enabledIds = booklogEnabledIds(chatId, subscribed);
-        await sendMessage(chatId, buildChoiceHeaderText(subscribed, 0, enabledIds.size, 'booklog'), {
-          replyMarkup: buildChoiceKeyboard(token, subscribed, [], enabledIds, 'booklog'),
+        const enabledIds = booklogEnabledIds(chatId, markets);
+        await sendMessage(chatId, buildChoiceHeaderText(markets, 0, enabledIds.size, 'booklog'), {
+          replyMarkup: buildChoiceKeyboard(token, markets, [], enabledIds, 'booklog'),
         });
         return;
       }
@@ -3303,10 +3369,10 @@ async function handleCallback(cb) {
     if (sub && messageId) {
       const levels = sub.levels?.length
         ? sub.levels.map((l) => LEVEL_LABEL[l]).join('/')
-        : '（无 — 不会推送）';
+        : (sub.booklogOnly ? '仅 📖 日记（无价格提醒）' : '（无 — 不会推送）');
       const mode = TRIGGER_LABEL[sub.triggerMode] ?? '价+量';
       const lines = [
-        `🟢 <b>${marketLink(sub.title || `Market ${sub.marketId}`, sub.slug)}</b>`,
+        `${sub.booklogOnly ? '📖' : '🟢'} <b>${marketLink(sub.title || `Market ${sub.marketId}`, sub.slug)}</b>`,
         `<code>id=${sub.marketId}</code>`,
         `档位：${levels} · 触发：${mode}`,
       ];
@@ -3493,16 +3559,31 @@ async function handleCallback(cb) {
   if (blogMatch) {
     const [, mid, action] = blogMatch;
     const sub = getSubscription(chatId, mid);
-    if (!sub) {
-      await answerCallbackQuery(cb.id, { text: '订阅已不存在', showAlert: true });
+    if (action === 'on') {
+      // No subscription needed — create a journal-only poll entry on
+      // demand so the diary works decoupled from regular monitoring.
+      const target = sub ?? await ensureBooklogSub(chatId, mid);
+      if (!target) {
+        await answerCallbackQuery(cb.id, { text: '找不到该市场（可能已下架）', showAlert: true });
+        return;
+      }
+      setSubscriptionBooklog(chatId, mid, { enabled: true, enabledAtMs: Date.now() });
+      await saveState();
+      await answerCallbackQuery(cb.id, { text: '📖 已开始记录' });
+      await runBooklogView(chatId, mid, { messageId });
       return;
     }
-    if (action === 'on' || action === 'off') {
-      setSubscriptionBooklog(chatId, mid, action === 'on'
-        ? { enabled: true, enabledAtMs: Date.now() }
-        : { enabled: false });
-      await saveState();
-      await answerCallbackQuery(cb.id, { text: action === 'on' ? '📖 已开始记录' : '⏹ 已停止记录' });
+    if (action === 'off') {
+      if (sub?.booklogOnly) {
+        // Journal-only entry: stopping removes the poll entirely;
+        // diary history stays readable.
+        removeSubscription(chatId, mid);
+        await saveState();
+      } else if (sub) {
+        setSubscriptionBooklog(chatId, mid, { enabled: false });
+        await saveState();
+      }
+      await answerCallbackQuery(cb.id, { text: '⏹ 已停止记录' });
       await runBooklogView(chatId, mid, { messageId });
       return;
     }
@@ -3512,7 +3593,7 @@ async function handleCallback(cb) {
         await answerCallbackQuery(cb.id);
         const sent = await sendMessage(chatId, [
           '✏️ <b>自定义大单提醒</b>',
-          `市场：${htmlEscape(sub.title || `Market ${mid}`)}  <code>id=${mid}</code>`,
+          `市场：${htmlEscape(sub?.title || `Market ${mid}`)}  <code>id=${mid}</code>`,
           '',
           '📝 <b>回复此条消息</b>，发一个张数（例 <code>300</code>）— 单笔挂单/撤单达到该数量就推送提醒。',
           '<i>发送 <code>off</code> 关闭提醒；30 分钟内有效。</i>',
@@ -3528,13 +3609,19 @@ async function handleCallback(cb) {
         await answerCallbackQuery(cb.id, { text: '未知选项', showAlert: true });
         return;
       }
+      // Turning an alert on implies wanting the journal running —
+      // create the journal-only poll entry if the market isn't tracked.
+      const target = alertMin != null ? (sub ?? await ensureBooklogSub(chatId, mid)) : sub;
+      if (alertMin != null && !target) {
+        await answerCallbackQuery(cb.id, { text: '找不到该市场（可能已下架）', showAlert: true });
+        return;
+      }
       const patch = { alertMin };
-      // Turning an alert on implies wanting the journal running.
-      if (alertMin != null && !sub.booklog?.enabled) {
+      if (alertMin != null && !target.booklog?.enabled) {
         patch.enabled = true;
         patch.enabledAtMs = Date.now();
       }
-      setSubscriptionBooklog(chatId, mid, patch);
+      if (target) setSubscriptionBooklog(chatId, mid, patch);
       await saveState();
       await answerCallbackQuery(cb.id, { text: alertMin ? `🔔 单笔 ≥${alertMin} 张提醒` : '🔕 已关闭提醒' });
       await runBooklogView(chatId, mid, { messageId });
