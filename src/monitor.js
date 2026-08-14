@@ -6,7 +6,7 @@ import {
   setSubscriptionInitial, setSubscriptionDigestBaseline,
   setSubscriptionLastSnap, setSubscriptionQuestion,
   getAllChatSettings, markChatDigestSent, isChatInQuietHours,
-  isChatDigestOnly,
+  isChatDigestOnly, getBooklogPollMs,
   ALL_LEVELS, LEVEL_LABEL, subKey,
 } from './state.js';
 import { appendEvent } from './history.js';
@@ -668,6 +668,80 @@ async function recordBooklog(s, k, prevTickSnap, snap, now) {
   }
 }
 
+// ── 挂撤单日记 fast poll loop ────────────────────────────────────────
+// Journal-enabled markets poll on their own (much faster) cadence —
+// default 1s via BOOKLOG_POLL_INTERVAL_MS, runtime-adjustable with
+// /booklog speed — completely independent of the main 30s alert loop,
+// so regular subscriptions don't hammer the API just because a few
+// markets keep a diary.
+const booklogPrevSnap = new Map(); // subKey → last snapshot the journal diffed
+const booklogErrStreak = new Map();
+
+async function booklogPollOnce() {
+  const subs = listAllSubscriptions().filter((s) => s.booklog?.enabled);
+  if (!subs.length) return false;
+  const byMarket = new Map();
+  for (const s of subs) {
+    if (!byMarket.has(s.marketId)) byMarket.set(s.marketId, []);
+    byMarket.get(s.marketId).push(s);
+  }
+  const groups = [...byMarket.entries()];
+  const fetched = await runWithConcurrency(
+    groups,
+    config.pollConcurrency,
+    ([marketId, group]) => fetchMarketSnap(marketId, group),
+  );
+  const now = Date.now();
+  for (const r of fetched) {
+    if (r.error) {
+      // At 1s cadence a dead market would flood the log — warn on the
+      // first miss and then every 30th.
+      const n = (booklogErrStreak.get(r.marketId) ?? 0) + 1;
+      booklogErrStreak.set(r.marketId, n);
+      if (n === 1 || n % 30 === 0) {
+        console.warn(new Date().toISOString(), `[booklog] ${r.marketId} fetch failed (×${n}):`, r.error);
+      }
+      continue;
+    }
+    booklogErrStreak.delete(r.marketId);
+    for (const s of r.group) {
+      const k = subKey(s.chatId, s.marketId);
+      const prev = booklogPrevSnap.get(k) ?? null;
+      booklogPrevSnap.set(k, r.snap);
+      // Share the freshest book with digests//stale — strictly fresher
+      // than what the slow loop has.
+      latestSnapPerSub.set(k, r.snap);
+      if (prev) await recordBooklog(s, k, prev, r.snap, now);
+    }
+  }
+  return true;
+}
+
+let _booklogRunning = false;
+export async function startBooklogLoop({ signal }) {
+  if (_booklogRunning) return;
+  _booklogRunning = true;
+  while (!signal?.aborted) {
+    const t0 = Date.now();
+    let active = false;
+    try {
+      active = await booklogPollOnce();
+    } catch (err) {
+      console.error(new Date().toISOString(), '[booklog] tick error:', err.message);
+    }
+    const interval = getBooklogPollMs();
+    const elapsed = Date.now() - t0;
+    // No journal-enabled subs → idle at ≥5s so the empty check stays
+    // cheap; otherwise honour the configured cadence with the same
+    // hard floor as the main loop.
+    const wait = active
+      ? Math.max(config.pollMinIntervalMs, interval - elapsed)
+      : Math.max(5000, interval);
+    await new Promise((r) => setTimeout(r, wait));
+  }
+  _booklogRunning = false;
+}
+
 async function pollOnce() {
   const subs = listAllSubscriptions();
   if (!subs.length) return;
@@ -737,15 +811,9 @@ async function pollOnce() {
       // Always cache the freshest snap, regardless of whether an alert
       // is going to fire below. Digests / aggregates read from this so
       // slow-drifting markets that never cross the alert threshold
-      // still report accurate prices in summaries.
-      // (Grab the previous tick's snap first — the 挂撤单日记 diffs
-      // consecutive polls, independent of the alert baseline which only
-      // moves when an alert fires.)
-      const prevTickSnap = latestSnapPerSub.get(k) ?? null;
+      // still report accurate prices in summaries. (挂撤单日记 runs on
+      // its own faster loop — startBooklogLoop — not here.)
       latestSnapPerSub.set(k, snap);
-      if (s.booklog?.enabled && prevTickSnap) {
-        await recordBooklog(s, k, prevTickSnap, snap, now);
-      }
       // Hydrate the in-memory baseline from the persisted last-alert
       // snapshot on the first poll after a restart. Without this every
       // sub fires "🆕 初次抓取" right after a redeploy because the

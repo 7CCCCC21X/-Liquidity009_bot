@@ -55,6 +55,10 @@ export const config = {
   orderbookKeyField: envStr('ORDERBOOK_KEY_FIELD', 'conditionId'),
 
   pollIntervalMs: envNum('POLL_INTERVAL_MS', 30_000),
+  // 挂撤单日记 fast loop — journal-enabled markets poll on their own
+  // (much faster) cadence, independent of the main alert loop above.
+  // Runtime-adjustable via /booklog speed; this is the default.
+  booklogPollIntervalMs: envNum('BOOKLOG_POLL_INTERVAL_MS', 1000),
   // Hard floor for the monitor sleep — protects against runaway loops
   // when POLL_INTERVAL_MS is set very low. Default 200ms supports
   // sub-second polling on healthy networks; bump up if you start

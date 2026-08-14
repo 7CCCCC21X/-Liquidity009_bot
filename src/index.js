@@ -16,11 +16,12 @@ import {
   setChatDefaultLevels, setChatDefaultTriggerMode, setChatDefaultCooldown,
   putPendingBulkRetry, takePendingBulkRetry, gcPendingBulkRetry,
   markChatDigestLogQuery, getChatDigestLogLastQueryAt,
+  getBooklogPollMs, setBooklogPollMs,
   ALL_LEVELS, LEVEL_LABEL, TRIGGER_MODES, TRIGGER_LABEL,
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
 import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, fmtClockDateTime, sendDigestForChat, effectiveThresholds, deriveEventTitle, getLatestSnapForSub, fmtBookChangeLine } from './monitor.js';
-import { startMonitorLoop } from './monitor.js';
+import { startMonitorLoop, startBooklogLoop } from './monitor.js';
 
 requireConfig();
 
@@ -72,7 +73,7 @@ const HELP_DETAIL = [
   '/threshold &lt;id&gt; — 改该市场的灵敏度（🔕 低噪 / ⚖️ 平衡 / 🔔 高频 / 🌐 全局）',
   '/stats &lt;id&gt; [小时] — 该市场近 N 小时统计：触发次数 / 最大 Δ价 / 最大 Δ量 / 价差',
   '/history &lt;id&gt; [N] — 查看历史变动（默认最近 10 条）',
-  '/booklog — 📖 日记总览：所有在记录的市场 + <b>一键给全部设挂单提醒</b>（也可 <code>/booklog alert 500</code>）',
+  '/booklog — 📖 日记总览：所有在记录的市场 + <b>一键给全部设挂单提醒</b>（也可 <code>/booklog alert 500</code>）；日记独立快轮询（默认 1 秒，<code>/booklog speed 1s</code> 可调，不影响普通订阅的 30 秒）',
   '/booklog &lt;id&gt; — 📖 挂撤单日记：逐笔记录该市场前3档的挂单/撤单（带时间，几秒前）；<b>不需要订阅</b>（未订阅的建「仅日记」轮询，不发价格提醒）；<code>on/off</code> 开关 · <code>alert 500</code> 单笔≥500张就提醒（方向可选挂+撤/只挂单/只撤单）· <code>min 10</code> 记录阈值',
   '/movers [时长] [N] — 近期变动最大的市场排序，例 <code>/movers 24h</code>（默认 24h，最多列 N=20）',
   '/stale [N] — 买1/卖1 停滞最久的市场排行（盘口最稳、最不易被插队；辅助判断挂 Yes/No，默认 N=20，别名 /idle）',
@@ -991,6 +992,21 @@ async function handleCommand(chatId, text) {
     if (!id) {
       // No id → 日记总览 with batch-alert buttons for every journal-
       // enabled market（添加市场 button opens the reply prompt）.
+      await runBooklogOverview(chatId);
+      return true;
+    }
+    if (id.toLowerCase() === 'speed' || id === '频率') {
+      // /booklog speed <1s|500ms|10> — journal fast-loop cadence.
+      const ms = parseBooklogSpeed(rest[0]);
+      if (ms == null || ms < BOOKLOG_SPEED_MIN_MS || ms > BOOKLOG_SPEED_MAX_MS) {
+        await sendMessage(chatId, [
+          `⏱ 当前日记查询频率：<b>每 ${fmtBooklogPoll(getBooklogPollMs())}</b>`,
+          `用法：<code>/booklog speed 1s</code> · <code>/booklog speed 500ms</code> · <code>/booklog speed 10</code>（数字=秒，范围 ${BOOKLOG_SPEED_MIN_MS}ms–${BOOKLOG_SPEED_MAX_MS / 1000}s）`,
+        ].join('\n'));
+        return true;
+      }
+      setBooklogPollMs(ms);
+      await saveState();
       await runBooklogOverview(chatId);
       return true;
     }
@@ -2468,9 +2484,31 @@ function buildBooklogKeyboard(marketId, bl) {
   };
 }
 
+// Human label for the journal poll cadence: "1秒" / "500ms" / "5秒".
+function fmtBooklogPoll(ms) {
+  return ms % 1000 === 0 ? `${ms / 1000}秒` : `${ms}ms`;
+}
+
+// Parse a journal poll cadence reply: "1s" / "1秒" / "500ms" / bare
+// number (= seconds). Returns ms or null.
+function parseBooklogSpeed(raw) {
+  const m = String(raw ?? '').trim().toLowerCase().match(/^(\d+(?:\.\d+)?)\s*(ms|s|秒)?$/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(m[2] === 'ms' ? n : n * 1000);
+}
+const BOOKLOG_SPEED_MIN_MS = 300;
+const BOOKLOG_SPEED_MAX_MS = 300_000;
+
 // 日记总览 keyboard: batch alert presets applying to EVERY journal-
-// enabled market in this chat, plus add/refresh.
+// enabled market in this chat, poll-speed presets, plus add/refresh.
 function buildBooklogOverviewKeyboard() {
+  const curMs = getBooklogPollMs();
+  const spdBtn = (ms, label) => ({
+    text: (curMs === ms ? '🟢 ' : '') + label,
+    callback_data: `blogall:spd:${ms}`,
+  });
   return {
     inline_keyboard: [
       [
@@ -2484,6 +2522,13 @@ function buildBooklogOverviewKeyboard() {
       ],
       [
         { text: '✏️ 全部自定义张数…', callback_data: 'blogall:al:custom' },
+      ],
+      [
+        spdBtn(1000, '查1秒'),
+        spdBtn(3000, '查3秒'),
+        spdBtn(5000, '查5秒'),
+        spdBtn(10_000, '查10秒'),
+        { text: '⏱ 自定义…', callback_data: 'blogall:spd:custom' },
       ],
       [
         { text: '➕ 添加市场', callback_data: 'blogall:add' },
@@ -2508,7 +2553,10 @@ function booklogAlertOffPatch(sub) {
 // links on each row.
 async function runBooklogOverview(chatId, { messageId = null } = {}) {
   const subs = listSubscriptionsForChat(chatId).filter((s) => s.booklog?.enabled);
-  const lines = ['📖 <b>挂撤单日记总览</b>'];
+  const lines = [
+    '📖 <b>挂撤单日记总览</b>',
+    `⏱ 日记查询频率：<b>每 ${fmtBooklogPoll(getBooklogPollMs())}</b>（独立于普通订阅的 ${Math.round(config.pollIntervalMs / 1000)}秒轮询）`,
+  ];
   if (!subs.length) {
     lines.push('');
     lines.push('<i>还没有在记录日记的市场。</i>');
@@ -2657,7 +2705,7 @@ async function runBooklogView(chatId, marketId, { n = 20, messageId = null } = {
     lines.push(`<i>最近 ${events.length} 次变动（新→旧）· /booklog ${marketId} 50 看更多</i>`);
   }
   lines.push('');
-  lines.push(`<i>说明：每 ${config.pollIntervalMs}ms 轮询对比前3档 — 数量减少可能是撤单或成交（盘口数据无法区分）；滑出前3档也会记为撤单。</i>`);
+  lines.push(`<i>说明：日记每 ${fmtBooklogPoll(getBooklogPollMs())} 查询一次（/booklog speed 可调），对比前3档 — 数量减少可能是撤单或成交（盘口数据无法区分）；滑出前3档也会记为撤单。</i>`);
   const text = lines.join('\n');
   const replyMarkup = buildBooklogKeyboard(marketId, bl);
   if (messageId) {
@@ -2756,6 +2804,19 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
     setSubscriptionBooklog(chatId, mid, patch);
     await saveState();
     await runBooklogView(chatId, mid);
+    return;
+  }
+  // 日记查询频率 sub-flow: the reply is an interval like "1s" /
+  // "500ms" / bare seconds. Global — affects the journal fast loop.
+  if (cmd === 'booklogspeed') {
+    const ms = parseBooklogSpeed(replyText);
+    if (ms == null || ms < BOOKLOG_SPEED_MIN_MS || ms > BOOKLOG_SPEED_MAX_MS) {
+      await sendMessage(chatId, `❌ 请回复 ${BOOKLOG_SPEED_MIN_MS}ms – ${BOOKLOG_SPEED_MAX_MS / 1000}s 之间的间隔，例 <code>1s</code> / <code>500ms</code> / <code>10</code>（数字=秒）。`);
+      return;
+    }
+    setBooklogPollMs(ms);
+    await saveState();
+    await runBooklogOverview(chatId);
     return;
   }
   // 日记总览批量提醒 sub-flow: the reply is a share count (or "off")
@@ -3823,6 +3884,34 @@ async function handleCallback(cb) {
       });
       return;
     }
+    if (action.startsWith('spd:')) {
+      const v = action.slice(4);
+      if (v === 'custom') {
+        await answerCallbackQuery(cb.id);
+        const sent = await sendMessage(chatId, [
+          '⏱ <b>自定义日记查询频率</b>',
+          `<i>当前：每 ${fmtBooklogPoll(getBooklogPollMs())} · 只影响开了日记的市场，普通订阅仍按 ${Math.round(config.pollIntervalMs / 1000)}秒轮询。</i>`,
+          '',
+          '📝 <b>回复此条消息</b>，发一个间隔，例 <code>1s</code> / <code>500ms</code> / <code>10</code>（数字=秒）',
+          `<i>范围 ${BOOKLOG_SPEED_MIN_MS}ms – ${BOOKLOG_SPEED_MAX_MS / 1000}s；调太快遇到 429 限流就调回来。30 分钟内有效。</i>`,
+        ].join('\n'), {
+          replyMarkup: { force_reply: true, selective: true, input_field_placeholder: '1s / 500ms / 10' },
+        });
+        putPendingPrompt(chatId, sent.message_id, 'booklogspeed', {});
+        await saveState();
+        return;
+      }
+      const ms = Math.round(Number(v));
+      if (!Number.isFinite(ms) || ms < BOOKLOG_SPEED_MIN_MS || ms > BOOKLOG_SPEED_MAX_MS) {
+        await answerCallbackQuery(cb.id, { text: '未知选项', showAlert: true });
+        return;
+      }
+      setBooklogPollMs(ms);
+      await saveState();
+      await answerCallbackQuery(cb.id, { text: `⏱ 日记查询改为每 ${fmtBooklogPoll(ms)}` });
+      await runBooklogOverview(chatId, { messageId });
+      return;
+    }
     if (action.startsWith('al:')) {
       const v = action.slice(3);
       const enabledSubs = listSubscriptionsForChat(chatId).filter((s) => s.booklog?.enabled);
@@ -4055,6 +4144,7 @@ async function main() {
   await Promise.all([
     pollUpdates(ctrl.signal),
     startMonitorLoop({ signal: ctrl.signal }),
+    startBooklogLoop({ signal: ctrl.signal }),
   ]);
   await saveState();
   console.log('[bot] bye');
