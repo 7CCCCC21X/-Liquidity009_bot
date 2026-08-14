@@ -644,8 +644,10 @@ async function recordBooklog(s, k, prevTickSnap, snap, now) {
     if (!big.length) return;
     const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
     const headWord = kind === 'add' ? '挂单' : kind === 'cut' ? '撤单' : '挂撤单';
+    const tzLabel = config.displayTzLabel ? ` ${config.displayTzLabel}` : '';
     const lines = [
       `📖 <b>大额${headWord}</b>  <i>≥ ${alertMin.toLocaleString('en-US')} 张</i>`,
+      `🕒 <code>${fmtClockTime(now)}</code>${tzLabel}`,
       `📊 ${titleLink}`,
     ];
     const qSub = questionSubtitle(s);
