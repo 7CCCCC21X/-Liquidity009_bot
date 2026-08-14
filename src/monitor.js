@@ -42,6 +42,11 @@ const pendingExcursion = new Map();
 // network blip never trips it.
 const notFoundStreak = new Map();
 const RESOLVED_404_STREAK = 5;
+// 挂撤单日记 alert throttle: at fast poll intervals a whale working an
+// order could otherwise fire an alert every tick. One alert per sub per
+// window; the journal itself records every tick regardless.
+const booklogAlertAt = new Map();
+const BOOKLOG_ALERT_COOLDOWN_MS = 60_000;
 
 // Distinguish a "market resolved / delisted" miss (404 not_found) from
 // a transient failure (timeout, fetch failed, 5xx). getOrderbook throws
@@ -236,6 +241,53 @@ function fmtRowDelta(prev, cur, mode = 'both') {
     parts.push(`量${ds > 0 ? '↑' : '↓'}${fmt}`);
   }
   return parts.join(' ');
+}
+
+// 挂撤单日记 diff: compare two consecutive poll snapshots price-by-price
+// (not level-by-level — a price shifting from L1 to L2 is the SAME order,
+// not a cancel+add) and emit one compact change record per real delta:
+//   { s: 'b'|'a', k: 'add'|'cut', p: price, d: shares, g?: 1 }
+// k='add' → 挂单 (new price level or size increase at a price)
+// k='cut' → 撤单/成交 (level gone or size decrease; book data can't
+//           distinguish a cancel from a fill — the diary labels both 撤单)
+// g=1     → the whole price level disappeared.
+// minSize is the noise floor in shares. Only the visible top-3 levels are
+// compared, so a level sliding out of the top 3 shows up as a cut.
+export function diffBookOrders(prev, cur, minSize = 1) {
+  const out = [];
+  const walk = (pArr, cArr, sideKey) => {
+    const pm = new Map((pArr ?? []).map((l) => [l.price.toFixed(6), l.size]));
+    const cm = new Map((cArr ?? []).map((l) => [l.price.toFixed(6), l.size]));
+    for (const [pk, cs] of cm) {
+      const ps = pm.get(pk);
+      const price = Number(pk);
+      if (ps == null) {
+        if (cs >= minSize) out.push({ s: sideKey, k: 'add', p: price, d: cs });
+      } else if (cs - ps >= minSize) {
+        out.push({ s: sideKey, k: 'add', p: price, d: cs - ps });
+      } else if (ps - cs >= minSize) {
+        out.push({ s: sideKey, k: 'cut', p: price, d: ps - cs });
+      }
+    }
+    for (const [pk, ps] of pm) {
+      if (!cm.has(pk) && ps >= minSize) out.push({ s: sideKey, k: 'cut', p: Number(pk), d: ps, g: 1 });
+    }
+  };
+  walk(prev?.bids, cur?.bids, 'b');
+  walk(prev?.asks, cur?.asks, 'a');
+  return out;
+}
+
+// One diary line for a single add/cut record. Shared by the /booklog
+// view (index.js) and the big-order alert below so both render alike.
+export function fmtBookChangeLine(c) {
+  const side = c.s === 'b' ? '买' : '卖';
+  const emoji = c.k === 'add' ? '🟢' : '🔴';
+  const verb = c.k === 'add' ? '挂单' : '撤单';
+  const sign = c.k === 'add' ? '+' : '−';
+  const amt = Math.round(c.d).toLocaleString('en-US');
+  const gone = c.g ? '（整档撤空）' : '';
+  return `${emoji} ${verb} ${side} ${c.p.toFixed(4)} ${sign}${amt} 张${gone}`;
 }
 
 function getLevel(snap, key) {
@@ -559,6 +611,65 @@ async function runWithConcurrency(items, limit, worker) {
   return results;
 }
 
+// 挂撤单日记 recorder: diff this sub's previous-tick book against the
+// fresh one, journal every add/cut to history.jsonl (type='book'), and
+// fire the big-order alert when configured. Never throws — a journal
+// failure must not break the main alert loop.
+async function recordBooklog(s, k, prevTickSnap, snap, now) {
+  try {
+    const bl = s.booklog;
+    const changes = diffBookOrders(prevTickSnap, snap, bl.minSize ?? 10);
+    if (!changes.length) return;
+    await appendEvent({
+      type: 'book',
+      chatId: s.chatId,
+      marketId: s.marketId,
+      title: s.title || null,
+      slug: s.slug || null,
+      changes,
+      // Post-change top-of-book for context when reading the diary.
+      bb: snap.bestBid?.price ?? null,
+      ba: snap.bestAsk?.price ?? null,
+    });
+    // Alert path: any single add/cut ≥ alertMin shares. Respects pause,
+    // quiet hours and digest-only just like regular alerts, plus its own
+    // fixed cooldown so a working whale doesn't ping every tick.
+    const alertMin = Number(bl.alertMin);
+    if (!Number.isFinite(alertMin) || alertMin <= 0) return;
+    if (s.pausedUntil && now < s.pausedUntil) return;
+    if (isChatInQuietHours(s.chatId, now) || isChatDigestOnly(s.chatId)) return;
+    const big = changes.filter((c) => c.d >= alertMin);
+    if (!big.length) return;
+    const lastAt = booklogAlertAt.get(k) ?? 0;
+    if (now - lastAt < BOOKLOG_ALERT_COOLDOWN_MS) return;
+    booklogAlertAt.set(k, now);
+    const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
+    const lines = [
+      `📖 <b>大额挂撤单</b>  <i>≥ ${alertMin.toLocaleString('en-US')} 张</i>`,
+      `📊 ${titleLink}`,
+    ];
+    const qSub = questionSubtitle(s);
+    if (qSub) lines.push(`<i>${qSub}</i>`);
+    lines.push('');
+    const SHOW_CAP = 6;
+    for (const c of big.slice(0, SHOW_CAP)) lines.push(fmtBookChangeLine(c));
+    if (big.length > SHOW_CAP) lines.push(`<i>… 另 ${big.length - SHOW_CAP} 笔</i>`);
+    lines.push('', fmtSpreadLine(snap), '', `<code>id=${s.marketId}</code>`);
+    try {
+      await sendMessage(s.chatId, lines.join('\n'), {
+        replyMarkup: { inline_keyboard: [[
+          { text: '📖 查看日记', callback_data: `blog:${s.marketId}:view` },
+          { text: '🔕 关此提醒', callback_data: `blog:${s.marketId}:al:off` },
+        ]] },
+      });
+    } catch (err) {
+      console.warn('[booklog] alert send failed:', s.chatId, err.message);
+    }
+  } catch (err) {
+    console.warn('[booklog] record failed:', err.message);
+  }
+}
+
 async function pollOnce() {
   const subs = listAllSubscriptions();
   if (!subs.length) return;
@@ -629,7 +740,14 @@ async function pollOnce() {
       // is going to fire below. Digests / aggregates read from this so
       // slow-drifting markets that never cross the alert threshold
       // still report accurate prices in summaries.
+      // (Grab the previous tick's snap first — the 挂撤单日记 diffs
+      // consecutive polls, independent of the alert baseline which only
+      // moves when an alert fires.)
+      const prevTickSnap = latestSnapPerSub.get(k) ?? null;
       latestSnapPerSub.set(k, snap);
+      if (s.booklog?.enabled && prevTickSnap) {
+        await recordBooklog(s, k, prevTickSnap, snap, now);
+      }
       // Hydrate the in-memory baseline from the persisted last-alert
       // snapshot on the first poll after a restart. Without this every
       // sub fires "🆕 初次抓取" right after a redeploy because the

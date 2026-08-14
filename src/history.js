@@ -96,7 +96,7 @@ export async function readDigests({ chatId, limit = 10, sinceMs = 0 } = {}) {
 // whole file then walks backwards — fine for the 14-day default; if
 // the file ever gets huge consider an indexed format. limit is a hard
 // cap so we don't blow Telegram's message length.
-export async function readEvents({ chatId, marketId, limit = 50, sinceMs = 0 } = {}) {
+export async function readEvents({ chatId, marketId, limit = 50, sinceMs = 0, types = null } = {}) {
   if (!config.historyEnabled) return [];
   // Same bounded forward-stream as readDigests; keep newest `limit` and
   // return newest-first. `sinceMs` (optional) drops events older than the
@@ -106,9 +106,34 @@ export async function readEvents({ chatId, marketId, limit = 50, sinceMs = 0 } =
   await streamLines(config.historyFile, (line) => {
     let evt;
     try { evt = JSON.parse(line); } catch { return; }
+    // 'book' journal lines (挂撤单日记) are high-volume and have their
+    // own reader (readBookEvents); keep them out of the generic view
+    // (/history /stats /movers) unless the caller asks for everything
+    // via types='all' (used by /export).
+    if (types !== 'all' && evt.type === 'book') return;
     if (chatId != null && String(evt.chatId) !== String(chatId)) return;
     if (marketId != null && String(evt.marketId) !== String(marketId)) return;
     if (sinceMs && evt.ts < sinceMs) return; // older than the window
+    window.push(evt);
+    if (window.length > limit) window.shift();
+  });
+  window.reverse();
+  return window;
+}
+
+// 挂撤单日记 reader: type='book' events only. Each event is one poll
+// tick's bundle of add/cut changes for one (chat, market). Newest-first,
+// same bounded sliding-window scan as the other readers.
+export async function readBookEvents({ chatId, marketId, limit = 50, sinceMs = 0 } = {}) {
+  if (!config.historyEnabled) return [];
+  const window = [];
+  await streamLines(config.historyFile, (line) => {
+    let evt;
+    try { evt = JSON.parse(line); } catch { return; }
+    if (evt.type !== 'book') return;
+    if (chatId != null && String(evt.chatId) !== String(chatId)) return;
+    if (marketId != null && String(evt.marketId) !== String(marketId)) return;
+    if (sinceMs && evt.ts < sinceMs) return;
     window.push(evt);
     if (window.length > limit) window.shift();
   });

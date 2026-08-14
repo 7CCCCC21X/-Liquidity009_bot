@@ -231,6 +231,21 @@ export function setSubscriptionThresholds(chatId, marketId, thresholds) {
   return s;
 }
 
+// 挂撤单日记 (orderbook journal) config on a subscription. Shape:
+//   { enabled, enabledAtMs, minSize, alertMin }
+// - enabled:  record per-tick add/cut events to history.jsonl
+// - minSize:  ignore deltas smaller than this many shares (noise floor)
+// - alertMin: push an immediate alert when a single add/cut ≥ this;
+//             null = no alerts, journal-only.
+// `patch` merges into the existing config; pass null to delete it all.
+export function setSubscriptionBooklog(chatId, marketId, patch) {
+  const s = _state.subs[subKey(chatId, marketId)];
+  if (!s) return null;
+  if (patch == null) { delete s.booklog; return s; }
+  s.booklog = { ...(s.booklog ?? {}), ...patch };
+  return s;
+}
+
 export function setSubscriptionPause(chatId, marketId, untilMs) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
