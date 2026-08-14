@@ -1043,8 +1043,9 @@ async function handleCommand(chatId, text) {
     if (a0 === 'alert' || a0 === '提醒') {
       const v = (rest[1] ?? '').toLowerCase();
       if (v === 'off' || v === '关' || v === '0') {
-        if (getSubscription(chatId, id)) {
-          setSubscriptionBooklog(chatId, id, { alertMin: null });
+        const subOff = getSubscription(chatId, id);
+        if (subOff) {
+          setSubscriptionBooklog(chatId, id, booklogAlertOffPatch(subOff));
           await saveState();
         }
         await runBooklogView(chatId, id);
@@ -2473,12 +2474,15 @@ function buildBooklogOverviewKeyboard() {
   return {
     inline_keyboard: [
       [
-        { text: '全部🔕关提醒', callback_data: 'blogall:al:off' },
-        { text: '全部≥100张', callback_data: 'blogall:al:100' },
-        { text: '全部≥500张', callback_data: 'blogall:al:500' },
+        { text: '🔔 全部开提醒', callback_data: 'blogall:al:on' },
+        { text: '🔕 全部关提醒', callback_data: 'blogall:al:off' },
       ],
       [
+        { text: '全部≥100张', callback_data: 'blogall:al:100' },
+        { text: '全部≥500张', callback_data: 'blogall:al:500' },
         { text: '全部≥1000张', callback_data: 'blogall:al:1000' },
+      ],
+      [
         { text: '✏️ 全部自定义张数…', callback_data: 'blogall:al:custom' },
       ],
       [
@@ -2486,6 +2490,15 @@ function buildBooklogOverviewKeyboard() {
         { text: '🔄 刷新', callback_data: 'blogall:rf' },
       ],
     ],
+  };
+}
+
+// Shared "turn the alert off but remember the threshold" patch so 开提醒
+// can restore it later instead of forcing the user to re-pick a number.
+function booklogAlertOffPatch(sub) {
+  return {
+    alertMin: null,
+    alertMinPrev: sub?.booklog?.alertMin ?? sub?.booklog?.alertMinPrev ?? null,
   };
 }
 
@@ -2502,6 +2515,7 @@ async function runBooklogOverview(chatId, { messageId = null } = {}) {
     lines.push('<i>点「➕ 添加市场」回复 URL / id（事件页可多选勾选），或直接 <code>/booklog &lt;id&gt; on</code> 开启。</i>');
   } else {
     lines.push(`<i>记录中 <b>${subs.length}</b> 个市场 · 下方按钮对<b>全部</b>生效；点各行 /booklog_… 单独调整</i>`);
+    lines.push(`<i>🔔 开提醒＝恢复各市场原来的张数阈值（没设过的默认 ≥500 张）；≥N 按钮＝统一指定阈值</i>`);
     lines.push('');
     const CAP = 30;
     for (const s of subs.slice(0, CAP)) {
@@ -2527,11 +2541,20 @@ async function runBooklogOverview(chatId, { messageId = null } = {}) {
 }
 
 // Apply an alert threshold to every journal-enabled market at once.
-// Returns the number of markets touched.
+// alertMin=null turns alerts off (remembering each market's threshold);
+// 'restore' turns them back on with each market's remembered threshold
+// (default 500 for markets that never had one). Returns the count.
 async function applyBooklogAlertToAll(chatId, alertMin) {
   const subs = listSubscriptionsForChat(chatId).filter((s) => s.booklog?.enabled);
   for (const s of subs) {
-    setSubscriptionBooklog(chatId, s.marketId, { alertMin });
+    if (alertMin === 'restore') {
+      if (s.booklog?.alertMin) continue; // already on — keep as-is
+      setSubscriptionBooklog(chatId, s.marketId, { alertMin: s.booklog?.alertMinPrev ?? 500 });
+    } else if (alertMin == null) {
+      setSubscriptionBooklog(chatId, s.marketId, booklogAlertOffPatch(s));
+    } else {
+      setSubscriptionBooklog(chatId, s.marketId, { alertMin });
+    }
   }
   if (subs.length) await saveState();
   return subs.length;
@@ -2708,8 +2731,9 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
     const t = String(replyText ?? '').trim().toLowerCase();
     const mid = args.marketId;
     if (t === 'off' || t === '关' || t === '0') {
-      if (getSubscription(chatId, mid)) {
-        setSubscriptionBooklog(chatId, mid, { alertMin: null });
+      const subOff = getSubscription(chatId, mid);
+      if (subOff) {
+        setSubscriptionBooklog(chatId, mid, booklogAlertOffPatch(subOff));
         await saveState();
       }
       await runBooklogView(chatId, mid);
@@ -3737,7 +3761,7 @@ async function handleCallback(cb) {
         await answerCallbackQuery(cb.id, { text: '找不到该市场（可能已下架）', showAlert: true });
         return;
       }
-      const patch = { alertMin };
+      const patch = alertMin == null ? booklogAlertOffPatch(target) : { alertMin };
       if (alertMin != null && !target.booklog?.enabled) {
         patch.enabled = true;
         patch.enabledAtMs = Date.now();
@@ -3819,6 +3843,13 @@ async function handleCallback(cb) {
         });
         putPendingPrompt(chatId, sent.message_id, 'booklogalertall', {});
         await saveState();
+        return;
+      }
+      if (v === 'on') {
+        // Restore each market's remembered threshold (default ≥500).
+        const nApplied = await applyBooklogAlertToAll(chatId, 'restore');
+        await answerCallbackQuery(cb.id, { text: `🔔 已开 ${nApplied} 个市场的提醒` });
+        await runBooklogOverview(chatId, { messageId });
         return;
       }
       const alertMin = v === 'off' ? null : Math.floor(Number(v));
