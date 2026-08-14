@@ -626,15 +626,17 @@ async function recordBooklog(s, k, prevTickSnap, snap, now) {
       bb: snap.bestBid?.price ?? null,
       ba: snap.bestAsk?.price ?? null,
     });
-    // Alert path: any single add/cut ≥ alertMin shares. Respects pause,
-    // quiet hours and digest-only just like regular alerts. No cooldown
-    // by design（出来一条提醒一条）— changes within one tick are still
-    // bundled into a single message, so the worst case is one alert per
-    // poll interval per market.
+    // Alert path: any single add/cut ≥ alertMin shares. The user set
+    // this threshold explicitly, so it deliberately IGNORES digest-only
+    // mode and /pause (both target the noisy price alerts — they used
+    // to silently swallow journal alerts too, which read as "diary has
+    // the entry but no push came"). Only quiet hours (/quiet, explicit
+    // do-not-disturb) still mute it. No cooldown by design（出来一条提
+    // 醒一条）— same-tick changes are bundled into a single message, so
+    // the ceiling is one alert per poll interval per market.
     const alertMin = Number(bl.alertMin);
     if (!Number.isFinite(alertMin) || alertMin <= 0) return;
-    if (s.pausedUntil && now < s.pausedUntil) return;
-    if (isChatInQuietHours(s.chatId, now) || isChatDigestOnly(s.chatId)) return;
+    if (isChatInQuietHours(s.chatId, now)) return;
     // Direction filter: alertKind 'add' = 只挂单, 'cut' = 只撤单,
     // anything else (default) = both.
     const kind = bl.alertKind === 'add' || bl.alertKind === 'cut' ? bl.alertKind : null;
