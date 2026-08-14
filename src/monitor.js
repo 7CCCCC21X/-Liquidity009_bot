@@ -1012,7 +1012,9 @@ async function pollOnce() {
 // baseline for the next round.
 export async function sendDigestForChat(chatId) {
   const all = listAllSubscriptions();
-  const subs = all.filter((s) => String(s.chatId) === String(chatId));
+  // 仅日记 (journal-only) entries are polled for the /booklog diary but
+  // are not part of subscription monitoring — keep them out of digests.
+  const subs = all.filter((s) => String(s.chatId) === String(chatId) && !s.booklogOnly);
   if (!subs.length) {
     await sendMessage(chatId, '<i>📋 摘要：当前没有订阅。</i>');
     return;
