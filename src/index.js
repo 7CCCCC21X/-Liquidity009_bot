@@ -2671,6 +2671,9 @@ async function runBooklogView(chatId, marketId, { n = 20, messageId = null } = {
     ? `单笔${kindLabel} ≥ ${Number(bl.alertMin).toLocaleString('en-US')} 张即推送`
     : '🔕 未设';
   lines.push(`状态：${statusBit} · 提醒：${alertBit} · 记录阈值：≥ ${bl?.minSize ?? 10} 张`);
+  if (bl?.alertMin && isChatInQuietHours(chatId)) {
+    lines.push('<i>🌙 当前处于勿扰时段（/quiet）— 提醒暂停推送，仅记录日记。</i>');
+  }
   if (sub?.booklogOnly) {
     lines.push('<i>📖 仅日记 — 独立于订阅监控，不发价格/数量提醒；停止记录即取消轮询。</i>');
   }
