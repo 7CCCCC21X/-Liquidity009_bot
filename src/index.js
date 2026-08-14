@@ -2515,7 +2515,7 @@ async function runBooklogOverview(chatId, { messageId = null } = {}) {
     lines.push('<i>点「➕ 添加市场」回复 URL / id（事件页可多选勾选），或直接 <code>/booklog &lt;id&gt; on</code> 开启。</i>');
   } else {
     lines.push(`<i>记录中 <b>${subs.length}</b> 个市场 · 下方按钮对<b>全部</b>生效；点各行 /booklog_… 单独调整</i>`);
-    lines.push(`<i>🔔 开提醒＝恢复各市场原来的张数阈值（没设过的默认 ≥500 张）；≥N 按钮＝统一指定阈值</i>`);
+    lines.push(`<i>🔔 开提醒＝恢复各市场原来的张数阈值（没设过的默认 ≥100 张）；≥N 按钮＝统一指定阈值</i>`);
     lines.push('');
     const CAP = 30;
     for (const s of subs.slice(0, CAP)) {
@@ -2543,13 +2543,13 @@ async function runBooklogOverview(chatId, { messageId = null } = {}) {
 // Apply an alert threshold to every journal-enabled market at once.
 // alertMin=null turns alerts off (remembering each market's threshold);
 // 'restore' turns them back on with each market's remembered threshold
-// (default 500 for markets that never had one). Returns the count.
+// (default 100 for markets that never had one). Returns the count.
 async function applyBooklogAlertToAll(chatId, alertMin) {
   const subs = listSubscriptionsForChat(chatId).filter((s) => s.booklog?.enabled);
   for (const s of subs) {
     if (alertMin === 'restore') {
       if (s.booklog?.alertMin) continue; // already on — keep as-is
-      setSubscriptionBooklog(chatId, s.marketId, { alertMin: s.booklog?.alertMinPrev ?? 500 });
+      setSubscriptionBooklog(chatId, s.marketId, { alertMin: s.booklog?.alertMinPrev ?? 100 });
     } else if (alertMin == null) {
       setSubscriptionBooklog(chatId, s.marketId, booklogAlertOffPatch(s));
     } else {
