@@ -485,11 +485,11 @@ function buildChoiceKeyboard(token, matches, selected = [], existingIds = new Se
     { text: '✅ 全选', callback_data: `pick:${token}:all` },
     { text: '⬜ 清空', callback_data: `pick:${token}:none` },
   ]);
+  const doneText = mode === 'unsub' ? `🛑 取消所选 (${sel.size})`
+    : mode === 'booklog' ? `📖 开启日记 (${sel.size})`
+    : `✓ 完成 (${sel.size})`;
   rows.push([
-    {
-      text: mode === 'unsub' ? `🛑 取消所选 (${sel.size})` : `✓ 完成 (${sel.size})`,
-      callback_data: `pick:${token}:done`,
-    },
+    { text: doneText, callback_data: `pick:${token}:done` },
     { text: '✖ 取消', callback_data: `pick:${token}:cancel` },
   ]);
   return { inline_keyboard: rows };
@@ -500,6 +500,13 @@ function buildChoiceHeaderText(matches, selectedCount, existingCount = 0, mode =
     return [
       `🛑 这个事件里你订阅了 <b>${matches.length}</b> 个市场，请<b>勾选</b>要取消的：`,
       `<i>已选 <b>${selectedCount}</b> 个 · 30 分钟内有效</i>`,
+    ].join('\n');
+  }
+  if (mode === 'booklog') {
+    const enabledHint = existingCount ? ` · 🟢 ${existingCount} 个已在记录` : '';
+    return [
+      `📖 这个事件里你订阅了 <b>${matches.length}</b> 个市场，请<b>勾选</b>要开启挂撤单日记的（可多选）：`,
+      `<i>已选 <b>${selectedCount}</b> 个${enabledHint} · 只选 1 个会直接打开日记卡片 · 30 分钟内有效</i>`,
     ].join('\n');
   }
   const existingHint = existingCount
@@ -523,6 +530,22 @@ function existingMatchIds(chatId, matches) {
   return out;
 }
 
+// booklog-mode counterpart: 🟢 marks markets whose 挂撤单日记 is
+// already recording (instead of "already subscribed").
+function booklogEnabledIds(chatId, matches) {
+  const out = new Set();
+  for (const m of matches) {
+    if (getSubscription(chatId, m.id)?.booklog?.enabled) out.add(String(m.id));
+  }
+  return out;
+}
+
+// Picker rows' 🟢 marker means different things per mode; compute the
+// right id set for the mode in one place.
+function pickerMarkIds(chatId, matches, mode) {
+  return mode === 'booklog' ? booklogEnabledIds(chatId, matches) : existingMatchIds(chatId, matches);
+}
+
 // Single source of truth for the pick:<token>:<action> callback router.
 // Actions: t:<idx> (toggle), all, none, done, cancel.
 async function handlePickCallback(chatId, messageId, callbackId, token, action) {
@@ -542,7 +565,7 @@ async function handlePickCallback(chatId, messageId, callbackId, token, action) 
     return;
   }
   const { matches } = entry;
-  const mode = entry.mode === 'unsub' ? 'unsub' : 'sub';
+  const mode = ['unsub', 'booklog'].includes(entry.mode) ? entry.mode : 'sub';
 
   if (action === 'all') {
     entry.selected = matches.map((_, i) => i);
@@ -583,6 +606,11 @@ async function handlePickCallback(chatId, messageId, callbackId, token, action) 
       await commitPickedUnsubscriptions(chatId, messageId, matches, entry.selected);
       return;
     }
+    if (mode === 'booklog') {
+      await answerCallbackQuery(callbackId, { text: `开启 ${entry.selected.length} 个日记…` });
+      await commitPickedBooklog(chatId, messageId, matches, entry.selected);
+      return;
+    }
     await answerCallbackQuery(callbackId, { text: `订阅 ${entry.selected.length} 个…` });
     await commitPickedSubscriptions(chatId, messageId, matches, entry.selected);
     return;
@@ -592,7 +620,7 @@ async function handlePickCallback(chatId, messageId, callbackId, token, action) 
 
 async function refreshChoiceKeyboard(chatId, messageId, token, matches, selected, mode = 'sub') {
   if (!messageId) return;
-  const existingIds = existingMatchIds(chatId, matches);
+  const existingIds = pickerMarkIds(chatId, matches, mode);
   try {
     await editMessageText(
       chatId,
@@ -626,6 +654,50 @@ async function commitPickedUnsubscriptions(chatId, messageId, matches, selectedI
     ...lines,
     '',
     '<i>历史记录保留；重新发送网址可再次订阅。</i>',
+  ].join('\n');
+  if (messageId) {
+    try {
+      await editMessageText(chatId, messageId, summary);
+      return;
+    } catch { /* old message — fall through to a fresh send */ }
+  }
+  await sendMessage(chatId, summary);
+}
+
+// 完成 in booklog mode — enable the 挂撤单日记 on every picked market.
+// Single pick → jump straight into that market's diary card; multi →
+// one summary with clickable /booklog_<id> links per market.
+async function commitPickedBooklog(chatId, messageId, matches, selectedIdx) {
+  const picked = selectedIdx.map((i) => matches[i]).filter(Boolean);
+  const lines = [];
+  let ok = 0;
+  for (const m of picked) {
+    const sub = getSubscription(chatId, m.id);
+    if (!sub) {
+      lines.push(`✗ <code>${m.id}</code> 未订阅（已跳过）`);
+      continue;
+    }
+    if (!sub.booklog?.enabled) {
+      setSubscriptionBooklog(chatId, m.id, { enabled: true, enabledAtMs: Date.now() });
+    }
+    ok += 1;
+    const titleShort = (sub.title || m.title || '').replace(/\s+/g, ' ').slice(0, 40);
+    lines.push(`✓ ${htmlEscape(titleShort)}  /booklog_${m.id}`);
+  }
+  if (ok) await saveState();
+  if (picked.length === 1 && ok === 1) {
+    if (messageId) {
+      try { await editMessageText(chatId, messageId, '📖 已开启挂撤单日记（详见下条）'); } catch { /* old msg */ }
+    }
+    await runBooklogView(chatId, picked[0].id);
+    return;
+  }
+  const summary = [
+    `📖 <b>已开启 ${ok} 个市场的挂撤单日记</b>`,
+    '',
+    ...lines,
+    '',
+    '<i>点各行的 /booklog_… 打开对应日记卡片（翻记录 / 设大单提醒）。</i>',
   ].join('\n');
   if (messageId) {
     try {
@@ -915,6 +987,7 @@ async function handleCommand(chatId, text) {
     if (!id) {
       await promptCommandTarget(chatId, 'booklog', {
         headline: '<b>📖 挂撤单日记</b>  <i>回复要看的市场</i>',
+        hint: '<b>📝 回复此条消息</b>，发送 URL / marketId / slug\n<i>事件页 URL 也行 — 会弹出卡片让你勾选（可多选）要开日记的子市场。</i>',
       });
       return true;
     }
@@ -2491,6 +2564,48 @@ async function resolveAndDispatchPrompt(chatId, replyText, cmd, args = {}) {
     await saveState();
     await runBooklogView(chatId, mid);
     return;
+  }
+  // /booklog reply-flow: an event URL maps to several sub-markets —
+  // instead of bouncing the user ("无法定位单一目标"), show the same
+  // checkbox picker as the subscribe flow in 'booklog' mode so they can
+  // multi-select which markets to journal. Numeric ids fall through to
+  // the generic single-market dispatch below.
+  if (cmd === 'booklog') {
+    const t = String(replyText ?? '').trim();
+    const numeric = extractMarketId(t);
+    if (!numeric) {
+      let markets = [];
+      try {
+        const r = await resolveUrlToMarkets(t);
+        markets = r.markets ?? [];
+      } catch (err) {
+        await sendMessage(chatId, `❌ 解析失败：${htmlEscape(err.message)}`);
+        return;
+      }
+      if (markets.length) {
+        const subscribed = markets.filter((m) => getSubscription(chatId, m.id));
+        if (!subscribed.length) {
+          await sendMessage(chatId, [
+            `<i>这个链接对应的 ${markets.length} 个市场你都没有订阅。</i>`,
+            '<i>日记依赖轮询 — 先把网址直接发给我订阅，再来开日记。</i>',
+          ].join('\n'));
+          return;
+        }
+        if (subscribed.length === 1) {
+          await runBooklogView(chatId, subscribed[0].id);
+          return;
+        }
+        const token = shortToken();
+        putPendingChoice(chatId, token, subscribed, [], 'booklog');
+        await saveState();
+        const enabledIds = booklogEnabledIds(chatId, subscribed);
+        await sendMessage(chatId, buildChoiceHeaderText(subscribed, 0, enabledIds.size, 'booklog'), {
+          replyMarkup: buildChoiceKeyboard(token, subscribed, [], enabledIds, 'booklog'),
+        });
+        return;
+      }
+      // markets.length === 0 → fall through to the generic "无法识别"
+    }
   }
   // /stop reply-flow: a URL may map to several subscribed sub-markets
   // (event page). Resolve to the full set, keep only the ones this
