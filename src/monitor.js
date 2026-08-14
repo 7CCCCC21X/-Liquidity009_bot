@@ -42,11 +42,6 @@ const pendingExcursion = new Map();
 // network blip never trips it.
 const notFoundStreak = new Map();
 const RESOLVED_404_STREAK = 5;
-// 挂撤单日记 alert throttle: at fast poll intervals a whale working an
-// order could otherwise fire an alert every tick. One alert per sub per
-// window; the journal itself records every tick regardless.
-const booklogAlertAt = new Map();
-const BOOKLOG_ALERT_COOLDOWN_MS = 60_000;
 
 // Distinguish a "market resolved / delisted" miss (404 not_found) from
 // a transient failure (timeout, fetch failed, 5xx). getOrderbook throws
@@ -632,8 +627,10 @@ async function recordBooklog(s, k, prevTickSnap, snap, now) {
       ba: snap.bestAsk?.price ?? null,
     });
     // Alert path: any single add/cut ≥ alertMin shares. Respects pause,
-    // quiet hours and digest-only just like regular alerts, plus its own
-    // fixed cooldown so a working whale doesn't ping every tick.
+    // quiet hours and digest-only just like regular alerts. No cooldown
+    // by design（出来一条提醒一条）— changes within one tick are still
+    // bundled into a single message, so the worst case is one alert per
+    // poll interval per market.
     const alertMin = Number(bl.alertMin);
     if (!Number.isFinite(alertMin) || alertMin <= 0) return;
     if (s.pausedUntil && now < s.pausedUntil) return;
@@ -643,9 +640,6 @@ async function recordBooklog(s, k, prevTickSnap, snap, now) {
     const kind = bl.alertKind === 'add' || bl.alertKind === 'cut' ? bl.alertKind : null;
     const big = changes.filter((c) => c.d >= alertMin && (!kind || c.k === kind));
     if (!big.length) return;
-    const lastAt = booklogAlertAt.get(k) ?? 0;
-    if (now - lastAt < BOOKLOG_ALERT_COOLDOWN_MS) return;
-    booklogAlertAt.set(k, now);
     const titleLink = marketLink(s.title || `Market ${s.marketId}`, s.slug);
     const headWord = kind === 'add' ? '挂单' : kind === 'cut' ? '撤单' : '挂撤单';
     const lines = [
