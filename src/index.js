@@ -21,7 +21,7 @@ import {
 } from './state.js';
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
 import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, fmtClockDateTime, sendDigestForChat, effectiveThresholds, deriveEventTitle, getLatestSnapForSub, fmtBookChangeLine } from './monitor.js';
-import { startMonitorLoop, startBooklogLoop } from './monitor.js';
+import { startMonitorLoop, startBooklogLoop, startWsFeed, transportStats } from './monitor.js';
 
 requireConfig();
 
@@ -1499,6 +1499,7 @@ async function handleCommand(chatId, text) {
       '',
       `<b>订阅</b>: ${subs.length} 个${pausedCount ? ` (⏸ ${pausedCount} 暂停中)` : ''}`,
       `<b>轮询</b>: 每 ${config.pollIntervalMs}ms · 下限 ${config.pollMinIntervalMs}ms · 并发 ${config.pollConcurrency}`,
+      fmtTransportLines(),
       `<b>冷却</b>: ${Math.round(config.notifyCooldownMs / 1000)}s`,
       `<b>价格阈值</b>: ≥ ${config.priceEpsilon}`,
       `<b>数量阈值</b>: ≥ ${config.sizeAbsoluteMin} 张 / ${(config.sizeRelativeEpsilon * 100).toFixed(0)}%`,
@@ -3144,6 +3145,29 @@ async function runProbe(chatId, marketId) {
   await sendMessage(chatId, text, { replyMarkup });
 }
 
+// One-line-per-transport summary for /status: REST budget usage and
+// the WebSocket feed's health, so a user can tell at a glance whether
+// the diary is running off pushes or polls and whether we're being
+// rate-limited.
+function fmtTransportLines() {
+  const { rest, ws, deadMarkets } = transportStats();
+  const restLine = rest.enabled
+    ? `<b>REST 配额</b>: ${rest.perMinute}/分钟 · 桶内 ${rest.tokens}/${rest.capacity} · 排队 ${rest.queued}` +
+      `${rest.blocks ? ` · 429 暂停 ${rest.blocks} 次` : ''}${rest.blockedForMs ? ` · 暂停中 ${Math.ceil(rest.blockedForMs / 1000)}s` : ''}`
+    : '<b>REST 配额</b>: 未限速';
+  let wsLine;
+  if (!ws.enabled) wsLine = '<b>WebSocket</b>: 已关闭（PREDICT_WS_ENABLED=0）';
+  else if (!ws.supported) wsLine = '<b>WebSocket</b>: 运行时不支持（需要 Node ≥ 22），改用轮询';
+  else if (!ws.connected) wsLine = `<b>WebSocket</b>: 🔴 未连接${ws.lastError ? ` · ${htmlEscape(String(ws.lastError).slice(0, 60))}` : ''}（已回退轮询）`;
+  else {
+    const ago = ws.lastMsgAgoMs != null ? `${Math.round(ws.lastMsgAgoMs / 1000)}s 前` : '—';
+    wsLine = `<b>WebSocket</b>: 🟢 已订阅 ${ws.subscribed} 个市场 · 收到 ${ws.books} 次订单簿 · 最近消息 ${ago}` +
+      `${ws.distrusted ? ` · ${ws.distrusted} 个已回退轮询` : ''}${ws.connects > 1 ? ` · 重连 ${ws.connects - 1} 次` : ''}`;
+  }
+  const dead = deadMarkets ? `\n<b>404 退避中</b>: ${deadMarkets} 个市场` : '';
+  return `${restLine}\n${wsLine}${dead}`;
+}
+
 // Speed test: hammer one orderbook endpoint N times back-to-back and
 // report the latency distribution. Tells the user the floor for
 // POLL_INTERVAL_MS without trial-and-erroring it on Railway.
@@ -4148,6 +4172,7 @@ async function main() {
     pollUpdates(ctrl.signal),
     startMonitorLoop({ signal: ctrl.signal }),
     startBooklogLoop({ signal: ctrl.signal }),
+    startWsFeed({ signal: ctrl.signal }),
   ]);
   await saveState();
   console.log('[bot] bye');

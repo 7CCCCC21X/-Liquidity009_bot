@@ -11,7 +11,9 @@
 - **备注**：每张订阅可加自定义文字标签，列表和通知里都显示。点「📝 设置备注」按钮（ForceReply 弹输入框）或 `/note <id> <文字>`。
 - 变动监控：默认 30s 轮询，被勾选的档位价位（变动 ≥ 0.005）或量（变动 ≥ 50 张或 10%）触发推送
 - 持久化：订阅 + 档位 + 备注写入 `STATE_FILE`，Railway redeploy 不丢
-- 0 第三方依赖：纯 Node 20 内置 fetch
+- **WebSocket 实时推送**：订阅的市场走 `wss://ws.predict.fun/ws` 的 `predictOrderbook/<id>` 推送，日记按推送即时记录、主循环复用推送到的订单簿；WS 断线或某市场推送异常时自动回退 REST 轮询（`PREDICT_WS_ENABLED=0` 可关）
+- **配额友好**：客户端令牌桶限速（`REST_RATE_LIMIT_PER_MIN`）+ 429 按 `Retry-After` 全局暂停；订单簿 404 指数退避，不再每 tick 重打；`/status` 显示 REST 配额与 WS 状态
+- 0 第三方依赖：纯 Node 22 内置 fetch + WebSocket
 
 ## 命令
 | 命令 | 说明 |
@@ -131,15 +133,29 @@ Bot 内部并行抓多市场（`Promise.all` + 并发上限），所以 N 个订
 | `HISTORY_FILE` | `./history.jsonl` | Railway 推荐 `/data/history.jsonl` |
 | `HISTORY_KEEP_DAYS` | `14` | 自动 prune 阈值（天）；0 关闭 |
 
+**API 配额 / 实时推送**：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `REST_RATE_LIMIT_PER_MIN` | `3000` | 客户端令牌桶（次/分钟）。Predict.fun 基础等级通用桶 5,000/分钟 **按应用计**，同一 key 上的其他程序共享；0 = 不限速 |
+| `ORDERBOOK_404_BACKOFF_MAX_MS` | `60000` | 订单簿 404 后的指数退避上限；连续 404 ≥ 5 次且持续 ≥ 60s 自动退订 |
+| `PREDICT_WS_ENABLED` | `true` | 走 `wss://ws.predict.fun/ws` 推送；断线 / 被拒 / 推送异常自动回退 REST 轮询 |
+| `PREDICT_WS_STALE_MS` | `45000` | 心跳看门狗，超时重连并回退轮询 |
+| `PREDICT_WS_AUDIT_INTERVAL_MS` | `60000` | WS 在线市场的 REST 审计间隔；发现漏推 3 次即切回轮询 `PREDICT_WS_DISTRUST_MS`（默认 10 分钟） |
+
+> **建议**：给这个机器人单独建一个 Predict.fun 应用 / API key，别和交易程序共用——后台指标页里 `/v1/positions`、`/v1/orders/matches` 这些请求并不是本机器人发的，却在吃同一个桶。
+
 ## 项目结构
 ```
 src/
 ├── config.js     env 加载
-├── http.js       fetch + 重试 + 超时
+├── http.js       fetch + 重试 + 超时 + 429 Retry-After
+├── ratelimit.js  REST 令牌桶限速
+├── ws.js         Predict.fun WebSocket 订单簿推送（自动重连 / 回退）
 ├── telegram.js   Telegram Bot API
-├── predict.js    URL → slug → marketId 解析；GraphQL 市场列表；REST 订单簿
+├── predict.js    URL → slug → marketId 解析；GraphQL 市场列表；REST 订单簿（404 退避）
 ├── state.js      JSON 持久化
-├── monitor.js    轮询 + 变动检测 + 推送
+├── monitor.js    轮询 + WS 复用 + 变动检测 + 推送
 └── index.js      命令处理 + 长轮询 + 启动
 scripts/
 └── get-chat-id.js

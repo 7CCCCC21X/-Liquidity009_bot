@@ -1,5 +1,9 @@
 import { config } from './config.js';
-import { getOrderbook, getMarketById } from './predict.js';
+import {
+  getOrderbook, getMarketById, isNotFoundError, restLimiter,
+  clearOrderbookNotFound, orderbookNotFoundState,
+} from './predict.js';
+import { startOrderbookFeed, isWsLive, wsLatestBook, wsLastBookAgoMs, wsStatus, distrustWsMarket } from './ws.js';
 import { sendMessage, htmlEscape } from './telegram.js';
 import {
   listAllSubscriptions, removeSubscription, saveState,
@@ -34,23 +38,120 @@ const questionBackfillTried = new Set();
 // cooldown, the buffer is preferred over the (possibly reverted)
 // current snap so the user still hears about the move.
 const pendingExcursion = new Map();
-// Consecutive "orderbook not found / 404" count per marketId. When a
+// Consecutive "orderbook not found / 404" tracker per marketId, SHARED
+// by the 30s main loop, the 1s booklog loop and the WS feed. When a
 // market resolves on Predict.fun its book is deleted and every fetch
-// 404s forever; after RESOLVED_404_STREAK straight misses we auto-remove
-// (unsubscribe) all its subs so the poll loop stops hammering a dead
-// endpoint. Reset on any success or on a transient (non-404) error so a
-// network blip never trips it.
-const notFoundStreak = new Map();
+// 404s forever; once we've seen RESOLVED_404_STREAK straight misses
+// spanning at least RESOLVED_MIN_AGE_MS we auto-remove (unsubscribe)
+// all its subs so no loop keeps polling a dead endpoint. The age gate
+// is what makes the 1 Hz booklog loop safe to count — five misses in
+// five seconds is a blip, five misses over a minute is a settlement.
+// predict.js additionally negative-caches the 404 with exponential
+// backoff, so the misses counted here mostly cost zero requests.
+// Reset on any success or on a transient (non-404) error.
+const notFoundStreak = new Map(); // marketId -> { count, firstAt }
 const RESOLVED_404_STREAK = 5;
+const RESOLVED_MIN_AGE_MS = 60_000;
 
-// Distinguish a "market resolved / delisted" miss (404 not_found) from
-// a transient failure (timeout, fetch failed, 5xx). getOrderbook throws
-// e.g. "Orderbook not found for 123 (tried 4). Last: 404 <url>: {...
-// "error":"not_found"...}". Only the former should count toward the
-// auto-pause streak — we must never disable a live market over a blip.
+// Distinguish a "market resolved / delisted" miss (404 not_found,
+// including predict.js's cached-404 backoff error) from a transient
+// failure (timeout, fetch failed, 5xx, 429). Only the former counts
+// toward the auto-remove streak — we must never drop a live market
+// over a blip or a rate-limit pause.
 function isResolvedMiss(errMsg) {
-  const s = String(errMsg ?? '');
-  return /not_found/i.test(s) || /Last:\s*404\b/.test(s);
+  return isNotFoundError(errMsg);
+}
+
+// Record one failed fetch for a market. Returns true when the market
+// has just crossed the auto-remove threshold (caller unsubscribes).
+function noteFetchMiss(marketId, errMsg, now = Date.now()) {
+  if (!isResolvedMiss(errMsg)) {
+    notFoundStreak.delete(marketId);
+    return false;
+  }
+  const cur = notFoundStreak.get(marketId) ?? { count: 0, firstAt: now };
+  cur.count += 1;
+  notFoundStreak.set(marketId, cur);
+  if (cur.count >= RESOLVED_404_STREAK && now - cur.firstAt >= RESOLVED_MIN_AGE_MS) {
+    notFoundStreak.delete(marketId);
+    return true;
+  }
+  return false;
+}
+
+// Unsubscribe every sub of a market that looks settled/delisted and
+// queue the per-chat announcement. Returns true if state changed.
+function autoRemoveMarket(marketId, group, newlyRemoved) {
+  const chatIds = new Set();
+  let changed = false;
+  for (const s of group ?? []) {
+    if (removeSubscription(s.chatId, s.marketId)) {
+      chatIds.add(String(s.chatId));
+      changed = true;
+    }
+  }
+  clearOrderbookNotFound(marketId);
+  if (chatIds.size) {
+    newlyRemoved.push({
+      marketId,
+      title: group?.[0]?.title || `Market ${marketId}`,
+      chatIds,
+    });
+  }
+  return changed;
+}
+
+async function announceRemoved(newlyRemoved) {
+  if (!newlyRemoved.length) return;
+  const byChat = new Map();
+  for (const r of newlyRemoved) {
+    for (const cid of r.chatIds) {
+      if (!byChat.has(cid)) byChat.set(cid, []);
+      byChat.get(cid).push(r);
+    }
+  }
+  for (const [cid, items] of byChat) {
+    const lines = [
+      `<b>🗑 已自动删除 ${items.length} 个已结束的市场订阅</b>`,
+      `<i>这些市场在 Predict.fun 已无订单簿（连续 ${RESOLVED_404_STREAK} 次以上 404 not_found，持续超过 ${Math.round(RESOLVED_MIN_AGE_MS / 1000)} 秒），通常表示已结算 / 下架，已自动退订、不再轮询。</i>`,
+      '',
+      ...items.map((r) => `· <code>${r.marketId}</code> ${htmlEscape((r.title || '').slice(0, 50))}`),
+      '',
+      `<i>历史记录保留；若市场重新开放，重新发送网址 / id 即可再次订阅。</i>`,
+    ];
+    try {
+      await sendMessage(cid, lines.join('\n'));
+    } catch (err) {
+      console.warn('[monitor] removed-notify failed:', cid, err.message);
+    }
+  }
+}
+
+// Freshest snapshot per MARKET from any transport (REST poll in either
+// loop, or a WS push). Both loops consult this before spending a REST
+// request: the 30s main loop reuses anything younger than its own
+// interval, and any market the WebSocket feed is maintaining needs no
+// REST at all.
+const latestSnapPerMarket = new Map(); // marketId -> snap
+
+function noteMarketSnap(marketId, snap) {
+  const id = String(marketId);
+  const prev = latestSnapPerMarket.get(id);
+  if (prev && prev.fetchedAtMs > (snap.fetchedAtMs ?? 0)) return;
+  latestSnapPerMarket.set(id, snap);
+}
+
+export function getLatestSnapForMarket(marketId) {
+  return latestSnapPerMarket.get(String(marketId)) ?? null;
+}
+
+// Diagnostics for /status.
+export function transportStats() {
+  return {
+    rest: restLimiter.snapshot(),
+    ws: wsStatus(),
+    deadMarkets: [...notFoundStreak.keys()].length,
+  };
 }
 
 // Build a Predict.fun market URL, optionally with the configured
@@ -571,7 +672,20 @@ function fmtHeadline(prev, cur, levels, mode = 'both', th = null) {
 // GraphQL getMarketById round-trip entirely and only fall back to
 // it when the sub was added before we started persisting conditionId
 // (or the sub object is incomplete for any reason).
-async function fetchMarketSnap(marketId, group) {
+async function fetchMarketSnap(marketId, group, { maxAgeMs = 0, allowWs = true } = {}) {
+  const now = Date.now();
+  // WS-live market: the socket keeps the book current, no REST needed.
+  if (allowWs && isWsLive(marketId, now)) {
+    const snap = wsLatestBook(marketId) ?? latestSnapPerMarket.get(String(marketId));
+    if (snap) return { marketId, group, snap, reused: 'ws' };
+  }
+  // Another loop fetched this market a moment ago — reuse it.
+  if (maxAgeMs > 0) {
+    const snap = latestSnapPerMarket.get(String(marketId));
+    if (snap && now - (snap.fetchedAtMs ?? 0) < maxAgeMs) {
+      return { marketId, group, snap, reused: 'recent' };
+    }
+  }
   try {
     const s0 = group[0];
     let market = s0?.conditionId
@@ -583,6 +697,7 @@ async function fetchMarketSnap(marketId, group) {
       market = m;
     }
     const snap = await getOrderbook(market);
+    noteMarketSnap(marketId, snap);
     return { marketId, group, snap };
   } catch (err) {
     return { marketId, group, error: err.message };
@@ -678,42 +793,151 @@ async function recordBooklog(s, k, prevTickSnap, snap, now) {
 // markets keep a diary.
 const booklogPrevSnap = new Map(); // subKey → last snapshot the journal diffed
 const booklogErrStreak = new Map();
+// Per-market promise chain so a WS push and a REST audit for the same
+// market never interleave their diffs.
+const booklogChain = new Map(); // marketId -> Promise
+// Last REST audit per WS-live market, and gap counter for distrust.
+const wsAuditAt = new Map();    // marketId -> ts
+const wsGaps = new Map();       // marketId -> [ts, ...]
 
-async function booklogPollOnce() {
+function booklogGroups() {
   const subs = listAllSubscriptions().filter((s) => s.booklog?.enabled);
-  if (!subs.length) return false;
   const byMarket = new Map();
   for (const s of subs) {
     if (!byMarket.has(s.marketId)) byMarket.set(s.marketId, []);
     byMarket.get(s.marketId).push(s);
   }
-  const groups = [...byMarket.entries()];
+  return byMarket;
+}
+
+// Journal one fresh snapshot for every journal-enabled sub of a market.
+// Serialised per market. Returns the number of subs whose book changed.
+function journalMarketSnap(marketId, group, snap, now) {
+  const id = String(marketId);
+  const run = async () => {
+    let changed = 0;
+    try {
+      for (const s of group) {
+        const k = subKey(s.chatId, s.marketId);
+        const prev = booklogPrevSnap.get(k) ?? null;
+        // Out-of-order guards: never diff against something newer than
+        // us — by local receipt time, and by the server's own book
+        // timestamp (a REST audit answered from a moment before a WS
+        // push must not journal the change backwards).
+        if (prev && (prev.fetchedAtMs ?? 0) > (snap.fetchedAtMs ?? 0)) continue;
+        if (prev && prev.updatedAtMs > 0 && snap.updatedAtMs > 0 && prev.updatedAtMs > snap.updatedAtMs) continue;
+        booklogPrevSnap.set(k, snap);
+        // Share the freshest book with digests / stale — strictly fresher
+        // than what the slow loop has.
+        latestSnapPerSub.set(k, snap);
+        if (!prev) continue;
+        if (diffBookOrders(prev, snap, s.booklog?.minSize ?? 10).length) changed += 1;
+        await recordBooklog(s, k, prev, snap, now);
+      }
+    } catch (err) {
+      console.warn('[booklog] journal failed:', id, err.message);
+    }
+    return changed;
+  };
+  const chain = (booklogChain.get(id) ?? Promise.resolve()).then(run, run);
+  booklogChain.set(id, chain);
+  chain.then(() => { if (booklogChain.get(id) === chain) booklogChain.delete(id); }, () => {});
+  return chain;
+}
+
+// WS push handler: journal immediately (sub-second), share the book
+// with everyone, and clear any 404 backoff — a live feed proves the
+// market exists.
+function onWsBook(marketId, snap) {
+  noteMarketSnap(marketId, snap);
+  notFoundStreak.delete(String(marketId));
+  if (orderbookNotFoundState(marketId)) clearOrderbookNotFound(marketId);
+  const group = booklogGroups().get(String(marketId));
+  if (!group?.length) return;
+  journalMarketSnap(marketId, group, snap, Date.now()).catch((err) => {
+    console.warn('[ws] journal failed:', marketId, err.message);
+  });
+}
+
+// Every subscribed market gets a WS topic — journaled ones for the
+// diary, plain ones so the 30s alert loop can skip their REST fetch.
+function wantedWsMarketIds() {
+  const ids = new Set();
+  for (const s of listAllSubscriptions()) ids.add(String(s.marketId));
+  return ids;
+}
+
+export async function startWsFeed({ signal }) {
+  await startOrderbookFeed({ signal, getWantedMarketIds: wantedWsMarketIds, onBook: onWsBook });
+}
+
+async function booklogPollOnce() {
+  const byMarket = booklogGroups();
+  if (!byMarket.size) return false;
+  const now = Date.now();
+  const groups = [];
+  const audits = new Set();
+  for (const [marketId, group] of byMarket) {
+    if (isWsLive(marketId, now)) {
+      // Feed is maintaining this book. Only spend a REST call on the
+      // slow audit cadence; otherwise nothing to do this tick.
+      const auditMs = config.wsAuditIntervalMs;
+      if (auditMs > 0 && now - (wsAuditAt.get(marketId) ?? 0) >= auditMs) {
+        wsAuditAt.set(marketId, now);
+        audits.add(marketId);
+        groups.push([marketId, group]);
+      }
+      continue;
+    }
+    groups.push([marketId, group]);
+  }
+  if (!groups.length) return true;
   const fetched = await runWithConcurrency(
     groups,
     config.pollConcurrency,
-    ([marketId, group]) => fetchMarketSnap(marketId, group),
+    ([marketId, group]) => fetchMarketSnap(marketId, group, { allowWs: false }),
   );
-  const now = Date.now();
+  const newlyRemoved = [];
+  let needsSave = false;
   for (const r of fetched) {
     if (r.error) {
       // At 1s cadence a dead market would flood the log — warn on the
-      // first miss and then every 30th.
+      // first miss and then every 30th. (With the 404 backoff in
+      // predict.js most of these misses are cached and cost nothing.)
       const n = (booklogErrStreak.get(r.marketId) ?? 0) + 1;
       booklogErrStreak.set(r.marketId, n);
       if (n === 1 || n % 30 === 0) {
         console.warn(new Date().toISOString(), `[booklog] ${r.marketId} fetch failed (×${n}):`, r.error);
       }
+      if (noteFetchMiss(r.marketId, r.error, now)) {
+        if (autoRemoveMarket(r.marketId, r.group, newlyRemoved)) needsSave = true;
+      }
       continue;
     }
     booklogErrStreak.delete(r.marketId);
-    for (const s of r.group) {
-      const k = subKey(s.chatId, s.marketId);
-      const prev = booklogPrevSnap.get(k) ?? null;
-      booklogPrevSnap.set(k, r.snap);
-      // Share the freshest book with digests//stale — strictly fresher
-      // than what the slow loop has.
-      latestSnapPerSub.set(k, r.snap);
-      if (prev) await recordBooklog(s, k, prev, r.snap, now);
+    notFoundStreak.delete(r.marketId);
+    const changed = await journalMarketSnap(r.marketId, r.group, r.snap, now);
+    // A change the audit saw but the feed didn't push counts as a gap —
+    // unless the feed pushed within the last 2s, in which case this is
+    // just the REST/WS race on an active book, not a silent feed.
+    if (audits.has(r.marketId) && changed && wsLastBookAgoMs(r.marketId, now) > 2_000) {
+      // The feed missed something. Three gaps inside 10 min → distrust
+      // the WS for this market and fall back to full-speed polling.
+      const arr = (wsGaps.get(r.marketId) ?? []).filter((t) => now - t < 600_000);
+      arr.push(now);
+      wsGaps.set(r.marketId, arr);
+      console.warn(`[ws] audit found a change the feed missed for ${r.marketId} (${arr.length}/3)`);
+      if (arr.length >= 3) {
+        distrustWsMarket(r.marketId, config.wsDistrustMs);
+        wsGaps.delete(r.marketId);
+        console.warn(`[ws] ${r.marketId} → REST polling for ${Math.round(config.wsDistrustMs / 1000)}s`);
+      }
+    }
+  }
+  if (newlyRemoved.length) await announceRemoved(newlyRemoved);
+  if (needsSave) {
+    try { await saveState(); } catch (err) {
+      console.warn('[booklog] saveState failed:', err.message);
     }
   }
   return true;
@@ -735,10 +959,12 @@ export async function startBooklogLoop({ signal }) {
     const elapsed = Date.now() - t0;
     // No journal-enabled subs → idle at ≥5s so the empty check stays
     // cheap; otherwise honour the configured cadence with the same
-    // hard floor as the main loop.
-    const wait = active
+    // hard floor as the main loop. If the REST bucket is paused (429)
+    // there's no point waking up before it reopens.
+    let wait = active
       ? Math.max(config.pollMinIntervalMs, interval - elapsed)
       : Math.max(5000, interval);
+    wait = Math.max(wait, restLimiter.blockedForMs());
     await new Promise((r) => setTimeout(r, wait));
   }
   _booklogRunning = false;
@@ -756,10 +982,12 @@ async function pollOnce() {
   // Fetch every market in parallel (bounded). With 1 sub the wall-clock
   // is one HTTP call; with N subs it's max(L), not N×L.
   const groups = [...byMarket.entries()];
+  // Reuse anything fetched (by the booklog loop) or pushed (by the WS
+  // feed) within our own interval instead of spending a REST call.
   const fetched = await runWithConcurrency(
     groups,
     config.pollConcurrency,
-    ([marketId, group]) => fetchMarketSnap(marketId, group),
+    ([marketId, group]) => fetchMarketSnap(marketId, group, { maxAgeMs: config.pollIntervalMs }),
   );
   // Process notifications serially per market so we don't fire
   // multiple Telegram sends in the same tick (rate-limit friendly).
@@ -771,35 +999,11 @@ async function pollOnce() {
   for (const result of fetched) {
     if (result.error) {
       console.warn(new Date().toISOString(), `[monitor] ${result.marketId} fetch failed:`, result.error);
-      if (isResolvedMiss(result.error)) {
-        const streak = (notFoundStreak.get(result.marketId) ?? 0) + 1;
-        if (streak >= RESOLVED_404_STREAK) {
-          // Looks settled/delisted — auto-unsubscribe every sub for this
-          // market so we stop polling a dead endpoint. History records
-          // in history.jsonl are append-only and stay intact.
-          notFoundStreak.delete(result.marketId);
-          const group = result.group ?? [];
-          const chatIds = new Set();
-          for (const s of group) {
-            if (removeSubscription(s.chatId, s.marketId)) {
-              chatIds.add(String(s.chatId));
-              needsSave = true;
-            }
-          }
-          if (chatIds.size) {
-            newlyRemoved.push({
-              marketId: result.marketId,
-              title: group[0]?.title || `Market ${result.marketId}`,
-              chatIds,
-            });
-          }
-        } else {
-          notFoundStreak.set(result.marketId, streak);
-        }
-      } else {
-        // Transient error (timeout / 5xx / network) — don't let it
-        // accumulate toward an auto-removal.
-        notFoundStreak.delete(result.marketId);
+      if (noteFetchMiss(result.marketId, result.error, now)) {
+        // Looks settled/delisted — auto-unsubscribe every sub for this
+        // market so we stop polling a dead endpoint. History records
+        // in history.jsonl are append-only and stay intact.
+        if (autoRemoveMarket(result.marketId, result.group, newlyRemoved)) needsSave = true;
       }
       continue;
     }
@@ -1029,30 +1233,7 @@ async function pollOnce() {
   }
   // Tell each affected chat which markets we just auto-removed. One
   // message per chat even if several markets resolved in the same tick.
-  if (newlyRemoved.length) {
-    const byChat = new Map();
-    for (const r of newlyRemoved) {
-      for (const cid of r.chatIds) {
-        if (!byChat.has(cid)) byChat.set(cid, []);
-        byChat.get(cid).push(r);
-      }
-    }
-    for (const [cid, items] of byChat) {
-      const lines = [
-        `<b>🗑 已自动删除 ${items.length} 个已结束的市场订阅</b>`,
-        `<i>这些市场在 Predict.fun 已无订单簿（连续 ${RESOLVED_404_STREAK} 次 404 not_found），通常表示已结算 / 下架，已自动退订、不再轮询。</i>`,
-        '',
-        ...items.map((r) => `· <code>${r.marketId}</code> ${htmlEscape((r.title || '').slice(0, 50))}`),
-        '',
-        `<i>历史记录保留；若市场重新开放，重新发送网址 / id 即可再次订阅。</i>`,
-      ];
-      try {
-        await sendMessage(cid, lines.join('\n'));
-      } catch (err) {
-        console.warn('[monitor] removed-notify failed:', cid, err.message);
-      }
-    }
-  }
+  await announceRemoved(newlyRemoved);
   // Digests: per-chat periodic summary. Runs after the change-alert
   // loop so it uses the freshest lastBookPerSub snapshots.
   try {
@@ -1356,7 +1537,8 @@ export async function startMonitorLoop({ signal }) {
       console.error(new Date().toISOString(), '[monitor] tick error:', err.message);
     }
     const elapsed = Date.now() - t0;
-    const wait = Math.max(config.pollMinIntervalMs, config.pollIntervalMs - elapsed);
+    let wait = Math.max(config.pollMinIntervalMs, config.pollIntervalMs - elapsed);
+    wait = Math.max(wait, restLimiter.blockedForMs());
     await new Promise((r) => setTimeout(r, wait));
   }
   _running = false;

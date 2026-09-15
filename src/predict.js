@@ -1,5 +1,14 @@
 import { config } from './config.js';
 import { fetchJson } from './http.js';
+import { createRateLimiter } from './ratelimit.js';
+
+// One token bucket for every REST call this process makes (orderbook
+// polls, /markets scans, speedtest). GraphQL is a different host with
+// its own limits and stays ungoverned.
+export const restLimiter = createRateLimiter({
+  perMinute: config.restRateLimitPerMin,
+  burst: config.restRateLimitBurst,
+});
 
 function restHeaders() {
   const h = { Accept: 'application/json' };
@@ -459,6 +468,7 @@ export async function getSlugMapCached() {
           headers: restHeaders(),
           timeoutMs: config.orderbookTimeoutMs,
           retries: 1,
+          limiter: restLimiter,
         });
         const data = json?.data ?? json;
         arr = Array.isArray(data) ? data : (data?.markets ?? data?.items ?? data?.nodes ?? []);
@@ -580,20 +590,56 @@ export async function fuzzySlugSuggestions(slug, limit = 8) {
 
 const ORDERBOOK_DEPTH = 3;
 const ID_FIELDS = ['conditionId', 'id'];
-const FALLBACK_TEMPLATES = ['/markets/{key}/orderbook', '/orderbook/{key}'];
+
+// Accept both REST rows ([price, size]) and WS levels ({price, size}).
+function levelOf(r) {
+  if (r == null) return null;
+  let price;
+  let size;
+  if (Array.isArray(r)) { price = Number(r[0]); size = Number(r[1]); }
+  else if (typeof r === 'object') {
+    price = Number(r.price ?? r.p);
+    size = Number(r.size ?? r.quantity ?? r.amount ?? r.s ?? r.q);
+  } else return null;
+  if (!Number.isFinite(price) || !Number.isFinite(size)) return null;
+  return { price, size };
+}
 
 function topNOfBook(rows, n = ORDERBOOK_DEPTH) {
   const out = [];
   if (!Array.isArray(rows)) return out;
   for (let i = 0; i < n && i < rows.length; i++) {
-    const r = rows[i];
-    if (!r) continue;
-    const price = Number(r[0]);
-    const size = Number(r[1]);
-    if (!Number.isFinite(price) || !Number.isFinite(size)) continue;
-    out.push({ price, size });
+    const l = levelOf(rows[i]);
+    if (l) out.push(l);
   }
   return out;
+}
+
+// Build the snapshot shape every consumer (monitor, booklog, index)
+// works with. Shared by the REST fetcher and the WebSocket feed so a
+// book is a book regardless of transport.
+//   source: 'rest' | 'ws'   fetchedAtMs: local receipt time (freshness)
+export function normalizeBook(marketId, data, { source = 'rest', sort = false } = {}) {
+  let bids = Array.isArray(data?.bids) ? data.bids : [];
+  let asks = Array.isArray(data?.asks) ? data.asks : [];
+  if (sort) {
+    // WS payloads aren't guaranteed to be ordered; REST rows are.
+    bids = bids.map(levelOf).filter((l) => l && l.size > 0).sort((a, b) => b.price - a.price);
+    asks = asks.map(levelOf).filter((l) => l && l.size > 0).sort((a, b) => a.price - b.price);
+  }
+  const b = topNOfBook(bids);
+  const a = topNOfBook(asks);
+  const ts = Number(data?.updateTimestampMs ?? data?.timestamp ?? data?.updatedAt);
+  return {
+    marketId: String(marketId),
+    updatedAtMs: Number.isFinite(ts) && ts > 0 ? ts : Date.now(),
+    fetchedAtMs: Date.now(),
+    source,
+    bids: b,
+    asks: a,
+    bestBid: b[0] ?? null,
+    bestAsk: a[0] ?? null,
+  };
 }
 
 function buildUrl(template, key) {
@@ -608,32 +654,86 @@ async function tryFetch(template, key) {
       headers: restHeaders(),
       timeoutMs: config.orderbookTimeoutMs,
       retries: 1,
+      limiter: restLimiter,
     });
     return { ok: true, url, json };
   } catch (err) {
-    return { ok: false, url, status: err.status, msg: err.message };
+    return { ok: false, url, status: err.status, msg: err.message, retryAfterMs: err.retryAfterMs };
   }
 }
 
-// Self-healing orderbook fetcher. Tries the configured (path, key) first,
-// then fallback templates / id fields drawn from the market record. Caches
-// the working combination per market so subsequent ticks go straight to
-// the right URL.
+function isNotFoundResult(r) {
+  return r.status === 404 || /not_found/i.test(String(r.msg ?? ''));
+}
+
+export function isNotFoundError(err) {
+  if (err?.code === 'not_found') return true;
+  const s = String(err?.message ?? err ?? '');
+  return /not_found/i.test(s) || /Last:\s*404\b/.test(s) || /cached 404/.test(s);
+}
+
+// Working (template, key) per market so steady-state polls go straight
+// to the right URL. Only the configured template is ever tried — the
+// old `/orderbook/{key}` guesses hit routes that don't exist on
+// api.predict.fun (they showed up as 100%-error "unknown" endpoints in
+// the API dashboard) and cost 2 wasted requests per dead market per
+// tick.
 const _obCache = new Map(); // marketId -> { template, key }
+
+// Negative cache. When every attempt for a market 404s (settled /
+// delisted, or a stale conditionId) we back off exponentially instead
+// of re-probing every tick: 1s, 2s, 4s … up to ORDERBOOK_404_BACKOFF_MAX_MS.
+// While backed off getOrderbook throws synchronously (no network) with a
+// message monitor.js still recognises as a "resolved miss", so the
+// auto-unsubscribe streak keeps advancing.
+const _notFound = new Map(); // marketId -> { misses, nextRetryAt, lastErr }
+
+export function orderbookNotFoundState(marketId) {
+  return _notFound.get(String(marketId)) ?? null;
+}
+
+export function clearOrderbookNotFound(marketId) {
+  _notFound.delete(String(marketId));
+}
+
+function markNotFound(ctxId, lastErr) {
+  const prev = _notFound.get(ctxId);
+  const misses = (prev?.misses ?? 0) + 1;
+  const cap = Math.max(1000, config.orderbookNotFoundBackoffMaxMs);
+  const backoff = Math.min(cap, 1000 * Math.pow(2, Math.min(misses - 1, 20)));
+  const entry = { misses, nextRetryAt: Date.now() + backoff, lastErr };
+  _notFound.set(ctxId, entry);
+  return entry;
+}
+
+function notFoundError(ctxId, entry, tried, cached) {
+  const waitS = Math.max(0, Math.ceil((entry.nextRetryAt - Date.now()) / 1000));
+  const err = new Error(
+    cached
+      ? `Orderbook not found for ${ctxId} (cached 404 ×${entry.misses}, retry in ${waitS}s). Last: ${entry.lastErr}`
+      : `Orderbook not found for ${ctxId} (tried ${tried}, miss ×${entry.misses}, backoff ${waitS}s). Last: ${entry.lastErr}`,
+  );
+  err.code = 'not_found';
+  err.cached = !!cached;
+  err.misses = entry.misses;
+  return err;
+}
 
 export async function getOrderbook(market) {
   const ctxId = String(market.id);
+  const dead = _notFound.get(ctxId);
+  if (dead && Date.now() < dead.nextRetryAt) {
+    throw notFoundError(ctxId, dead, 0, true);
+  }
   const preferredKey = market[config.orderbookKeyField] ?? market.conditionId ?? market.id;
   const attempts = [];
   const cached = _obCache.get(ctxId);
   if (cached) attempts.push(cached);
   attempts.push({ template: config.orderbookPathTemplate, key: String(preferredKey) });
-  for (const tpl of [config.orderbookPathTemplate, ...FALLBACK_TEMPLATES]) {
-    for (const f of ID_FIELDS) {
-      const v = market[f];
-      if (v == null || v === '') continue;
-      attempts.push({ template: tpl, key: String(v) });
-    }
+  for (const f of ID_FIELDS) {
+    const v = market[f];
+    if (v == null || v === '') continue;
+    attempts.push({ template: config.orderbookPathTemplate, key: String(v) });
   }
   const seen = new Set();
   const dedup = attempts.filter((a) => {
@@ -643,23 +743,32 @@ export async function getOrderbook(market) {
     return true;
   });
   let lastErr = null;
+  let allNotFound = true;
   for (const a of dedup) {
     const r = await tryFetch(a.template, a.key);
     if (r.ok) {
       _obCache.set(ctxId, { template: a.template, key: a.key });
+      _notFound.delete(ctxId);
       const data = r.json?.data ?? r.json;
-      const bids = topNOfBook(data?.bids);
-      const asks = topNOfBook(data?.asks);
-      return {
-        marketId: ctxId,
-        updatedAtMs: Number(data?.updateTimestampMs ?? Date.now()),
-        bids,
-        asks,
-        bestBid: bids[0] ?? null,
-        bestAsk: asks[0] ?? null,
-      };
+      return normalizeBook(ctxId, data, { source: 'rest' });
     }
     lastErr = `${r.status ?? '?'} ${r.url}: ${(r.msg ?? '').slice(0, 120)}`;
+    // Rate limited: the bucket is empty for *every* URL, so probing
+    // the alternate key would only burn more quota. Bail out now; the
+    // limiter has already been paused for Retry-After by fetchJson.
+    if (r.status === 429) {
+      const err = new Error(`Orderbook rate limited for ${ctxId} (429, retry after ${r.retryAfterMs ?? '?'}ms): ${r.url}`);
+      err.status = 429;
+      err.retryAfterMs = r.retryAfterMs;
+      throw err;
+    }
+    if (!isNotFoundResult(r)) allNotFound = false;
   }
-  throw new Error(`Orderbook not found for ${ctxId} (tried ${dedup.length}). Last: ${lastErr}`);
+  if (allNotFound && dedup.length) {
+    const entry = markNotFound(ctxId, lastErr);
+    throw notFoundError(ctxId, entry, dedup.length, false);
+  }
+  // Transient (timeout / 5xx / network) — don't poison the negative
+  // cache; the caller's streak logic treats this as a blip.
+  throw new Error(`Orderbook fetch failed for ${ctxId} (tried ${dedup.length}). Last: ${lastErr}`);
 }
