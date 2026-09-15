@@ -5,7 +5,7 @@
   "description": "Telegram bot — paste a Predict.fun URL, pick a market card, watch the orderbook change in real time.",
   "type": "module",
   "engines": {
-    "node": ">=20.6.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "start": "node src/index.js",
