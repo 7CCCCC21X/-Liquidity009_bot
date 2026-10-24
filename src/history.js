@@ -68,6 +68,24 @@ export async function appendEvent(evt) {
   return _appendQueue.catch(() => {});
 }
 
+// Cheap pre-filters applied to the raw line BEFORE JSON.parse. Every
+// line in the file was written by appendEvent → JSON.stringify, so a
+// record with type:'book' always contains the exact substring
+// `"type":"book"`, and a record whose chatId/marketId equals X always
+// contains the digits of X somewhere. These are necessary conditions
+// only (a false positive just means we parse and then reject as
+// before), but they let the readers skip the bulk of the file —
+// journal lines are written at 1 Hz per market and dominate it —
+// without paying for a parse per line.
+const BOOK_MARKER = '"type":"book"';
+const DIGEST_MARKER = '"type":"digest"';
+
+function mayMatchIds(line, chatId, marketId) {
+  if (chatId != null && !line.includes(String(chatId))) return false;
+  if (marketId != null && !line.includes(String(marketId))) return false;
+  return true;
+}
+
 // Same backwards scan as readEvents, but filters to type='digest'.
 // Used by /digestlog so the user can replay summaries they missed
 // (overnight, while travelling, etc.). Returns newest-first.
@@ -80,6 +98,7 @@ export async function readDigests({ chatId, limit = 10, sinceMs = 0 } = {}) {
   // big the file is. Returns newest-first to preserve the old contract.
   const window = [];
   await streamLines(config.historyFile, (line) => {
+    if (!line.includes(DIGEST_MARKER) || !mayMatchIds(line, chatId, null)) return;
     let evt;
     try { evt = JSON.parse(line); } catch { return; }
     if (evt.type !== 'digest') return;
@@ -103,14 +122,17 @@ export async function readEvents({ chatId, marketId, limit = 50, sinceMs = 0, ty
   // cutoff before they ever enter the window — used by /movers to scan a
   // bounded time slice instead of a fixed count.
   const window = [];
+  const skipBook = types !== 'all';
   await streamLines(config.historyFile, (line) => {
+    if (skipBook && line.includes(BOOK_MARKER)) return;
+    if (!mayMatchIds(line, chatId, marketId)) return;
     let evt;
     try { evt = JSON.parse(line); } catch { return; }
     // 'book' journal lines (挂撤单日记) are high-volume and have their
     // own reader (readBookEvents); keep them out of the generic view
     // (/history /stats /movers) unless the caller asks for everything
     // via types='all' (used by /export).
-    if (types !== 'all' && evt.type === 'book') return;
+    if (skipBook && evt.type === 'book') return;
     if (chatId != null && String(evt.chatId) !== String(chatId)) return;
     if (marketId != null && String(evt.marketId) !== String(marketId)) return;
     if (sinceMs && evt.ts < sinceMs) return; // older than the window
@@ -128,6 +150,7 @@ export async function readBookEvents({ chatId, marketId, limit = 50, sinceMs = 0
   if (!config.historyEnabled) return [];
   const window = [];
   await streamLines(config.historyFile, (line) => {
+    if (!line.includes(BOOK_MARKER) || !mayMatchIds(line, chatId, marketId)) return;
     let evt;
     try { evt = JSON.parse(line); } catch { return; }
     if (evt.type !== 'book') return;

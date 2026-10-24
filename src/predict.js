@@ -503,6 +503,33 @@ export async function getSlugMapCached() {
 // Resolve a slug to ALL matching markets — single-market URLs return one
 // hit, event-level URLs (multiple sub-markets share question / categorySlug)
 // return many. Each match: { id, conditionId, title, question, slug }.
+// Per-market slug forms, computed lazily and cached on the market
+// record itself (records live as long as the 10-min market-list cache).
+// slugify() is normalize()+4 regex passes; without this cache every URL
+// resolution ran it 4× per market across the whole list, and the fuzzy
+// fallback another 2×. Keyed on the UTC year because slugifyWithYear
+// injects the current year.
+const SLUG_CACHE = Symbol('slugForms');
+
+function slugForms(m) {
+  const year = new Date().getUTCFullYear();
+  const hit = m[SLUG_CACHE];
+  if (hit && hit.year === year) return hit;
+  const cs = m.categorySlug ?? m.slug ?? m.marketSlug;
+  const forms = {
+    year,
+    title: slugify(m.title ?? ''),
+    question: slugify(m.question ?? ''),
+    titleYear: slugifyWithYear(m.title ?? ''),
+    questionYear: slugifyWithYear(m.question ?? ''),
+    category: cs ? String(cs).toLowerCase() : '',
+  };
+  try {
+    Object.defineProperty(m, SLUG_CACHE, { value: forms, enumerable: false, configurable: true });
+  } catch { /* frozen record — recompute next time */ }
+  return forms;
+}
+
 export async function resolveSlugToMarkets(slug) {
   if (!slug) return [];
   const all = await getAllMarketsCached();
@@ -520,40 +547,37 @@ export async function resolveSlugToMarkets(slug) {
       slug: slugOverride ?? m.categorySlug ?? m.slug ?? m.marketSlug ?? null,
     });
   };
-  // Tier 1: exact title-slug match (single-market URLs).
+  // One pass over the list, bucketed by tier so the result order is
+  // identical to the old five sequential scans:
+  //   1. exact title-slug (single-market URLs)
+  //   2. question slug (event URLs whose subs share question text)
+  //   3. year-augmented title — Predict.fun URLs often carry the year
+  //      ("...-2026") that the API title omits
+  //   4. year-augmented question
+  //   5. GraphQL-exposed categorySlug
+  const tiers = [[], [], [], [], []];
   for (const m of all) {
-    if (slugify(m.title ?? '') === slug) add(m);
+    const f = slugForms(m);
+    if (f.title === slug) tiers[0].push(m);
+    if (f.question === slug) tiers[1].push(m);
+    if (f.titleYear === slug) tiers[2].push(m);
+    if (f.questionYear === slug) tiers[3].push(m);
+    if (f.category && f.category === slug) tiers[4].push(m);
   }
-  // Tier 2: question slug (event-level URLs whose subs share question text).
-  for (const m of all) {
-    if (slugify(m.question ?? '') === slug) add(m);
-  }
-  // Tier 3: year-augmented variants — Predict.fun URLs often have the
-  // year ("...-2026") that the API title omits.
-  for (const m of all) {
-    if (slugifyWithYear(m.title ?? '') === slug) add(m);
-  }
-  for (const m of all) {
-    if (slugifyWithYear(m.question ?? '') === slug) add(m);
-  }
-  // Tier 4: GraphQL-exposed categorySlug.
-  for (const m of all) {
-    const cs = m.categorySlug ?? m.slug ?? m.marketSlug;
-    if (cs && String(cs).toLowerCase() === slug) add(m);
-  }
-  // Tier 5: REST slug map (authoritative — has categorySlug for every
+  for (const tier of tiers) for (const m of tier) add(m);
+  // Tier 6: REST slug map (authoritative — has categorySlug for every
   // market regardless of whether GraphQL exposes it). Only consult if
   // the GraphQL pass came up empty, since REST scan is a separate
   // network round-trip.
   if (matches.length === 0) {
     try {
       const slugMap = await getSlugMapCached();
+      const byId = _cache.byId ?? new Map(all.map((x) => [String(x.id), x]));
       for (const [id, entry] of slugMap.entries()) {
         if (entry.slug !== slug) continue;
         // Prefer the GraphQL record (it has rewardTimings etc) but fall
         // back to the REST one so we still return something.
-        const graphM = all.find((x) => String(x.id) === id);
-        add(graphM ?? entry.market, entry.slug);
+        add(byId.get(id) ?? entry.market, entry.slug);
       }
     } catch {
       // best-effort
@@ -573,7 +597,8 @@ export async function fuzzySlugSuggestions(slug, limit = 8) {
   const minScore = Math.max(1, Math.ceil(tokens.length / 2));
   const scored = [];
   for (const m of all) {
-    const hay = `${slugify(m.title ?? '')} ${slugify(m.question ?? '')} ${m.categorySlug ?? ''}`;
+    const f = slugForms(m);
+    const hay = `${f.title} ${f.question} ${m.categorySlug ?? ''}`;
     let score = 0;
     for (const t of tokens) if (hay.includes(t)) score += 1;
     if (score >= minScore) scored.push({ m, score });
