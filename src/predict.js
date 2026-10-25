@@ -427,17 +427,53 @@ export async function getAllMarketsCached() {
   return _cache.inFlight;
 }
 
+// Single-market records fetched via `market(id:)`, keyed by id. Lives
+// as long as the market-list cache so the two subscribe-path lookups
+// (handleMarketIdInput → sendSubscribed) and the poll-loop question
+// backfill share one request per market.
+const _byIdDirect = new Map(); // id -> { at, market }
+
+// Look a market up by id. Order of attempts:
+//   1. the full-list cache, but only if it is already warm — never
+//      trigger the (dozens-of-requests) list fetch just for one id;
+//   2. the per-id direct cache;
+//   3. one `market(id:)` GraphQL query. A record flagged isResolved is
+//      reported as not found, mirroring the `isResolved: false` filter
+//      the list path applies, so a settled market still can't be
+//      subscribed only to 404 on its first poll;
+//   4. the full list, only when the direct query itself fails (schema
+//      without `market(id:)`, transient error) — the old behaviour.
 export async function getMarketById(id) {
-  await getAllMarketsCached();
-  const hit = _cache.byId?.get(String(id));
-  if (hit) return hit;
-  const { selection } = await getMarketSelection();
-  const data = await postGraphQL(
-    `query GetMarket($id: ID!) { market(id: $id) { ${selection} } }`,
-    { id: String(id) },
-    'GetMarket',
-  );
-  return data?.market ?? null;
+  const key = String(id);
+  const now = Date.now();
+  if (_cache.byId && now - _cache.at < config.marketsCacheTtlMs) {
+    const hit = _cache.byId.get(key);
+    if (hit) return hit;
+  }
+  const direct = _byIdDirect.get(key);
+  if (direct && now - direct.at < config.marketsCacheTtlMs) return direct.market;
+  let directErr = null;
+  try {
+    const { selection } = await getMarketSelection();
+    const data = await postGraphQL(
+      `query GetMarket($id: ID!) { market(id: $id) { ${selection} } }`,
+      { id: key },
+      'GetMarket',
+    );
+    const m = data?.market ?? null;
+    if (m && m.isResolved === true) return null;
+    if (m) _byIdDirect.set(key, { at: Date.now(), market: m });
+    return m;
+  } catch (err) {
+    directErr = err;
+  }
+  // Direct lookup unavailable — fall back to scanning the full list.
+  try {
+    await getAllMarketsCached();
+  } catch {
+    throw directErr;
+  }
+  return _cache.byId?.get(key) ?? null;
 }
 
 // REST `/v1/markets` exposes `categorySlug` (the actual URL slug) on
