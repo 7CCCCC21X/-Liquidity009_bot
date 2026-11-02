@@ -12,7 +12,7 @@ import { htmlEscape } from './telegram.js';
 import {
   extractSlugFromUrl, isAllowedPredictHost, extractMarketsFromHtml,
   resolveUrlToMarkets, fuzzySlugSuggestions, getAllMarketsCached, restLimiter,
-  getMarketsByCategorySlugRest,
+  getMarketsByCategorySlugRest, restMarketListInfo,
 } from './predict.js';
 
 const STEP_TIMEOUT_MS = 15_000;
@@ -194,8 +194,14 @@ export async function runDiagnose(input) {
     try {
       const all = await getAllMarketsCached();
       facts.cachedCount = all.length;
-      line(all.length > 0, '8. 机器人缓存的市场列表', Date.now() - t0,
-        `${all.length} 个市场${all.length ? '' : ' — 列表为空，slug 匹配和「相似市场」都不可能命中'}`);
+      const info = restMarketListInfo();
+      let src = '';
+      if (info) {
+        const probes = info.probes.map((p) => `${p.name}: ${p.error ?? (p.ok ? `✓ ${p.markets} 个` : `✗ ${p.rows ?? 0} 条/已结算 ${p.resolved ?? 0}`)}`).join(' · ');
+        src = `\n来源 ${info.source} · ${info.pages} 页 · ${info.ms}ms${info.truncated ? ' · ⚠️ 达到上限被截断' : ''}${info.error ? ` · 出错 ${clip(info.error, 80)}` : ''}\n探测 ${probes || '（无）'}`;
+      }
+      line(all.length > 0 && !info?.truncated, '8. 机器人缓存的市场列表', Date.now() - t0,
+        `${all.length} 个未结算市场${all.length ? '' : ' — 列表为空，slug 匹配和「相似市场」都不可能命中'}${src}`);
     } catch (err) {
       facts.cachedCount = 0;
       line(false, '8. 机器人缓存的市场列表', Date.now() - t0, clip(err.message, 200));

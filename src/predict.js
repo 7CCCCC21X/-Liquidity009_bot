@@ -585,67 +585,160 @@ export async function getMarketById(id) {
   return _cache.byId?.get(key) ?? null;
 }
 
-// REST `/v1/markets` exposes `categorySlug` (the actual URL slug) on
-// every market, while GraphQL doesn't reliably surface it. Cache an
-// id → categorySlug map so resolveSlugToMarkets has an authoritative
-// fallback when GraphQL title/question slugify produces a different
-// string than the URL.
-let _slugCache = { at: 0, byId: null, inFlight: null };
+// ── REST market list (active markets only) ──────────────────────────
+// With GraphQL blocked, the bot's market list (fuzzy "相似市场", id
+// lookups, slug matching) comes from REST. Walking /v1/markets from the
+// start reads Predict.fun's whole history oldest-first — thousands of
+// settled markets, mostly hourly crypto up/down — and hit the 100-page
+// cap after ~12s with only ~74 live markets in hand.
+//
+// So ask the server for active markets only. The exact filter values
+// aren't verifiable from here, so candidates are probed in order and
+// the first one whose FIRST PAGE proves the filter works (non-empty,
+// no resolved records) is used to paginate:
+//   1. /categories?status=OPEN — official, and every category carries
+//      its markets plus its URL slug, which we stamp onto each market
+//   2. /markets?status=OPEN, ?tradingStatus=OPEN, ?status=REGISTERED
+//   3. unfiltered /markets scan (the old behaviour), filtered locally
+// The chosen source and every probe outcome are kept for /diagnose.
+
+const REST_PAGE = 100;
+const REST_MAX_PAGES = 100;
+const REST_SCAN_BUDGET_MS = 30_000;
+
+const REST_SOURCES = [
+  { name: 'categories?status=OPEN', path: '/categories', params: { status: 'OPEN' }, kind: 'categories' },
+  { name: 'markets?status=OPEN', path: '/markets', params: { status: 'OPEN' }, kind: 'markets' },
+  { name: 'markets?tradingStatus=OPEN', path: '/markets', params: { tradingStatus: 'OPEN' }, kind: 'markets' },
+  { name: 'markets?status=REGISTERED', path: '/markets', params: { status: 'REGISTERED' }, kind: 'markets' },
+];
+const REST_FALLBACK = { name: 'markets（不筛选，全量扫描）', path: '/markets', params: {}, kind: 'markets' };
+
+let _restListInfo = null; // { source, pages, total, ms, truncated, probes: [...] }
+export function restMarketListInfo() { return _restListInfo; }
 
 function pickRestSlug(m) {
   return m?.categorySlug || m?.slug || m?.marketSlug || m?.category_slug || null;
 }
+
+async function restPage(src, after) {
+  const params = new URLSearchParams({ first: String(REST_PAGE), ...src.params });
+  if (after != null) params.set('after', String(after));
+  const json = await fetchJson(`${config.restUrl}${src.path}?${params.toString()}`, {
+    headers: restHeaders(),
+    timeoutMs: config.orderbookTimeoutMs,
+    retries: 1,
+    limiter: restLimiter,
+  });
+  const data = json?.data ?? json;
+  const rows = Array.isArray(data) ? data : (data?.markets ?? data?.categories ?? data?.items ?? data?.nodes ?? []);
+  const cursor = json?.cursor ?? data?.cursor ?? json?.pageInfo?.endCursor ?? null;
+  // A response that carries a cursor field at all (even null = last page)
+  // is cursor-paginated; only servers without one get last-id paging.
+  const cursorPaged = (json && typeof json === 'object' && 'cursor' in json)
+    || (data && typeof data === 'object' && !Array.isArray(data) && 'cursor' in data)
+    || !!json?.pageInfo;
+  // Flatten to market records. Category rows lend their slug/title to
+  // markets that don't carry their own.
+  const markets = [];
+  let resolvedParents = 0;
+  if (src.kind === 'categories') {
+    for (const c of rows) {
+      if (isResolvedRecord(c)) resolvedParents += 1;
+      for (const m of Array.isArray(c?.markets) ? c.markets : []) {
+        markets.push({
+          ...m,
+          categorySlug: pickRestSlug(m) ?? c?.slug ?? null,
+          question: m?.question ?? c?.title ?? null,
+        });
+      }
+    }
+  } else {
+    markets.push(...rows);
+  }
+  return { rows, markets, cursor, cursorPaged, resolvedParents };
+}
+
+// A filter "works" when its first page is non-empty and contains nothing
+// resolved. Rejected filters (400 for an unknown value) or ignored ones
+// (oldest-first history full of resolved records) fail this check.
+async function probeSource(src) {
+  const t0 = Date.now();
+  try {
+    const pg = await restPage(src, null);
+    const resolved = src.kind === 'categories'
+      ? pg.resolvedParents
+      : pg.markets.filter(isResolvedRecord).length;
+    const ok = pg.rows.length > 0 && pg.markets.length > 0 && resolved === 0;
+    return { name: src.name, ok, ms: Date.now() - t0, rows: pg.rows.length, markets: pg.markets.length, resolved, first: pg };
+  } catch (err) {
+    return { name: src.name, ok: false, ms: Date.now() - t0, error: `HTTP ${err.status ?? '—'}` };
+  }
+}
+
+async function scanSource(src, firstPage, map, t0) {
+  let pages = 0;
+  let truncated = false;
+  let after = null;
+  let pg = firstPage;
+  for (;;) {
+    if (!pg) pg = await restPage(src, after);
+    pages += 1;
+    let progress = 0;
+    for (const m of pg.markets) {
+      if (m?.id == null || map.has(String(m.id))) continue;
+      const slug = pickRestSlug(m);
+      // Full record kept (slug may be null) so the resolver and the
+      // REST-backed list can use title/conditionId without GraphQL.
+      map.set(String(m.id), { slug: slug ? String(slug).toLowerCase() : null, market: m });
+      progress += 1;
+    }
+    const next = pg.cursorPaged ? pg.cursor : (pg.rows.length >= REST_PAGE ? pg.rows[pg.rows.length - 1]?.id : null);
+    if (!pg.rows.length || (!progress && src.kind === 'markets')) break;
+    if (next == null || String(next) === String(after)) break;
+    if (pages >= REST_MAX_PAGES || Date.now() - t0 > REST_SCAN_BUDGET_MS) { truncated = true; break; }
+    after = next;
+    pg = null;
+  }
+  return { pages, truncated };
+}
+
+let _slugCache = { at: 0, byId: null, inFlight: null };
 
 export async function getSlugMapCached() {
   const now = Date.now();
   if (_slugCache.byId && now - _slugCache.at < config.marketsCacheTtlMs) return _slugCache.byId;
   if (_slugCache.inFlight) return _slugCache.inFlight;
   _slugCache.inFlight = (async () => {
+    const t0 = Date.now();
     const map = new Map();
-    // Paginate with the response's `cursor` (documented envelope:
-    // { success, cursor, data: [...] }) passed back as `after`. Falls back
-    // to the last id for servers that don't return a cursor. The old
-    // id-only paging stalled after the first page whenever the server
-    // expected an opaque cursor, so the slug map only ever saw ~100
-    // markets.
-    let after = null;
-    for (let page = 0; page < 100; page++) {
-      const params = new URLSearchParams({ first: '100' });
-      if (after != null) params.set('after', String(after));
-      const url = `${config.restUrl}/markets?${params.toString()}`;
-      let arr = [];
-      let cursor = null;
-      try {
-        const json = await fetchJson(url, {
-          headers: restHeaders(),
-          timeoutMs: config.orderbookTimeoutMs,
-          retries: 1,
-          limiter: restLimiter,
-        });
-        const data = json?.data ?? json;
-        arr = Array.isArray(data) ? data : (data?.markets ?? data?.items ?? data?.nodes ?? []);
-        cursor = json?.cursor ?? data?.cursor ?? json?.pageInfo?.endCursor ?? null;
-      } catch {
-        break;
-      }
-      if (!arr.length) break;
-      let progress = 0;
-      for (const m of arr) {
-        if (m?.id == null || map.has(String(m.id))) continue;
-        const slug = pickRestSlug(m);
-        // Store the full record (slug may be null) so the resolver and
-        // the REST-backed market list can use title/conditionId without
-        // a GraphQL round-trip.
-        map.set(String(m.id), { slug: slug ? String(slug).toLowerCase() : null, market: m });
-        progress += 1;
-      }
-      if (!progress) break;
-      const next = cursor ?? (arr.length >= 100 ? arr[arr.length - 1]?.id : null);
-      if (next == null || String(next) === String(after)) break;
-      after = next;
+    const probes = [];
+    let chosen = null;
+    let firstPage = null;
+    for (const src of REST_SOURCES) {
+      const pr = await probeSource(src);
+      probes.push({ name: pr.name, ok: pr.ok, ms: pr.ms, rows: pr.rows, markets: pr.markets, resolved: pr.resolved, error: pr.error });
+      if (pr.ok) { chosen = src; firstPage = pr.first; break; }
     }
+    if (!chosen) chosen = REST_FALLBACK;
+    let pages = 0;
+    let truncated = false;
+    let error = null;
+    try {
+      ({ pages, truncated } = await scanSource(chosen, firstPage, map, t0));
+    } catch (err) {
+      error = err.message;
+      truncated = true;
+    }
+    const active = [...map.values()].filter((e) => !isResolvedRecord(e.market)).length;
+    _restListInfo = {
+      source: chosen.name, pages, total: map.size, active,
+      ms: Date.now() - t0, truncated, error, probes,
+    };
+    console.log(new Date().toISOString(), `[predict] REST market list: ${active} active / ${map.size} via ${chosen.name}, ${pages} page(s), ${_restListInfo.ms}ms${truncated ? ' (truncated)' : ''}`);
     _slugCache.byId = map;
-    _slugCache.at = Date.now();
+    // Retry an empty or broken scan in a minute, not after the full TTL.
+    _slugCache.at = map.size && !error ? Date.now() : Date.now() - config.marketsCacheTtlMs + 60_000;
     return map;
   })().finally(() => { _slugCache.inFlight = null; });
   return _slugCache.inFlight;
