@@ -37,8 +37,24 @@ export function normalizeTriggerMode(mode, chatOverride = null) {
   return TRIGGER_MODES.includes(candidate) ? candidate : 'both';
 }
 
+// True when `levels` is already a canonical subset of ALL_LEVELS (valid
+// names, no duplicates, in ALL_LEVELS order). Lets normalizeLevels
+// return the array untouched on the hot path — listAllSubscriptions()
+// normalises every sub on every call, so this avoids three allocations
+// per sub per call once a sub has been normalised once.
+function isCanonicalLevels(levels) {
+  let pos = 0;
+  for (const l of levels) {
+    const idx = ALL_LEVELS.indexOf(l, pos);
+    if (idx < 0) return false;
+    pos = idx + 1;
+  }
+  return true;
+}
+
 export function normalizeLevels(levels, chatOverride = null) {
   if (Array.isArray(levels)) {
+    if (isCanonicalLevels(levels)) return levels;
     const set = new Set(levels.filter((l) => ALL_LEVELS.includes(l)));
     return ALL_LEVELS.filter((l) => set.has(l));
   }
@@ -62,6 +78,13 @@ function emptyState() {
 }
 
 let _state = null;
+// Monotonic revision of the in-memory state. Bumped by every mutator
+// below so hot-path readers (monitor.js groups subs by market on every
+// WebSocket push and every poll tick) can memoise derived views and
+// rebuild them only when something actually changed.
+let _rev = 0;
+function touch() { _rev += 1; }
+export function stateRevision() { return _rev; }
 // Save coalescing — concurrent callers all set _dirty; the lone
 // _saving worker keeps draining until _dirty stays false. This
 // guarantees: (a) the on-disk file is always a valid serialisation
@@ -88,6 +111,7 @@ export async function loadState() {
     if (err.code !== 'ENOENT') console.warn(new Date().toISOString(), '[state] load failed:', err.message);
     _state = emptyState();
   }
+  touch();
   return _state;
 }
 
@@ -129,6 +153,7 @@ export function subKey(chatId, marketId) {
 export function addSubscription(sub) {
   const k = subKey(sub.chatId, sub.marketId);
   const existing = _state.subs[k];
+  touch();
   // Pull chat-level defaults so a new sub follows whatever the user
   // set via /settings; existing subs keep their own saved values.
   const cs = _state.chatSettings?.[String(sub.chatId)] ?? {};
@@ -161,6 +186,7 @@ export function addSubscription(sub) {
 export function updateSubscriptionTriggerMode(chatId, marketId, mode) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   s.triggerMode = normalizeTriggerMode(mode);
   return s;
 }
@@ -172,6 +198,7 @@ export function updateSubscriptionTriggerMode(chatId, marketId, mode) {
 export function setSubscriptionDigestBaseline(chatId, marketId, snapshot) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   s.digestBaseline = snapshot;
   return s;
 }
@@ -182,6 +209,7 @@ export function setSubscriptionDigestBaseline(chatId, marketId, snapshot) {
 export function setSubscriptionInitial(chatId, marketId, snapshot) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   s.initial = snapshot;
   return s;
 }
@@ -193,6 +221,7 @@ export function setSubscriptionInitial(chatId, marketId, snapshot) {
 export function setSubscriptionLastSnap(chatId, marketId, snapshot) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   s.lastSnap = snapshot;
   return s;
 }
@@ -203,6 +232,7 @@ export function setSubscriptionLastSnap(chatId, marketId, snapshot) {
 export function setSubscriptionQuestion(chatId, marketId, question) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   s.question = question || null;
   return s;
 }
@@ -218,6 +248,7 @@ export function setSubscriptionQuestion(chatId, marketId, question) {
 export function setSubscriptionThresholds(chatId, marketId, thresholds) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   if (thresholds == null) {
     delete s.thresholds;
   } else {
@@ -241,6 +272,7 @@ export function setSubscriptionThresholds(chatId, marketId, thresholds) {
 export function setSubscriptionBooklog(chatId, marketId, patch) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   if (patch == null) { delete s.booklog; return s; }
   s.booklog = { ...(s.booklog ?? {}), ...patch };
   return s;
@@ -249,6 +281,7 @@ export function setSubscriptionBooklog(chatId, marketId, patch) {
 export function setSubscriptionPause(chatId, marketId, untilMs) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   s.pausedUntil = (typeof untilMs === 'number' && untilMs > Date.now()) ? untilMs : null;
   return s;
 }
@@ -256,6 +289,7 @@ export function setSubscriptionPause(chatId, marketId, untilMs) {
 // Pause every sub in a chat. Returns the count actually changed so the
 // caller can render an accurate confirmation.
 export function pauseAllForChat(chatId, untilMs) {
+  touch();
   let n = 0;
   for (const s of Object.values(_state.subs)) {
     if (String(s.chatId) !== String(chatId)) continue;
@@ -288,6 +322,7 @@ export function parseNoteText(raw) {
 export function updateSubscriptionNote(chatId, marketId, note) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   const trimmed = (note ?? '').toString().trim();
   if (!trimmed.length) {
     s.note = null;
@@ -312,6 +347,7 @@ export function getSubscription(chatId, marketId) {
 export function updateSubscriptionLevels(chatId, marketId, levels) {
   const s = _state.subs[subKey(chatId, marketId)];
   if (!s) return null;
+  touch();
   s.levels = normalizeLevels(levels);
   return s;
 }
@@ -320,6 +356,7 @@ export function removeSubscription(chatId, marketId) {
   const k = subKey(chatId, marketId);
   if (!_state.subs[k]) return false;
   delete _state.subs[k];
+  touch();
   return true;
 }
 
@@ -478,6 +515,7 @@ export function getAllChatSettings() {
 
 export function setChatDigest(chatId, intervalMs) {
   if (!_state.chatSettings) _state.chatSettings = {};
+  touch();
   const k = String(chatId);
   const cur = _state.chatSettings[k] ?? {};
   if (intervalMs > 0) {
@@ -496,6 +534,7 @@ export function setChatDigest(chatId, intervalMs) {
 // Existing subs keep whatever was saved at their creation time.
 export function setChatDefaultLevels(chatId, levels) {
   if (!_state.chatSettings) _state.chatSettings = {};
+  touch();
   const k = String(chatId);
   if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
   if (!levels || !levels.length) {
@@ -508,6 +547,7 @@ export function setChatDefaultLevels(chatId, levels) {
 
 export function setChatDefaultTriggerMode(chatId, mode) {
   if (!_state.chatSettings) _state.chatSettings = {};
+  touch();
   const k = String(chatId);
   if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
   if (mode == null) {
@@ -521,6 +561,7 @@ export function setChatDefaultTriggerMode(chatId, mode) {
 
 export function setChatDefaultCooldown(chatId, ms) {
   if (!_state.chatSettings) _state.chatSettings = {};
+  touch();
   const k = String(chatId);
   if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
   if (ms == null || ms <= 0) {
@@ -562,6 +603,7 @@ export function gcPendingBulkRetry() {
 // null in either field = disabled.
 export function setChatQuiet(chatId, startMin, endMin) {
   if (!_state.chatSettings) _state.chatSettings = {};
+  touch();
   const k = String(chatId);
   if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
   if (startMin == null || endMin == null) {
@@ -581,6 +623,7 @@ export function setChatQuiet(chatId, startMin, endMin) {
 // wants the rolled-up summary, not per-poll pings.
 export function setChatDigestOnly(chatId, on) {
   if (!_state.chatSettings) _state.chatSettings = {};
+  touch();
   const k = String(chatId);
   if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
   if (on) _state.chatSettings[k].digestOnly = true;
@@ -592,6 +635,20 @@ export function isChatDigestOnly(chatId) {
   return !!_state.chatSettings?.[String(chatId)]?.digestOnly;
 }
 
+// Intl.DateTimeFormat construction is expensive (ICU locale + tz data
+// lookup, easily 100µs+); the timezone is fixed per process so build
+// it once. isChatInQuietHours runs for every alert and journal push.
+let _quietFmt = null;
+function quietHoursFormatter() {
+  if (!_quietFmt) {
+    _quietFmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: config.displayTz,
+      hour: 'numeric', minute: 'numeric', hour12: false,
+    });
+  }
+  return _quietFmt;
+}
+
 export function isChatInQuietHours(chatId, ms = Date.now()) {
   const s = _state.chatSettings?.[String(chatId)];
   if (!s || s.quietStartMin == null || s.quietEndMin == null) return false;
@@ -599,11 +656,7 @@ export function isChatInQuietHours(chatId, ms = Date.now()) {
   if (start === end) return false;
   // Current minute-of-day in the configured timezone.
   try {
-    const fmt = new Intl.DateTimeFormat('en-CA', {
-      timeZone: config.displayTz,
-      hour: 'numeric', minute: 'numeric', hour12: false,
-    });
-    const parts = fmt.formatToParts(new Date(ms));
+    const parts = quietHoursFormatter().formatToParts(new Date(ms));
     const h = Number(parts.find((p) => p.type === 'hour')?.value ?? 0);
     const m = Number(parts.find((p) => p.type === 'minute')?.value ?? 0);
     const cur = h * 60 + m;
@@ -616,6 +669,7 @@ export function isChatInQuietHours(chatId, ms = Date.now()) {
 
 export function markChatDigestSent(chatId, atMs = Date.now()) {
   if (!_state.chatSettings) _state.chatSettings = {};
+  touch();
   const k = String(chatId);
   if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
   _state.chatSettings[k].digestLastSentAt = atMs;
@@ -626,6 +680,7 @@ export function markChatDigestSent(chatId, atMs = Date.now()) {
 // covers exactly what happened since the user last looked.
 export function markChatDigestLogQuery(chatId, atMs = Date.now()) {
   if (!_state.chatSettings) _state.chatSettings = {};
+  touch();
   const k = String(chatId);
   if (!_state.chatSettings[k]) _state.chatSettings[k] = {};
   _state.chatSettings[k].digestLogLastQueryAt = atMs;
@@ -644,6 +699,7 @@ export function getBooklogPollMs() {
 }
 
 export function setBooklogPollMs(ms) {
+  touch();
   if (ms == null) delete _state.booklogPollMs;
   else _state.booklogPollMs = Math.round(ms);
 }
