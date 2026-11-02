@@ -10,7 +10,7 @@ import {
   setSubscriptionInitial, setSubscriptionDigestBaseline,
   setSubscriptionLastSnap, setSubscriptionQuestion,
   getAllChatSettings, markChatDigestSent, isChatInQuietHours,
-  isChatDigestOnly, getBooklogPollMs, stateRevision,
+  isChatDigestOnly, getBooklogPollMs,
   ALL_LEVELS, LEVEL_LABEL, subKey,
 } from './state.js';
 import { appendEvent } from './history.js';
@@ -150,7 +150,7 @@ export function transportStats() {
   return {
     rest: restLimiter.snapshot(),
     ws: wsStatus(),
-    deadMarkets: notFoundStreak.size,
+    deadMarkets: [...notFoundStreak.keys()].length,
   };
 }
 
@@ -470,22 +470,13 @@ export function fmtBook(prev, snap, levels) {
 
 // Format a timestamp in the configured display timezone (default
 // Asia/Shanghai → UTC+8). Falls back to UTC ISO if Intl is unavailable.
-// Formatters are built once: Intl.DateTimeFormat construction is far
-// more expensive than .format(), and these run per alert, per digest
-// row and per /history line. displayTz is fixed for the process.
-let _clockTimeFmt = null;
-let _clockDateTimeFmt = null;
-
 export function fmtClockTime(ms) {
   try {
-    if (!_clockTimeFmt) {
-      _clockTimeFmt = new Intl.DateTimeFormat('en-CA', {
-        timeZone: config.displayTz,
-        hour: '2-digit', minute: '2-digit', second: '2-digit',
-        hour12: false,
-      });
-    }
-    return _clockTimeFmt.format(new Date(ms));
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: config.displayTz,
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false,
+    }).format(new Date(ms));
   } catch {
     return new Date(ms).toISOString().slice(11, 19);
   }
@@ -495,15 +486,13 @@ export function fmtClockTime(ms) {
 // reference snapshot may be hours / days old. "06-30 11:19".
 export function fmtClockDateTime(ms) {
   try {
-    if (!_clockDateTimeFmt) {
-      _clockDateTimeFmt = new Intl.DateTimeFormat('en-CA', {
-        timeZone: config.displayTz,
-        month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit',
-        hour12: false,
-      });
-    }
-    const parts = _clockDateTimeFmt.formatToParts(new Date(ms));
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: config.displayTz,
+      month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit',
+      hour12: false,
+    });
+    const parts = fmt.formatToParts(new Date(ms));
     const get = (t) => parts.find((p) => p.type === t)?.value ?? '';
     return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
   } catch {
@@ -736,12 +725,10 @@ async function runWithConcurrency(items, limit, worker) {
 // fresh one, journal every add/cut to history.jsonl (type='book'), and
 // fire the big-order alert when configured. Never throws — a journal
 // failure must not break the main alert loop.
-// `changes` is the diffBookOrders() output the caller already computed
-// for this sub (journalMarketSnap needs it for its own bookkeeping, so
-// diffing again here would double the work at 1 Hz × markets).
-async function recordBooklog(s, k, changes, snap, now) {
+async function recordBooklog(s, k, prevTickSnap, snap, now) {
   try {
     const bl = s.booklog;
+    const changes = diffBookOrders(prevTickSnap, snap, bl.minSize ?? 10);
     if (!changes.length) return;
     await appendEvent({
       type: 'book',
@@ -813,51 +800,14 @@ const booklogChain = new Map(); // marketId -> Promise
 const wsAuditAt = new Map();    // marketId -> ts
 const wsGaps = new Map();       // marketId -> [ts, ...]
 
-// Subscriptions grouped by market, memoised on the state revision.
-// Rebuilt only when a sub is added/removed/edited; otherwise the WS
-// push handler (potentially many times per second), the 1 Hz journal
-// loop and the main loop all share the same Maps instead of each
-// re-walking and re-normalising every sub on every call.
-//
-// Rebuilds also sweep the per-sub caches below for keys whose sub is
-// gone, so a long-lived process with subscribe/unsubscribe churn does
-// not accumulate orphaned snapshots forever.
-let _subsIndex = { rev: -1, byMarket: new Map(), booklogByMarket: new Map(), marketIds: new Set() };
-const PER_SUB_CACHES = [lastBookPerSub, lastNotify, latestSnapPerSub, pendingExcursion, questionBackfillTried];
-
-function subsIndex() {
-  const rev = stateRevision();
-  if (_subsIndex.rev === rev) return _subsIndex;
-  const byMarket = new Map();
-  const booklogByMarket = new Map();
-  const marketIds = new Set();
-  const liveKeys = new Set();
-  for (const s of listAllSubscriptions()) {
-    const id = String(s.marketId);
-    marketIds.add(id);
-    liveKeys.add(subKey(s.chatId, s.marketId));
-    let g = byMarket.get(s.marketId);
-    if (!g) byMarket.set(s.marketId, (g = []));
-    g.push(s);
-    if (s.booklog?.enabled) {
-      let bg = booklogByMarket.get(s.marketId);
-      if (!bg) booklogByMarket.set(s.marketId, (bg = []));
-      bg.push(s);
-    }
-  }
-  for (const cache of PER_SUB_CACHES) {
-    for (const k of cache.keys()) if (!liveKeys.has(k)) cache.delete(k);
-  }
-  for (const k of booklogPrevSnap.keys()) if (!liveKeys.has(k)) booklogPrevSnap.delete(k);
-  for (const cache of [latestSnapPerMarket, booklogErrStreak, wsAuditAt, wsGaps, notFoundStreak]) {
-    for (const id of cache.keys()) if (!marketIds.has(String(id))) cache.delete(id);
-  }
-  _subsIndex = { rev, byMarket, booklogByMarket, marketIds };
-  return _subsIndex;
-}
-
 function booklogGroups() {
-  return subsIndex().booklogByMarket;
+  const subs = listAllSubscriptions().filter((s) => s.booklog?.enabled);
+  const byMarket = new Map();
+  for (const s of subs) {
+    if (!byMarket.has(s.marketId)) byMarket.set(s.marketId, []);
+    byMarket.get(s.marketId).push(s);
+  }
+  return byMarket;
 }
 
 // Journal one fresh snapshot for every journal-enabled sub of a market.
@@ -881,10 +831,8 @@ function journalMarketSnap(marketId, group, snap, now) {
         // than what the slow loop has.
         latestSnapPerSub.set(k, snap);
         if (!prev) continue;
-        const changes = diffBookOrders(prev, snap, s.booklog?.minSize ?? 10);
-        if (!changes.length) continue;
-        changed += 1;
-        await recordBooklog(s, k, changes, snap, now);
+        if (diffBookOrders(prev, snap, s.booklog?.minSize ?? 10).length) changed += 1;
+        await recordBooklog(s, k, prev, snap, now);
       }
     } catch (err) {
       console.warn('[booklog] journal failed:', id, err.message);
@@ -914,7 +862,9 @@ function onWsBook(marketId, snap) {
 // Every subscribed market gets a WS topic — journaled ones for the
 // diary, plain ones so the 30s alert loop can skip their REST fetch.
 function wantedWsMarketIds() {
-  return subsIndex().marketIds;
+  const ids = new Set();
+  for (const s of listAllSubscriptions()) ids.add(String(s.marketId));
+  return ids;
 }
 
 export async function startWsFeed({ signal }) {
@@ -1021,9 +971,14 @@ export async function startBooklogLoop({ signal }) {
 }
 
 async function pollOnce() {
-  const { byMarket } = subsIndex();
-  if (!byMarket.size) return;
+  const subs = listAllSubscriptions();
+  if (!subs.length) return;
   let needsSave = false;
+  const byMarket = new Map();
+  for (const s of subs) {
+    if (!byMarket.has(s.marketId)) byMarket.set(s.marketId, []);
+    byMarket.get(s.marketId).push(s);
+  }
   // Fetch every market in parallel (bounded). With 1 sub the wall-clock
   // is one HTTP call; with N subs it's max(L), not N×L.
   const groups = [...byMarket.entries()];
