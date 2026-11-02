@@ -22,6 +22,7 @@ import {
 import { extractSlugFromUrl, extractMarketId, resolveUrlToMarkets, fuzzySlugSuggestions, getMarketById, getOrderbook } from './predict.js';
 import { fmtBook, fmtSpreadLine, subActionKeyboard, primeSubscriptionSnapshot, marketLink, fmtClockTime, fmtClockDateTime, sendDigestForChat, effectiveThresholds, deriveEventTitle, getLatestSnapForSub, fmtBookChangeLine } from './monitor.js';
 import { startMonitorLoop, startBooklogLoop, startWsFeed, transportStats } from './monitor.js';
+import { runDiagnose } from './diagnose.js';
 
 requireConfig();
 
@@ -842,7 +843,7 @@ async function handleUrl(chatId, text, { initialNote = null } = {}) {
       '• 是事件页 (event)，不是单 market',
       '• 缓存还没刷新（10 分钟 TTL）',
       '',
-      '排查：在仓库目录下跑 <code>node scripts/diagnose.js &lt;url&gt;</code> 看每一步实际返回。',
+      `排查：发送 <code>/diagnose ${htmlEscape(text)}</code> 查看每一步的实际返回。`,
     ].join('\n'));
     return;
   }
@@ -877,6 +878,28 @@ async function handleCommand(chatId, text) {
   const c = cmd.split('@')[0].toLowerCase();
   if (c === '/start' || c === '/help') {
     await sendMessage(chatId, welcomeText(), { replyMarkup: welcomeKeyboard() });
+    return true;
+  }
+  if (c === '/diagnose') {
+    const target = args.join(' ').trim();
+    if (!target) {
+      await sendMessage(chatId, [
+        '🩺 <b>解析诊断</b>',
+        '用法：<code>/diagnose &lt;网址或 slug&gt;</code>',
+        '例：<code>/diagnose https://predict.fun/zh-cn/market/xxxx</code>',
+        '',
+        '<i>会在服务器上把网址解析的每一步实际请求一遍，显示状态码和接口报错。</i>',
+      ].join('\n'));
+      return true;
+    }
+    await sendMessage(chatId, '🩺 诊断中，约 10–30 秒…');
+    let report;
+    try {
+      report = await runDiagnose(target);
+    } catch (err) {
+      report = `❌ 诊断本身出错：<code>${htmlEscape(err.message)}</code>`;
+    }
+    await sendMessage(chatId, report);
     return true;
   }
   if (c === '/list') {
@@ -4149,6 +4172,7 @@ async function main() {
     { command: 'digestonly', description: '只发摘要 · 静音即时提醒（开关）' },
     { command: 'settings',  description: '聊天设置面板（默认档位/触发/摘要/勿扰…）' },
     { command: 'status',    description: 'Bot 健康状态' },
+    { command: 'diagnose',  description: '诊断网址解析失败（发 /diagnose 网址）' },
     { command: 'export',    description: '导出 history.jsonl' },
     { command: 'speedtest', description: '测抓取延迟' },
     { command: 'stop',      description: '取消订阅（回复网址，弹确认/选项）' },
