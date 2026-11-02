@@ -238,11 +238,87 @@ async function resolveSlugViaCategories(originalSlug) {
   return [];
 }
 
+// ── REST (api.predict.fun, x-api-key) ───────────────────────────────
+// graphql.predict.fun started answering server traffic with a
+// Cloudflare 403 block page, while the REST API keeps working. The
+// official docs (dev.predict.fun, "Get category by slug") expose
+// GET /v1/categories/{slug} → the category plus its markets, which is
+// exactly the URL-slug → markets lookup the GraphQL chain did.
+//
+// Response shapes are parsed defensively (`{ success, data }` envelope
+// or bare object; markets under data.markets or data.category.markets)
+// so a minor shape difference degrades to "no match" instead of a
+// crash. /diagnose prints the raw top-level keys to verify on the
+// server.
+
+function unwrapRest(json) {
+  return json && typeof json === 'object' && 'data' in json ? json.data : json;
+}
+
+function isResolvedRecord(m) {
+  if (!m) return false;
+  if (m.isResolved === true || m.resolved === true) return true;
+  const st = String(m.status ?? m.marketStatus ?? '').toUpperCase();
+  return st === 'RESOLVED' || st === 'SETTLED' || st === 'CLOSED';
+}
+
+function restMarketToMatch(m, fallbackSlug = null) {
+  const id = m?.id ?? m?.marketId;
+  if (id == null) return null;
+  return {
+    id: String(id),
+    conditionId: m.conditionId ?? m.condition_id ?? null,
+    title: m.title ?? m.name ?? m.question ?? null,
+    question: m.question ?? null,
+    slug: pickRestSlug(m) ?? fallbackSlug ?? null,
+  };
+}
+
+async function restGet(path) {
+  return fetchJson(`${config.restUrl}${path}`, {
+    headers: restHeaders(),
+    timeoutMs: config.orderbookTimeoutMs,
+    retries: 1,
+    limiter: restLimiter,
+  });
+}
+
+// GET /v1/categories/{slug}. Returns [] when the slug is unknown (404)
+// or every market under it is resolved; throws on other failures so
+// the caller can log and move on to the next tier.
+export async function getMarketsByCategorySlugRest(slug) {
+  if (!slug) return [];
+  let json;
+  try {
+    json = await restGet(`/categories/${encodeURIComponent(slug)}`);
+  } catch (err) {
+    if (err.status === 404) return [];
+    throw err;
+  }
+  const data = unwrapRest(json);
+  const cat = data?.category ?? data;
+  const markets = cat?.markets ?? data?.markets ?? [];
+  const catSlug = cat?.slug ?? slug;
+  const out = [];
+  const seen = new Set();
+  for (const m of Array.isArray(markets) ? markets : []) {
+    if (isResolvedRecord(m)) continue;
+    const x = restMarketToMatch(m, catSlug);
+    if (!x || seen.has(x.id)) continue;
+    seen.add(x.id);
+    if (!x.question && cat?.title) x.question = cat.title;
+    out.push(x);
+  }
+  return out;
+}
+
 // Top-level resolver used by the bot. Tries every known path in order:
+//   0. REST GET /v1/categories/{slug} (official, works behind the
+//      GraphQL Cloudflare block)
 //   1. categorySlug GraphQL resolver (works for events + single markets)
 //   2. HTML scrape of the rendered page (fails behind Cloudflare but
 //      kept for non-CF deployments)
-//   3. Cached slug-based 5-tier matcher
+//   3. Cached slug-based matcher
 export async function resolveUrlToMarkets(input) {
   const isUrl = /^https?:\/\//i.test(String(input).trim());
   // SSRF defence — refuse full URLs that don't point at predict.fun.
@@ -251,6 +327,15 @@ export async function resolveUrlToMarkets(input) {
     return { markets: [], source: 'blocked-non-predict-host' };
   }
   const slug = extractSlugFromUrl(input);
+  // Tier 0: REST category-by-slug.
+  if (slug) {
+    try {
+      const markets = await getMarketsByCategorySlugRest(slug);
+      if (markets.length) return { markets, source: 'restCategory', slug };
+    } catch (err) {
+      console.warn('[predict] REST categories/{slug} failed:', err.message);
+    }
+  }
   // Tier 1: GraphQL categorySlug resolver — works for the slug regardless
   // of what the bot's market list looks like, and handles event pages.
   if (slug) {
@@ -418,10 +503,21 @@ export async function getAllMarketsCached() {
   if (_cache.list && now - _cache.at < config.marketsCacheTtlMs) return _cache.list;
   if (_cache.inFlight) return _cache.inFlight;
   _cache.inFlight = (async () => {
-    const list = await listAllMarkets();
+    let list = await listAllMarkets();
+    if (!list.length) {
+      // GraphQL unavailable (Cloudflare 403) — build the list from the
+      // REST /v1/markets scan instead, minus resolved markets to match
+      // the GraphQL `isResolved: false` filter.
+      try {
+        const map = await getSlugMapCached();
+        list = [...map.values()].map((e) => e.market).filter((m) => m && !isResolvedRecord(m));
+      } catch { /* stays empty */ }
+    }
     _cache.list = list;
     _cache.byId = new Map(list.map((m) => [String(m.id), m]));
-    _cache.at = Date.now();
+    // An empty list means both sources failed: retry in a minute rather
+    // than serving "no markets" for the whole TTL.
+    _cache.at = list.length ? Date.now() : Date.now() - config.marketsCacheTtlMs + 60_000;
     return list;
   })().finally(() => { _cache.inFlight = null; });
   return _cache.inFlight;
@@ -452,6 +548,19 @@ export async function getMarketById(id) {
   }
   const direct = _byIdDirect.get(key);
   if (direct && now - direct.at < config.marketsCacheTtlMs) return direct.market;
+  // REST GET /v1/markets/{id}. Any failure (including a 404, in case
+  // the path differs) falls through to GraphQL and then the list, so a
+  // wrong guess here can't make a live market look missing.
+  try {
+    const data = unwrapRest(await restGet(`/markets/${encodeURIComponent(key)}`));
+    const m = data?.market ?? data;
+    if (m && (m.id != null || m.marketId != null) && String(m.id ?? m.marketId) === key) {
+      if (isResolvedRecord(m)) return null;
+      const rec = { ...m, id: key };
+      _byIdDirect.set(key, { at: Date.now(), market: rec });
+      return rec;
+    }
+  } catch { /* fall through */ }
   let directErr = null;
   try {
     const { selection } = await getMarketSelection();
@@ -493,12 +602,19 @@ export async function getSlugMapCached() {
   if (_slugCache.inFlight) return _slugCache.inFlight;
   _slugCache.inFlight = (async () => {
     const map = new Map();
-    let lastId = null;
-    for (let page = 0; page < 50; page++) {
+    // Paginate with the response's `cursor` (documented envelope:
+    // { success, cursor, data: [...] }) passed back as `after`. Falls back
+    // to the last id for servers that don't return a cursor. The old
+    // id-only paging stalled after the first page whenever the server
+    // expected an opaque cursor, so the slug map only ever saw ~100
+    // markets.
+    let after = null;
+    for (let page = 0; page < 100; page++) {
       const params = new URLSearchParams({ first: '100' });
-      if (lastId != null) params.set('after', String(lastId));
+      if (after != null) params.set('after', String(after));
       const url = `${config.restUrl}/markets?${params.toString()}`;
       let arr = [];
+      let cursor = null;
       try {
         const json = await fetchJson(url, {
           headers: restHeaders(),
@@ -508,6 +624,7 @@ export async function getSlugMapCached() {
         });
         const data = json?.data ?? json;
         arr = Array.isArray(data) ? data : (data?.markets ?? data?.items ?? data?.nodes ?? []);
+        cursor = json?.cursor ?? data?.cursor ?? json?.pageInfo?.endCursor ?? null;
       } catch {
         break;
       }
@@ -516,18 +633,16 @@ export async function getSlugMapCached() {
       for (const m of arr) {
         if (m?.id == null || map.has(String(m.id))) continue;
         const slug = pickRestSlug(m);
-        if (slug) {
-          // Store the full record so the resolver can return title/conditionId
-          // without round-tripping back to GraphQL.
-          map.set(String(m.id), { slug: String(slug).toLowerCase(), market: m });
-          progress += 1;
-        }
+        // Store the full record (slug may be null) so the resolver and
+        // the REST-backed market list can use title/conditionId without
+        // a GraphQL round-trip.
+        map.set(String(m.id), { slug: slug ? String(slug).toLowerCase() : null, market: m });
+        progress += 1;
       }
       if (!progress) break;
-      if (arr.length < 100) break;
-      const newLast = arr[arr.length - 1]?.id;
-      if (newLast == null || newLast === lastId) break;
-      lastId = newLast;
+      const next = cursor ?? (arr.length >= 100 ? arr[arr.length - 1]?.id : null);
+      if (next == null || String(next) === String(after)) break;
+      after = next;
     }
     _slugCache.byId = map;
     _slugCache.at = Date.now();

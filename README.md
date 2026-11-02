@@ -72,9 +72,14 @@ npm run diagnose -- https://predict.fun/zh-cn/market/fifa-world-cup-group-e-winn
 ④ 严格匹配（title / question / categorySlug，含年份变体）；⑤ 模糊 token 匹配 top 10；
 ⑥ REST `/v1/markets` 兜底扫描；以及一段总结建议。
 
-> Bot 内置的解析器现在依次试 5 层：title-slug → question-slug → 年份变体 →
-> GraphQL categorySlug → REST `/v1/markets` 全表扫描。还匹配不到时会用模糊
+> Bot 内置的解析器依次尝试：**REST `/v1/categories/{slug}`（官方接口，首选）** →
+> GraphQL categorySlug → 网页 `__NEXT_DATA__` → 本地市场列表的 title / question /
+> 年份变体 / categorySlug 匹配 → REST `/v1/markets` 全表扫描。还匹配不到时会用模糊
 > token 给出"你是不是要找…"的可点选列表。
+>
+> `graphql.predict.fun` 目前会对服务器请求返回 Cloudflare 403，所以 **`PREDICT_API_KEY`
+> 实际上是必填的**：网址解析、按 id 查市场、市场列表都已改走 REST。遇到解析失败，直接在
+> 机器人里发 `/diagnose <网址>`，它会在服务器上逐步请求并给出结论。
 
 ## 部署到 Railway
 1. 把仓库 push 到 GitHub。

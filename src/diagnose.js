@@ -12,6 +12,7 @@ import { htmlEscape } from './telegram.js';
 import {
   extractSlugFromUrl, isAllowedPredictHost, extractMarketsFromHtml,
   resolveUrlToMarkets, fuzzySlugSuggestions, getAllMarketsCached, restLimiter,
+  getMarketsByCategorySlugRest,
 } from './predict.js';
 
 const STEP_TIMEOUT_MS = 15_000;
@@ -80,6 +81,32 @@ export async function runDiagnose(input) {
     return out.join('\n');
   }
   line(true, '1. 提取 slug', null, slug);
+
+  // 1b. REST GET /v1/categories/{slug} — raw shape + what the bot parses
+  {
+    const t0 = Date.now();
+    const headers = { Accept: 'application/json' };
+    if (config.predictApiKey) headers['x-api-key'] = config.predictApiKey;
+    try {
+      const json = await fetchJson(`${config.restUrl}/categories/${encodeURIComponent(slug)}`, {
+        headers, timeoutMs: STEP_TIMEOUT_MS, retries: 0, limiter: restLimiter,
+      });
+      const data = json && typeof json === 'object' && 'data' in json ? json.data : json;
+      const cat = data?.category ?? data;
+      const mk = cat?.markets ?? data?.markets;
+      const first = Array.isArray(mk) ? mk[0] : null;
+      const shape = `顶层键 [${Object.keys(json ?? {}).join(',')}] · data 键 [${Object.keys(cat ?? {}).slice(0, 12).join(',')}] · markets ${Array.isArray(mk) ? mk.length : '无'}${first ? ` · 市场字段 [${Object.keys(first).slice(0, 14).join(',')}]` : ''}`;
+      let parsed = [];
+      try { parsed = await getMarketsByCategorySlugRest(slug); } catch { /* shown as 0 */ }
+      facts.restCat = parsed.length;
+      line(parsed.length > 0, '1b. REST 按 slug 查分类（官方接口，机器人首选）', Date.now() - t0,
+        `HTTP 200 · ${shape}\n解析出 ${parsed.length} 个未结算市场${parsed.length ? ': ' + parsed.slice(0, 5).map((m) => `${m.id} ${clip(m.title, 30)}`).join(' | ') : ''}`);
+    } catch (err) {
+      facts.restCat = 0;
+      line(false, '1b. REST 按 slug 查分类（官方接口，机器人首选）', Date.now() - t0,
+        `HTTP ${err.status ?? '—'} · ${clip(err.message, 220)}`);
+    }
+  }
 
   // 2. GraphQL reachable at all? (exactly how the bot calls it: no key)
   const ping = await gql('{ __typename }');
@@ -186,7 +213,10 @@ export async function runDiagnose(input) {
       });
       const data = json?.data ?? json;
       const arr = Array.isArray(data) ? data : (data?.markets ?? data?.items ?? []);
-      line(true, '9. REST /markets', Date.now() - t0, `HTTP 200 · ${arr.length} 条`);
+      const cursor = json?.cursor ?? data?.cursor ?? null;
+      const keys = arr[0] ? Object.keys(arr[0]).slice(0, 16).join(',') : '';
+      line(true, '9. REST /markets', Date.now() - t0,
+        `HTTP 200 · ${arr.length} 条 · 顶层键 [${Object.keys(json ?? {}).join(',')}] · cursor ${cursor ? '有' : '无'}${keys ? ` · 字段 [${keys}]` : ''}`);
     } catch (err) {
       line(false, '9. REST /markets', Date.now() - t0, `HTTP ${err.status ?? '—'} · ${clip(err.message, 200)}`);
     }
@@ -209,8 +239,9 @@ export async function runDiagnose(input) {
 }
 
 function conclude(f) {
-  if (f.endToEnd > 0) return '现在能解析出市场。如果直接发网址仍失败，多半是 10 分钟市场缓存还没过期，稍后再试。';
+  if (f.endToEnd > 0) return '现在能解析出市场，直接发网址即可订阅。';
   if (!f.gqlNoKey && f.gqlWithKey) return 'GraphQL 现在要求 API key，而机器人的 GraphQL 请求没带 key。需要改代码让 GraphQL 也带上 PREDICT_API_KEY。';
+  if (!f.restCat && !f.gqlNoKey) return 'GraphQL 连不通（多半是 Cloudflare 拦截），REST 按 slug 也没查到（见第 1b 步）。如果 1b 是 404，说明这个 slug 在官方接口里不存在或已结算；如果是其他错误，把这条截图发给开发者。';
   if (!f.gqlNoKey) return 'GraphQL 接口在服务器上整体连不通（见第 2 步状态码）。不是这个市场的问题，是接口或网络层面的问题。';
   if (!f.listOk) return 'GraphQL 能连通，但市场列表查询报错（见第 7 步），所以缓存为空，任何网址都匹配不到。';
   if (!f.catId && (f.htmlBlocked || !f.htmlMarkets)) return 'GraphQL 正常，但 category(id: slug) 查不到这个 slug，网页抓取也拿不到数据。可能是 Predict.fun 对这类新页面换了 slug 规则，需要按第 3–6 步的返回调整解析逻辑。';
